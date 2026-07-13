@@ -11,7 +11,7 @@ import React, {
 
 const ACCESS_TOKEN_KEY = "accessToken";
 const REFRESH_TOKEN_KEY = "refreshToken";
-const API_BASE_URL = "http://10.1.0.52:8000";
+const API_BASE_URL = "https://hennings-alternativ-jul-api-preprod.onrender.com";
 
 type FetchArgs = Parameters<typeof fetch>;
 
