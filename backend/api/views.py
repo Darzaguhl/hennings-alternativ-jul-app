@@ -4,15 +4,18 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import permissions, status, viewsets
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     Assignment,
     Event,
     EventCheckIn,
+    Membership,
     QRCode,
     Shift,
     ShiftSignup,
@@ -20,15 +23,46 @@ from .models import (
 )
 from .serializers import (
     AssignmentSerializer,
+    EmailTokenObtainPairSerializer,
     EventSerializer,
+    MembershipSerializer,
     QRCodeSerializer,
+    RegisterSerializer,
     ShiftSerializer,
     ShiftSignupSerializer,
     SkillSerializer,
     UserSerializer,
 )
 
+
+class EmailTokenObtainPairView(TokenObtainPairView):
+    serializer_class = EmailTokenObtainPairSerializer
+
 User = get_user_model()
+
+
+class RegisterView(generics.CreateAPIView):
+    """Public self-registration: email + password. Returns JWT tokens
+    immediately so the caller (website or app) can go straight into
+    signing up for oppgaver without a separate login step."""
+
+    serializer_class = RegisterSerializer
+    permission_classes = [permissions.AllowAny]
+    queryset = User.objects.all()
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        refresh = RefreshToken.for_user(user)
+        return Response(
+            {
+                "user": UserSerializer(user, context={"request": request}).data,
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 def _rank_candidates(signups):
@@ -61,6 +95,12 @@ def _rank_candidates(signups):
         return (experience_score, urgency)
 
     return sorted(signups, key=sort_key)
+
+
+def _can_view_pool(event, user) -> bool:
+    if event.is_checkin_staff(user):
+        return True
+    return Shift.objects.filter(event=event, leaders=user).exists()
 
 
 def _resolve_checkin(event, user, performed_by):
@@ -142,21 +182,22 @@ class EventViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        event = serializer.save(created_by=self.request.user)
+        Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_SUPERADMIN)
 
     def perform_destroy(self, instance):
-        if instance.created_by != self.request.user:
-            raise PermissionDenied("Only the creator can delete this event.")
+        if not instance.is_superadmin(self.request.user):
+            raise PermissionDenied("Only a superadmin can delete this event.")
         instance.delete()
 
     def perform_update(self, serializer):
-        if self.get_object().created_by != self.request.user:
-            raise PermissionDenied("Only the creator can update this event.")
+        if not self.get_object().is_superadmin(self.request.user):
+            raise PermissionDenied("Only a superadmin can update this event.")
         serializer.save()
 
     @action(detail=True, methods=["post"], url_path="checkin")
     def checkin(self, request, pk=None):
-        """Personal-QR check-in: an admin scans a volunteer's own badge.
+        """Personal-QR check-in: check-in staff scan a volunteer's own badge.
 
         Used when Event.checkin_mode == CHECKIN_MODE_PERSONAL_QR. Resolves
         automatically when the scanned person has exactly one non-critical
@@ -170,8 +211,8 @@ class EventViewSet(viewsets.ModelViewSet):
                 {"detail": "This event uses event-QR self check-in, not personal-QR admit."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can check in attendees."}, status=status.HTTP_403_FORBIDDEN)
+        if not event.is_checkin_staff(request.user):
+            return Response({"detail": "Only check-in staff can check in attendees."}, status=status.HTTP_403_FORBIDDEN)
 
         user_code = request.data.get("user_code")
         if not user_code:
@@ -207,11 +248,12 @@ class EventViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="pool")
     def pool(self, request, pk=None):
         """List everyone checked in today who doesn't yet have a confirmed
-        oppgave, with their candidate signups (ranked) and a suggestion."""
+        oppgave, oldest arrival first (first-come-first-served queue), with
+        their candidate signups (ranked) and a suggestion."""
 
         event = self.get_object()
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can view the pool."}, status=status.HTTP_403_FORBIDDEN)
+        if not _can_view_pool(event, request.user):
+            return Response({"detail": "You don't have access to this event's pool."}, status=status.HTTP_403_FORBIDDEN)
 
         date_param = request.query_params.get("date")
         if date_param:
@@ -228,6 +270,7 @@ class EventViewSet(viewsets.ModelViewSet):
             .exclude(user_id__in=assigned_user_ids)
             .select_related("user")
             .prefetch_related("user__skills")
+            .order_by("checked_in_at")
         )
 
         entries = []
@@ -253,12 +296,11 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
-        """Admin confirms a specific oppgave for a checked-in, unassigned
-        volunteer — the final step out of the pool."""
+        """Superadmin or the target oppgave's leader confirms a specific
+        oppgave for a checked-in, unassigned volunteer — the final step out
+        of the pool."""
 
         event = self.get_object()
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can assign attendees."}, status=status.HTTP_403_FORBIDDEN)
 
         user_id = request.data.get("user_id")
         shift_id = request.data.get("shift_id")
@@ -267,6 +309,12 @@ class EventViewSet(viewsets.ModelViewSet):
 
         attendee = get_object_or_404(User, pk=user_id)
         shift = get_object_or_404(Shift, pk=shift_id, event=event)
+
+        if not (event.is_superadmin(request.user) or shift.is_led_by(request.user)):
+            return Response(
+                {"detail": "Only a superadmin or this oppgave's leader can assign it."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if not EventCheckIn.objects.filter(event=event, user=attendee, date=shift.date).exists():
             return Response({"detail": "This person has not checked in today."}, status=status.HTTP_400_BAD_REQUEST)
@@ -285,9 +333,89 @@ class EventViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["get", "post"], url_path="memberships")
+    def memberships(self, request, pk=None):
+        """List (GET) or add (POST) superadmin/check-in-staff roles for this
+        event. Oppgave leadership isn't managed here — see Shift.leaders."""
+
+        event = self.get_object()
+        if not event.is_superadmin(request.user):
+            return Response({"detail": "Only a superadmin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+
+        if request.method == "GET":
+            qs = Membership.objects.filter(event=event).select_related("user")
+            return Response(MembershipSerializer(qs, many=True, context={"request": request}).data)
+
+        serializer = MembershipSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                membership = serializer.save(event=event)
+        except IntegrityError:
+            return Response({"detail": "This user already has that role."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            MembershipSerializer(membership, context={"request": request}).data, status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=["post"], url_path="remove-membership")
+    def remove_membership(self, request, pk=None):
+        event = self.get_object()
+        if not event.is_superadmin(request.user):
+            return Response({"detail": "Only a superadmin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+
+        membership_id = request.data.get("membership_id")
+        deleted, _ = Membership.objects.filter(event=event, pk=membership_id).delete()
+        if not deleted:
+            return Response({"detail": "Membership not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="metrics")
+    def metrics(self, request, pk=None):
+        """Headcount + per-oppgave utilization for a given day (defaults
+        to today)."""
+
+        event = self.get_object()
+
+        date_param = request.query_params.get("date")
+        if date_param:
+            try:
+                target_date = datetime.date.fromisoformat(date_param)
+            except ValueError:
+                return Response({"detail": "date must be YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            target_date = timezone.localdate()
+
+        checked_in_count = EventCheckIn.objects.filter(event=event, date=target_date).count()
+        assigned_count = Assignment.objects.filter(event=event, date=target_date).count()
+
+        shift_metrics = [
+            {
+                "id": shift.id,
+                "title": shift.title,
+                "criticality": shift.criticality,
+                "capacity": shift.capacity,
+                "min_capacity": shift.min_capacity,
+                "signup_count": shift.signup_count,
+                "assigned_count": shift.assigned_count,
+                "is_full": shift.is_full,
+                "is_understaffed": shift.is_understaffed,
+            }
+            for shift in Shift.objects.filter(event=event, date=target_date)
+        ]
+
+        return Response(
+            {
+                "date": target_date.isoformat(),
+                "checked_in": checked_in_count,
+                "assigned": assigned_count,
+                "in_pool": max(checked_in_count - assigned_count, 0),
+                "shifts": shift_metrics,
+            }
+        )
+
 
 class ShiftViewSet(viewsets.ModelViewSet):
-    queryset = Shift.objects.select_related("event", "created_by").prefetch_related("participants")
+    queryset = Shift.objects.select_related("event", "created_by").prefetch_related("participants", "leaders")
     serializer_class = ShiftSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -300,18 +428,22 @@ class ShiftViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         event = serializer.validated_data["event"]
-        if event.created_by != self.request.user:
-            raise PermissionDenied("Only the event creator can add vakter.")
+        if not event.is_superadmin(self.request.user):
+            raise PermissionDenied("Only a superadmin can add vakter.")
         serializer.save(created_by=self.request.user)
 
     def perform_update(self, serializer):
-        if self.get_object().event.created_by != self.request.user:
-            raise PermissionDenied("Only the event creator can edit this vakt.")
+        shift = self.get_object()
+        is_superadmin = shift.event.is_superadmin(self.request.user)
+        if not (is_superadmin or shift.is_led_by(self.request.user)):
+            raise PermissionDenied("Only a superadmin or this oppgave's leader can edit it.")
+        if "leaders" in serializer.validated_data and not is_superadmin:
+            raise PermissionDenied("Only a superadmin can change this oppgave's leaders.")
         serializer.save()
 
     def perform_destroy(self, instance):
-        if instance.event.created_by != self.request.user:
-            raise PermissionDenied("Only the event creator can delete this vakt.")
+        if not instance.event.is_superadmin(self.request.user):
+            raise PermissionDenied("Only a superadmin can delete this vakt.")
         instance.delete()
 
     @action(detail=True, methods=["post"], url_path="signup")
@@ -358,11 +490,25 @@ class ShiftViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Not signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(ShiftSerializer(shift, context={"request": request}).data)
 
+    @action(detail=True, methods=["post"], url_path="cancel-assignment")
+    def cancel_assignment(self, request, pk=None):
+        """Let a volunteer cancel their own confirmed assignment to this
+        oppgave (plans changed after being placed)."""
+
+        shift = self.get_object()
+        deleted, _ = Assignment.objects.filter(shift=shift, user=request.user).delete()
+        if not deleted:
+            return Response({"detail": "You don't have a confirmed assignment for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ShiftSerializer(shift, context={"request": request}).data)
+
     @action(detail=True, methods=["get"], url_path="assignments")
     def assignments(self, request, pk=None):
         shift = self.get_object()
-        if shift.event.created_by != request.user:
-            return Response({"detail": "Only the event creator can view assignments."}, status=status.HTTP_403_FORBIDDEN)
+        if not (shift.event.is_superadmin(request.user) or shift.is_led_by(request.user)):
+            return Response(
+                {"detail": "Only a superadmin or this oppgave's leader can view assignments."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         serializer = AssignmentSerializer(
             shift.assignments.select_related("user", "confirmed_by"), many=True, context={"request": request}
         )

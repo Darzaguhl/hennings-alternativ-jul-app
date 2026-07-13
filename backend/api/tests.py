@@ -3,9 +3,10 @@ import datetime
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import Assignment, Event, EventCheckIn, QRCode, Shift, ShiftSignup, Skill
+from .models import Assignment, Event, EventCheckIn, Membership, QRCode, Shift, ShiftSignup, Skill
 
 User = get_user_model()
 
@@ -549,3 +550,316 @@ class OwnershipEnforcementRegressionTests(TestCase):
         self.assertEqual(update.status_code, 403)
         self.assertEqual(delete.status_code, 403)
         self.assertTrue(Shift.objects.filter(pk=shift.pk, title="Kjøkken").exists())
+
+
+class RegistrationAndEmailLoginTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_register_creates_user_and_returns_tokens(self):
+        response = self.client.post(
+            "/api/register/",
+            {"email": "new.volunteer@example.com", "password": "correct horse battery staple"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+        self.assertEqual(response.data["user"]["email"], "new.volunteer@example.com")
+        self.assertTrue(User.objects.filter(email="new.volunteer@example.com").exists())
+
+    def test_register_rejects_duplicate_email(self):
+        User.objects.create_user(username="existing", email="taken@example.com", password="pw12345678")
+        response = self.client.post(
+            "/api/register/",
+            {"email": "taken@example.com", "password": "correct horse battery staple"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(User.objects.filter(email="taken@example.com").count(), 1)
+
+    def test_register_rejects_weak_password(self):
+        response = self.client.post(
+            "/api/register/",
+            {"email": "weak@example.com", "password": "1234"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(User.objects.filter(email="weak@example.com").exists())
+
+    def test_login_with_email_succeeds(self):
+        User.objects.create_user(username="volunteer@example.com", email="volunteer@example.com", password="s3cret-password")
+        response = self.client.post(
+            "/api/token/",
+            {"email": "volunteer@example.com", "password": "s3cret-password"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+
+    def test_login_with_wrong_password_fails(self):
+        User.objects.create_user(username="volunteer@example.com", email="volunteer@example.com", password="s3cret-password")
+        response = self.client.post(
+            "/api/token/",
+            {"email": "volunteer@example.com", "password": "wrong-password"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_login_with_unknown_email_fails(self):
+        response = self.client.post(
+            "/api/token/",
+            {"email": "nobody@example.com", "password": "whatever12345"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 401)
+
+
+class MembershipRolesTests(TestCase):
+    def setUp(self):
+        self.superadmin = User.objects.create_user(username="super", password="pw")
+        self.staff = User.objects.create_user(username="staff", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.event = Event.objects.create(
+            title="Alternativ Jul",
+            created_by=self.superadmin,
+            checkin_mode=Event.CHECKIN_MODE_PERSONAL_QR,
+        )
+        Membership.objects.create(event=self.event, user=self.staff, role=Membership.ROLE_CHECKIN_STAFF)
+        self.today = datetime.date.today()
+        self.kitchen = Shift.objects.create(
+            event=self.event,
+            title="Kjøkken",
+            date=self.today,
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            created_by=self.superadmin,
+        )
+        self.kitchen.leaders.add(self.leader)
+        self.hosting = Shift.objects.create(
+            event=self.event,
+            title="Vertskap",
+            date=self.today,
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(23, 0),
+            created_by=self.superadmin,
+        )
+
+    def test_creator_is_auto_superadmin(self):
+        self.assertTrue(self.event.is_superadmin(self.superadmin))
+
+    def test_checkin_staff_is_not_superadmin(self):
+        self.assertFalse(self.event.is_superadmin(self.staff))
+        self.assertTrue(self.event.is_checkin_staff(self.staff))
+
+    def test_shift_leader_is_scoped_to_their_shift_only(self):
+        self.assertTrue(self.kitchen.is_led_by(self.leader))
+        self.assertFalse(self.hosting.is_led_by(self.leader))
+
+    def test_checkin_staff_can_use_personal_qr_checkin(self):
+        qr = QRCode.objects.create(user=self.volunteer)
+        client = APIClient()
+        client.force_authenticate(user=self.staff)
+        response = client.post(
+            f"/api/events/{self.event.id}/checkin/", {"user_code": qr.data}, format="json"
+        )
+        self.assertIn(response.status_code, (201, 202))
+
+    def test_plain_volunteer_cannot_use_personal_qr_checkin(self):
+        qr = QRCode.objects.create(user=self.volunteer)
+        client = APIClient()
+        client.force_authenticate(user=self.volunteer)
+        response = client.post(
+            f"/api/events/{self.event.id}/checkin/", {"user_code": qr.data}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_leader_can_assign_their_own_shift_but_not_others(self):
+        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
+
+        client = APIClient()
+        client.force_authenticate(user=self.leader)
+
+        denied = client.post(
+            f"/api/events/{self.event.id}/assign/",
+            {"user_id": self.volunteer.id, "shift_id": self.hosting.id},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        allowed = client.post(
+            f"/api/events/{self.event.id}/assign/",
+            {"user_id": self.volunteer.id, "shift_id": self.kitchen.id},
+            format="json",
+        )
+        self.assertEqual(allowed.status_code, 201)
+
+    def test_leader_can_view_pool(self):
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
+        client = APIClient()
+        client.force_authenticate(user=self.leader)
+        response = client.get(f"/api/events/{self.event.id}/pool/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_leader_can_edit_their_shift_but_not_reassign_leaders(self):
+        client = APIClient()
+        client.force_authenticate(user=self.leader)
+
+        ok = client.patch(f"/api/shifts/{self.kitchen.id}/", {"capacity": 5}, format="json")
+        self.assertEqual(ok.status_code, 200)
+
+        denied = client.patch(
+            f"/api/shifts/{self.kitchen.id}/", {"leader_ids": [self.volunteer.id]}, format="json"
+        )
+        self.assertEqual(denied.status_code, 403)
+
+    def test_leader_cannot_create_new_shifts(self):
+        client = APIClient()
+        client.force_authenticate(user=self.leader)
+        response = client.post(
+            "/api/shifts/",
+            {
+                "event": self.event.id,
+                "title": "Vakthold",
+                "date": str(self.today),
+                "start_time": "00:00:00",
+                "end_time": "06:00:00",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_superadmin_can_manage_memberships(self):
+        client = APIClient()
+        client.force_authenticate(user=self.superadmin)
+
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.volunteer.id, "role": Membership.ROLE_CHECKIN_STAFF},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(self.event.is_checkin_staff(self.volunteer))
+
+        listing = client.get(f"/api/events/{self.event.id}/memberships/")
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(len(listing.data), 2)  # staff + newly added volunteer
+
+    def test_non_superadmin_cannot_manage_memberships(self):
+        client = APIClient()
+        client.force_authenticate(user=self.staff)
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.volunteer.id, "role": Membership.ROLE_CHECKIN_STAFF},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+
+class PoolFifoOrderingTests(TestCase):
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", password="pw")
+        self.first_arrival = User.objects.create_user(username="first", password="pw")
+        self.second_arrival = User.objects.create_user(username="second", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.today = datetime.date.today()
+
+        first_checkin = EventCheckIn.objects.create(event=self.event, user=self.first_arrival, date=self.today)
+        second_checkin = EventCheckIn.objects.create(event=self.event, user=self.second_arrival, date=self.today)
+        # Force an explicit, unambiguous ordering regardless of auto_now_add clock resolution.
+        now = timezone.now()
+        EventCheckIn.objects.filter(pk=first_checkin.pk).update(checked_in_at=now - datetime.timedelta(minutes=5))
+        EventCheckIn.objects.filter(pk=second_checkin.pk).update(checked_in_at=now)
+
+    def test_pool_lists_earliest_arrival_first(self):
+        client = APIClient()
+        client.force_authenticate(user=self.organizer)
+        response = client.get(f"/api/events/{self.event.id}/pool/")
+        self.assertEqual(response.status_code, 200)
+        usernames = [entry["user"]["username"] for entry in response.data]
+        self.assertEqual(usernames, ["first", "second"])
+
+
+class MetricsTests(TestCase):
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.today = datetime.date.today()
+        self.kitchen = Shift.objects.create(
+            event=self.event,
+            title="Kjøkken",
+            date=self.today,
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            capacity=5,
+            min_capacity=2,
+            created_by=self.organizer,
+        )
+        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
+
+    def test_metrics_reports_headcounts_and_shift_utilization(self):
+        client = APIClient()
+        client.force_authenticate(user=self.organizer)
+        response = client.get(f"/api/events/{self.event.id}/metrics/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["checked_in"], 1)
+        self.assertEqual(response.data["assigned"], 0)
+        self.assertEqual(response.data["in_pool"], 1)
+        shift_metric = response.data["shifts"][0]
+        self.assertEqual(shift_metric["title"], "Kjøkken")
+        self.assertEqual(shift_metric["signup_count"], 1)
+        self.assertEqual(shift_metric["assigned_count"], 0)
+        self.assertTrue(shift_metric["is_understaffed"])
+
+
+class ShiftCapacityTests(TestCase):
+    def test_is_understaffed_reflects_min_capacity(self):
+        organizer = User.objects.create_user(username="organizer", password="pw")
+        event = Event.objects.create(title="Alternativ Jul", created_by=organizer)
+        shift = Shift.objects.create(
+            event=event,
+            title="Kjøkken",
+            date=datetime.date.today(),
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            min_capacity=2,
+            created_by=organizer,
+        )
+        self.assertTrue(shift.is_understaffed)
+
+        volunteer = User.objects.create_user(username="volunteer", password="pw")
+        Assignment.objects.create(shift=shift, user=volunteer, confirmed_by=organizer)
+        another = User.objects.create_user(username="volunteer2", password="pw")
+        Assignment.objects.create(shift=shift, user=another, confirmed_by=organizer)
+
+        shift.refresh_from_db()
+        self.assertFalse(shift.is_understaffed)
+
+
+class CancelAssignmentTests(TestCase):
+    def test_volunteer_can_cancel_their_own_assignment(self):
+        organizer = User.objects.create_user(username="organizer", password="pw")
+        volunteer = User.objects.create_user(username="volunteer", password="pw")
+        event = Event.objects.create(title="Alternativ Jul", created_by=organizer)
+        shift = Shift.objects.create(
+            event=event,
+            title="Kjøkken",
+            date=datetime.date.today(),
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            created_by=organizer,
+        )
+        Assignment.objects.create(shift=shift, user=volunteer, confirmed_by=organizer)
+
+        client = APIClient()
+        client.force_authenticate(user=volunteer)
+        response = client.post(f"/api/shifts/{shift.id}/cancel-assignment/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Assignment.objects.filter(shift=shift, user=volunteer).exists())
