@@ -568,6 +568,23 @@ class RegistrationAndEmailLoginTests(TestCase):
         self.assertEqual(response.data["user"]["email"], "new.volunteer@example.com")
         self.assertTrue(User.objects.filter(email="new.volunteer@example.com").exists())
 
+    def test_register_accepts_skill_ids_and_sets_them_on_the_user(self):
+        kokk = Skill.objects.create(name="Kokk")
+        vertskap = Skill.objects.create(name="Vertskap")
+        response = self.client.post(
+            "/api/register/",
+            {
+                "email": "chef.volunteer@example.com",
+                "password": "correct horse battery staple",
+                "skill_ids": [kokk.id, vertskap.id],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="chef.volunteer@example.com")
+        self.assertEqual(set(user.skills.values_list("name", flat=True)), {"Kokk", "Vertskap"})
+        self.assertEqual({s["name"] for s in response.data["user"]["skills"]}, {"Kokk", "Vertskap"})
+
     def test_register_rejects_duplicate_email(self):
         User.objects.create_user(username="existing", email="taken@example.com", password="pw12345678")
         response = self.client.post(
@@ -910,3 +927,21 @@ class PublicEventEndpointTests(TestCase):
         newer = Event.objects.create(title="Alternativ Jul 2027", created_by=self.organizer)
         response = self.client.get("/api/public/event/")
         self.assertEqual(response.data["id"], newer.id)
+
+
+class PublicSkillsEndpointTests(TestCase):
+    def setUp(self):
+        Skill.objects.create(name="Kokk")
+        Skill.objects.create(name="Vertskap")
+        self.client = APIClient()  # deliberately unauthenticated
+
+    def test_public_skills_is_reachable_without_auth(self):
+        response = self.client.get("/api/public/skills/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({s["name"] for s in response.data}, {"Kokk", "Vertskap"})
+
+    def test_public_skills_returns_empty_list_when_none_exist(self):
+        Skill.objects.all().delete()
+        response = self.client.get("/api/public/skills/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])

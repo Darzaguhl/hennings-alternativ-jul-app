@@ -45,10 +45,17 @@ class RegisterSerializer(serializers.ModelSerializer):
     goes through EmailBackend, not username."""
 
     password = serializers.CharField(write_only=True, min_length=8, validators=[validate_password])
+    skill_ids = serializers.PrimaryKeyRelatedField(
+        source="skills",
+        queryset=Skill.objects.all(),
+        many=True,
+        write_only=True,
+        required=False,
+    )
 
     class Meta:
         model = User
-        fields = ["id", "email", "password"]
+        fields = ["id", "email", "password", "skill_ids"]
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
@@ -56,11 +63,15 @@ class RegisterSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        return User.objects.create_user(
+        skills = validated_data.pop("skills", [])
+        user = User.objects.create_user(
             username=validated_data["email"],
             email=validated_data["email"],
             password=validated_data["password"],
         )
+        if skills:
+            user.skills.set(skills)
+        return user
 
 
 class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
