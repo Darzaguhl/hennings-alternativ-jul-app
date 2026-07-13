@@ -113,6 +113,45 @@ class EventSerializer(serializers.ModelSerializer):
         return "volunteer"
 
 
+class PublicShiftSerializer(serializers.ModelSerializer):
+    """Safe subset for anonymous website visitors browsing oppgaver before
+    signing up -- deliberately excludes participants/leaders (ShiftSerializer
+    embeds full UserSerializer, i.e. emails, for every signed-up volunteer,
+    which must never be public)."""
+
+    is_full = serializers.BooleanField(read_only=True)
+    is_critical = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Shift
+        fields = [
+            "id",
+            "event",
+            "title",
+            "date",
+            "start_time",
+            "end_time",
+            "capacity",
+            "criticality",
+            "is_critical",
+            "is_full",
+        ]
+        read_only_fields = fields
+
+
+class PublicEventSerializer(serializers.ModelSerializer):
+    """Safe subset for the public website signup page -- no created_by
+    (would embed the admin's email/profile), just enough to render a
+    signup form: name, blurb, and the day's oppgaver."""
+
+    shifts = PublicShiftSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Event
+        fields = ["id", "title", "description", "date", "shifts"]
+        read_only_fields = fields
+
+
 class QRCodeSerializer(serializers.ModelSerializer):
     owner_username = serializers.CharField(source="user.username", read_only=True)
 
