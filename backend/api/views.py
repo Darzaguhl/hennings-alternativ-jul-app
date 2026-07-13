@@ -50,6 +50,19 @@ def public_event(request):
     return Response(PublicEventSerializer(event, context={"request": request}).data)
 
 
+@api_view(["GET"])
+@permission_classes([permissions.AllowAny])
+def public_skills(request):
+    """Unauthenticated: the catalogue of oppgaver (roles like Kokk,
+    Lydtekniker, Vaktleder) a volunteer can express interest in at
+    signup, independent of which vakt/shift they pick. See public_event
+    for why this is a separate minimal endpoint rather than opening up
+    SkillViewSet."""
+
+    skills = Skill.objects.all()
+    return Response(SkillSerializer(skills, many=True).data)
+
+
 class EmailTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailTokenObtainPairSerializer
 
