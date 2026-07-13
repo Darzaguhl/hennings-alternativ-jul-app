@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "qr_app",
-    "slug": "qr_app",
+    "name": "Hennings Alternativ Jul",
+    "slug": "hennings-alternativ-jul",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "qrapp",
+    "scheme": "henningsalternativjul",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
@@ -31,7 +31,7 @@
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
+          "backgroundColor": "#1b4332"
         }
       ],
       "expo-barcode-scanner",

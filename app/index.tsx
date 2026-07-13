@@ -24,13 +24,13 @@ export default function SplashScreen() {
   return (
     <View style={styles.container}>
       <Image source={require("../assets/images/icon.png")} style={styles.logo} />
-      <Text style={styles.text}>Welcome to MyApp</Text>
+      <Text style={styles.text}>Hennings Alternativ Jul</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#007AFF" },
-  logo: { width: 150, height: 150, marginBottom: 20 },
-  text: { fontSize: 24, color: "white", fontWeight: "bold" },
+  container: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#1b4332" },
+  logo: { width: 160, height: 160, marginBottom: 20, borderRadius: 80 },
+  text: { fontSize: 22, color: "#f5efe0", fontWeight: "bold" },
 });
