@@ -33,7 +33,6 @@ export default function TabsLayout() {
 
   const menuItems = [
     { icon: "id-card-outline", route: "/qrcode" },
-    { icon: "notifications-outline", route: "/notifications" },
     { icon: "person-outline", route: "/profile" },
   ];
 
@@ -62,24 +61,15 @@ export default function TabsLayout() {
         <Tabs.Screen
           name="events/index"
           options={{
-            title: "Events",
+            title: "Alternativ Jul",
             tabBarIcon: ({ color, size }) => (
               <Ionicons name="calendar-outline" size={size} color={color} />
             ),
           }}
         />
-        <Tabs.Screen
-          name="groups/index"
-          options={{
-            title: "Groups",
-            tabBarIcon: ({ color, size }) => (
-              <Ionicons name="people-outline" size={size} color={color} />
-            ),
-          }}
-        />
 
         {/* hidden pages */}
-        {["scan", "qrcode", "notifications", "profile", "events/[id]", "groups/[id]"].map((s) => (
+        {["qrcode", "profile"].map((s) => (
           <Tabs.Screen key={s} name={s} options={{ href: null }} />
         ))}
       </Tabs>
