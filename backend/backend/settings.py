@@ -111,11 +111,11 @@ if not CORS_ALLOW_ALL_ORIGINS:
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 # Set DATABASE_URL (e.g. a Supabase Postgres connection string) for any
-# real deployment. Falls back to local SQLite when unset OR set-but-blank --
-# os.environ.get's `default` param only kicks in when the key is absent, not
-# when it's present as an empty string, which dj_database_url.config() can't
-# parse (ValueError: No support for '').
-_database_url = os.environ.get("DATABASE_URL") or f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
+# real deployment. Falls back to local SQLite when unset, blank, or
+# whitespace-only -- os.environ.get's `default` param only kicks in when the
+# key is absent, not when it's present as '' or ' ' (both of which
+# dj_database_url can't parse: ValueError: No support for '').
+_database_url = (os.environ.get("DATABASE_URL") or "").strip() or f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
 DATABASES = {
     'default': dj_database_url.parse(_database_url, conn_max_age=600)
 }
