@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status, viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -26,6 +26,7 @@ from .serializers import (
     EmailTokenObtainPairSerializer,
     EventSerializer,
     MembershipSerializer,
+    PublicEventSerializer,
     QRCodeSerializer,
     RegisterSerializer,
     ShiftSerializer,
@@ -33,6 +34,20 @@ from .serializers import (
     SkillSerializer,
     UserSerializer,
 )
+
+
+@api_view(["GET"])
+@permission_classes([permissions.AllowAny])
+def public_event(request):
+    """Unauthenticated: the current event + its oppgaver, for the public
+    website signup page. Deliberately a separate, minimal endpoint rather
+    than opening up EventViewSet/ShiftViewSet -- those embed full volunteer
+    profiles (emails) in participants/leaders, which must stay private."""
+
+    event = Event.objects.order_by("-id").prefetch_related("shifts").first()
+    if not event:
+        return Response({"detail": "No event configured yet."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(PublicEventSerializer(event, context={"request": request}).data)
 
 
 class EmailTokenObtainPairView(TokenObtainPairView):

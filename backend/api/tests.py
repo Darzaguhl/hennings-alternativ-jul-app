@@ -863,3 +863,50 @@ class CancelAssignmentTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Assignment.objects.filter(shift=shift, user=volunteer).exists())
+
+
+class PublicEventEndpointTests(TestCase):
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", email="organizer@example.com", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", description="Julefeiring for alle", created_by=self.organizer)
+        self.kitchen = Shift.objects.create(
+            event=self.event,
+            title="Kjøkken",
+            date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            criticality=Shift.CRITICALITY_CRITICAL,
+            created_by=self.organizer,
+        )
+        self.client = APIClient()  # deliberately unauthenticated
+
+    def test_public_event_is_reachable_without_auth(self):
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["title"], "Alternativ Jul")
+        self.assertEqual(len(response.data["shifts"]), 1)
+        self.assertEqual(response.data["shifts"][0]["title"], "Kjøkken")
+        self.assertTrue(response.data["shifts"][0]["is_critical"])
+
+    def test_public_event_never_exposes_volunteer_or_admin_profiles(self):
+        volunteer = User.objects.create_user(username="volunteer", email="volunteer@example.com", password="pw")
+        ShiftSignup.objects.create(shift=self.kitchen, user=volunteer)
+
+        response = self.client.get("/api/public/event/")
+
+        body = str(response.content)
+        self.assertNotIn("organizer@example.com", body)
+        self.assertNotIn("volunteer@example.com", body)
+        self.assertNotIn("created_by", response.data)
+        self.assertNotIn("participants", response.data["shifts"][0])
+        self.assertNotIn("leaders", response.data["shifts"][0])
+
+    def test_public_event_returns_404_when_none_exists(self):
+        self.event.delete()
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_public_event_returns_most_recently_created_event(self):
+        newer = Event.objects.create(title="Alternativ Jul 2027", created_by=self.organizer)
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.data["id"], newer.id)

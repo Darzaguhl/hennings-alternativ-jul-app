@@ -3,7 +3,8 @@ from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (EmailTokenObtainPairView, EventViewSet, QRCodeViewSet,
-                    RegisterView, ShiftViewSet, SkillViewSet, UserViewSet)
+                    RegisterView, ShiftViewSet, SkillViewSet, UserViewSet,
+                    public_event)
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet)
@@ -15,6 +16,11 @@ router.register(r'qrcodes', QRCodeViewSet)
 urlpatterns = [
     # Public registration
     path('register/', RegisterView.as_view(), name='register'),
+
+    # Public read-only: the current event + oppgaver, for the website
+    # signup page. See public_event's docstring for why this isn't just
+    # EventViewSet/ShiftViewSet opened up to AllowAny.
+    path('public/event/', public_event, name='public-event'),
 
     # JWT token endpoints (login by email)
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),
