@@ -1,7 +1,7 @@
 // app/login.tsx
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
-import { Alert, Button, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, Button, Image, StyleSheet, Text, TextInput, View } from "react-native";
 import { useAuth } from "./AuthContext";
 
 export default function LoginScreen() {
@@ -31,7 +31,8 @@ export default function LoginScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Login</Text>
+      <Image source={require("../assets/images/icon.png")} style={styles.logo} />
+      <Text style={styles.title}>Hennings Alternativ Jul</Text>
       <TextInput style={styles.input} placeholder="Username" autoCapitalize="none" value={username} onChangeText={setUsername} />
       <TextInput style={styles.input} placeholder="Password" secureTextEntry value={password} onChangeText={setPassword} />
       <Button title={loading ? "Logging in..." : "Login"} onPress={handleLogin} />
@@ -41,6 +42,7 @@ export default function LoginScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, justifyContent: "center", padding: 20 },
-  title: { fontSize: 24, fontWeight: "bold", marginBottom: 20, textAlign: "center" },
+  logo: { width: 96, height: 96, borderRadius: 48, alignSelf: "center", marginBottom: 16 },
+  title: { fontSize: 22, fontWeight: "bold", marginBottom: 20, textAlign: "center", color: "#1b4332" },
   input: { borderWidth: 1, borderColor: "#ccc", padding: 12, marginBottom: 15, borderRadius: 6 },
 });
