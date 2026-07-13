@@ -5,15 +5,10 @@ from .models import (
     Assignment,
     Event,
     EventCheckIn,
-    EventGroupInvite,
-    EventInvite,
-    Notification,
     QRCode,
     Shift,
     ShiftSignup,
     Skill,
-    UserGroup,
-    GroupInvite,
 )
 
 User = get_user_model()
@@ -40,59 +35,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ["id", "username", "email", "skills", "skill_ids", "experience_notes"]
 
 
-class UserGroupSerializer(serializers.ModelSerializer):
-    members = UserSerializer(many=True, read_only=True)
-    member_ids = serializers.PrimaryKeyRelatedField(
-        source="members",
-        queryset=User.objects.all(),
-        many=True,
-        write_only=True,
-        required=False,
-    )
-    created_by = UserSerializer(read_only=True)
-    code = serializers.CharField(read_only=True)
-
-    class Meta:
-        model = UserGroup
-        fields = ["id", "name", "code", "created_by", "members", "member_ids"]
-
-    def create(self, validated_data):
-        members = validated_data.pop("members", [])
-        request = self.context["request"]
-        group = UserGroup.objects.create(created_by=request.user, **validated_data)
-        if members:
-            group.members.set(members)
-        return group
-
-    def update(self, instance, validated_data):
-        members = validated_data.pop("members", None)
-        group = super().update(instance, validated_data)
-        if members is not None:
-            group.members.set(members)
-        return group
-
-
 class EventSerializer(serializers.ModelSerializer):
-    participants = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all(),
-        many=True,
-        required=False,
-    )
-    participant_details = UserSerializer(
-        source="participants",
-        many=True,
-        read_only=True,
-    )
-    groups = serializers.PrimaryKeyRelatedField(
-        queryset=UserGroup.objects.all(),
-        many=True,
-        required=False,
-    )
-    group_details = UserGroupSerializer(
-        source="groups",
-        many=True,
-        read_only=True,
-    )
     created_by = UserSerializer(read_only=True)
     code = serializers.CharField(read_only=True)
 
@@ -104,110 +47,10 @@ class EventSerializer(serializers.ModelSerializer):
             "description",
             "date",
             "code",
-            "auto_approve",
+            "checkin_mode",
             "created_by",
-            "participants",
-            "participant_details",
-            "groups",
-            "group_details",
         ]
-
-    def create(self, validated_data):
-        participants = validated_data.pop("participants", [])
-        groups = validated_data.pop("groups", [])
-        event = Event.objects.create(**validated_data)
-        if participants:
-            event.participants.set(participants)
-        if groups:
-            event.groups.set(groups)
-        return event
-
-    def update(self, instance, validated_data):
-        participants = validated_data.pop("participants", None)
-        groups = validated_data.pop("groups", None)
-        event = super().update(instance, validated_data)
-        if participants is not None:
-            event.participants.set(participants)
-        if groups is not None:
-            event.groups.set(groups)
-        return event
-
-
-class GroupInviteSerializer(serializers.ModelSerializer):
-    group = UserGroupSerializer(read_only=True)
-    invitee = UserSerializer(read_only=True)
-    invited_by = UserSerializer(read_only=True)
-
-    class Meta:
-        model = GroupInvite
-        fields = [
-            "id",
-            "group",
-            "invitee",
-            "invited_by",
-            "status",
-            "created_at",
-            "responded_at",
-        ]
-        read_only_fields = ["status", "created_at", "responded_at"]
-
-
-class EventInviteSerializer(serializers.ModelSerializer):
-    event = EventSerializer(read_only=True)
-    invitee = UserSerializer(read_only=True)
-    invited_by = UserSerializer(read_only=True)
-
-    class Meta:
-        model = EventInvite
-        fields = [
-            "id",
-            "event",
-            "invitee",
-            "invited_by",
-            "status",
-            "created_at",
-            "responded_at",
-        ]
-        read_only_fields = ["status", "created_at", "responded_at"]
-
-
-class EventGroupInviteSerializer(serializers.ModelSerializer):
-    event = EventSerializer(read_only=True)
-    group = UserGroupSerializer(read_only=True)
-    invited_by = UserSerializer(read_only=True)
-
-    class Meta:
-        model = EventGroupInvite
-        fields = [
-            "id",
-            "event",
-            "group",
-            "invited_by",
-            "status",
-            "created_at",
-            "responded_at",
-        ]
-        read_only_fields = ["status", "created_at", "responded_at"]
-
-
-class NotificationSerializer(serializers.ModelSerializer):
-    event_invite = EventInviteSerializer(read_only=True)
-    group_invite = GroupInviteSerializer(read_only=True)
-    event_group_invite = EventGroupInviteSerializer(read_only=True)
-
-    class Meta:
-        model = Notification
-        fields = [
-            "id",
-            "type",
-            "message",
-            "is_read",
-            "created_at",
-            "event_invite",
-            "group_invite",
-            "event_group_invite",
-        ]
-        read_only_fields = fields
+        read_only_fields = ["created_by"]
 
 
 class QRCodeSerializer(serializers.ModelSerializer):
@@ -239,7 +82,6 @@ class ShiftSerializer(serializers.ModelSerializer):
             "capacity",
             "criticality",
             "is_critical",
-            "auto_approve",
             "created_by",
             "participants",
             "signup_count",
