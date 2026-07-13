@@ -44,6 +44,7 @@ __pycache__/
 *.pyc
 bin/
 lib/
+.venv/
 pyvenv.cfg
 backend/db.sqlite3
 backend/media/

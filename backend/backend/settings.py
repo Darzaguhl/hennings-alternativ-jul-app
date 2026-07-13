@@ -13,6 +13,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 
+import dj_database_url
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -34,6 +36,13 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
 AUTH_USER_MODEL = "api.User"
+
+# Email backend (first) handles login by email; ModelBackend (fallback)
+# keeps the Django admin's username-based login working.
+AUTHENTICATION_BACKENDS = [
+    "api.auth_backends.EmailBackend",
+    "django.contrib.auth.backends.ModelBackend",
+]
 
 # Application definition
 
@@ -94,11 +103,13 @@ CORS_ALLOW_ALL_ORIGINS = os.environ.get("DJANGO_CORS_ALLOW_ALL", "True") == "Tru
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# Set DATABASE_URL (e.g. a Supabase Postgres connection string) for any
+# real deployment. Falls back to local SQLite when unset, for local dev.
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+    'default': dj_database_url.config(
+        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        conn_max_age=600,
+    )
 }
 
 

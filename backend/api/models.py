@@ -72,6 +72,44 @@ class Event(models.Model):
     def __str__(self) -> str:
         return f"{self.title} ({self.code})"
 
+    def is_superadmin(self, user) -> bool:
+        if not user.is_authenticated:
+            return False
+        if self.created_by_id == user.pk:
+            return True
+        return self.memberships.filter(user=user, role=Membership.ROLE_SUPERADMIN).exists()
+
+    def is_checkin_staff(self, user) -> bool:
+        if self.is_superadmin(user):
+            return True
+        return self.memberships.filter(user=user, role=Membership.ROLE_CHECKIN_STAFF).exists()
+
+
+class Membership(models.Model):
+    """Event-wide admin roles. Superadmins can manage everything on the
+    event; check-in staff can only operate check-in stations. Oppgave-level
+    leadership is scoped per-Shift instead (see Shift.leaders), since a
+    leader's authority doesn't extend to the whole event.
+    """
+
+    ROLE_SUPERADMIN = "superadmin"
+    ROLE_CHECKIN_STAFF = "checkin_staff"
+    ROLE_CHOICES = (
+        (ROLE_SUPERADMIN, "Superadmin"),
+        (ROLE_CHECKIN_STAFF, "Check-in staff"),
+    )
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="memberships")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="event_memberships")
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("event", "user", "role")
+
+    def __str__(self) -> str:
+        return f"{self.user} — {self.role} @ {self.event}"
+
 
 def generate_qr_payload() -> str:
     """Return a stable, unique token to embed in a user's QR code."""
@@ -109,7 +147,10 @@ class Shift(models.Model):
     date = models.DateField()
     start_time = models.TimeField()
     end_time = models.TimeField()
-    capacity = models.PositiveIntegerField(null=True, blank=True)
+    capacity = models.PositiveIntegerField(null=True, blank=True, help_text="Maximum volunteers. Blank = no limit.")
+    min_capacity = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Minimum volunteers needed. Informational only — used for understaffing alerts/metrics, not enforced at signup."
+    )
     criticality = models.CharField(
         max_length=10,
         choices=CRITICALITY_CHOICES,
@@ -119,6 +160,12 @@ class Shift(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="shifts_created",
+    )
+    leaders = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name="shifts_led",
+        blank=True,
+        help_text="Oppgave leaders: can edit this shift and assign its pool candidates.",
     )
     participants = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
@@ -148,6 +195,13 @@ class Shift(models.Model):
     @property
     def is_full(self) -> bool:
         return self.capacity is not None and self.signup_count >= self.capacity
+
+    @property
+    def is_understaffed(self) -> bool:
+        return self.min_capacity is not None and self.assigned_count < self.min_capacity
+
+    def is_led_by(self, user) -> bool:
+        return user.is_authenticated and self.leaders.filter(pk=user.pk).exists()
 
 
 class ShiftSignup(models.Model):
