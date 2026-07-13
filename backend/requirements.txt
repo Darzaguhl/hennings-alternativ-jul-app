@@ -4,6 +4,6 @@ djangorestframework-simplejwt==5.5.1
 django-cors-headers==4.7.0
 Pillow==11.3.0
 dj-database-url==2.3.0
-psycopg[binary]==3.2.3
+psycopg[binary]==3.2.13
 gunicorn==23.0.0
 whitenoise==6.8.2
