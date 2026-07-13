@@ -13,29 +13,18 @@ from .models import (
     Assignment,
     Event,
     EventCheckIn,
-    EventGroupInvite,
-    EventInvite,
-    GroupInvite,
-    Notification,
     QRCode,
     Shift,
     ShiftSignup,
     Skill,
-    UserGroup,
 )
 from .serializers import (
     AssignmentSerializer,
-    EventCheckInSerializer,
-    EventGroupInviteSerializer,
-    EventInviteSerializer,
     EventSerializer,
-    GroupInviteSerializer,
-    NotificationSerializer,
     QRCodeSerializer,
     ShiftSerializer,
     ShiftSignupSerializer,
     SkillSerializer,
-    UserGroupSerializer,
     UserSerializer,
 )
 
@@ -148,14 +137,12 @@ class UserViewSet(viewsets.ModelViewSet):
 
 
 class EventViewSet(viewsets.ModelViewSet):
-    queryset = Event.objects.all().select_related("created_by").prefetch_related("participants", "groups")
+    queryset = Event.objects.all().select_related("created_by")
     serializer_class = EventSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def perform_create(self, serializer):
-        with transaction.atomic():
-            event = serializer.save(created_by=self.request.user)
-            event.participants.add(self.request.user)
+        serializer.save(created_by=self.request.user)
 
     def perform_destroy(self, instance):
         if instance.created_by != self.request.user:
@@ -166,116 +153,6 @@ class EventViewSet(viewsets.ModelViewSet):
         if self.get_object().created_by != self.request.user:
             raise PermissionDenied("Only the creator can update this event.")
         serializer.save()
-
-    @action(detail=True, methods=["post"])
-    def invite_user(self, request, pk=None):
-        event = self.get_object()
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can send invites."}, status=status.HTTP_403_FORBIDDEN)
-
-        user_id = request.data.get("user_id")
-        invitee = get_object_or_404(User, pk=user_id)
-        invite, created = EventInvite.objects.get_or_create(
-            event=event,
-            invitee=invitee,
-            defaults={"invited_by": request.user},
-        )
-        if not created:
-            return Response({"detail": "User already invited."}, status=status.HTTP_400_BAD_REQUEST)
-
-        Notification.objects.create(
-            recipient=invitee,
-            type=Notification.TYPE_EVENT_INVITE,
-            event_invite=invite,
-            message=f"You have been invited to event '{event.title}'.",
-        )
-        return Response(EventInviteSerializer(invite, context={"request": request}).data, status=status.HTTP_201_CREATED)
-
-    @action(detail=True, methods=["post"], url_path="invite-group")
-    def invite_group(self, request, pk=None):
-        event = self.get_object()
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can send invites."}, status=status.HTTP_403_FORBIDDEN)
-
-        group_id = request.data.get("group_id")
-        group = get_object_or_404(UserGroup, pk=group_id)
-        invite, created = EventGroupInvite.objects.get_or_create(
-            event=event,
-            group=group,
-            defaults={"invited_by": request.user},
-        )
-        if not created:
-            return Response({"detail": "Group already invited."}, status=status.HTTP_400_BAD_REQUEST)
-
-        Notification.objects.create(
-            recipient=group.created_by,
-            type=Notification.TYPE_EVENT_GROUP_INVITE,
-            event_group_invite=invite,
-            message=f"Your group '{group.name}' has been invited to event '{event.title}'.",
-        )
-        return Response(EventGroupInviteSerializer(invite, context={"request": request}).data, status=status.HTTP_201_CREATED)
-
-    @action(detail=True, methods=["post"], url_path="admit")
-    def admit(self, request, pk=None):
-        event = self.get_object()
-        if event.created_by != request.user:
-            return Response({"detail": "Only the creator can admit attendees."}, status=status.HTTP_403_FORBIDDEN)
-
-        user_code = request.data.get("user_code")
-        if not user_code:
-            return Response({"detail": "user_code is required"}, status=status.HTTP_400_BAD_REQUEST)
-
-        qr = QRCode.objects.filter(data=user_code).select_related("user").first()
-        if not qr:
-            return Response({"detail": "QR code not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        attendee = qr.user
-        already_participant = event.participants.filter(pk=attendee.pk).exists()
-
-        confirm_flag = request.data.get("confirm")
-        if isinstance(confirm_flag, str):
-            confirm = confirm_flag.lower() in {"1", "true", "yes", "on"}
-        else:
-            confirm = bool(confirm_flag)
-
-        should_admit = event.auto_approve or confirm
-
-        attendee_payload = UserSerializer(attendee, context={"request": request}).data
-
-        if already_participant:
-            reload_event = Event.objects.select_related("created_by").prefetch_related("participants", "groups").get(pk=event.pk)
-            event_payload = EventSerializer(reload_event, context={"request": request}).data
-            return Response(
-                {
-                    "status": "already_admitted",
-                    "user": attendee_payload,
-                    "event": event_payload,
-                    "message": "This attendee is already part of the event.",
-                }
-            )
-
-        if should_admit:
-            event.participants.add(attendee)
-            reload_event = Event.objects.select_related("created_by").prefetch_related("participants", "groups").get(pk=event.pk)
-            event_payload = EventSerializer(reload_event, context={"request": request}).data
-            return Response(
-                {
-                    "status": "admitted",
-                    "user": attendee_payload,
-                    "event": event_payload,
-                    "message": "Attendee admitted successfully.",
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        return Response(
-            {
-                "status": "pending_confirmation",
-                "user": attendee_payload,
-                "message": "Manual approval required for this attendee.",
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
 
     @action(detail=True, methods=["post"], url_path="checkin")
     def checkin(self, request, pk=None):
@@ -490,155 +367,6 @@ class ShiftViewSet(viewsets.ModelViewSet):
             shift.assignments.select_related("user", "confirmed_by"), many=True, context={"request": request}
         )
         return Response(serializer.data)
-
-
-class UserGroupViewSet(viewsets.ModelViewSet):
-    queryset = UserGroup.objects.all().select_related("created_by").prefetch_related("members")
-    serializer_class = UserGroupSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def perform_create(self, serializer):
-        with transaction.atomic():
-            group = serializer.save()
-            group.members.add(self.request.user)
-
-    def perform_destroy(self, instance):
-        if instance.created_by != self.request.user:
-            raise PermissionDenied("Only the creator can delete this group.")
-        instance.delete()
-
-    def perform_update(self, serializer):
-        if self.get_object().created_by != self.request.user:
-            raise PermissionDenied("Only the creator can update this group.")
-        serializer.save()
-
-    @action(detail=True, methods=["post"], url_path="invite-user")
-    def invite_user(self, request, pk=None):
-        group = self.get_object()
-        if group.created_by != request.user:
-            return Response({"detail": "Only the creator can send invites."}, status=status.HTTP_403_FORBIDDEN)
-
-        user_id = request.data.get("user_id")
-        invitee = get_object_or_404(User, pk=user_id)
-        invite, created = GroupInvite.objects.get_or_create(
-            group=group,
-            invitee=invitee,
-            defaults={"invited_by": request.user},
-        )
-        if not created:
-            return Response({"detail": "User already invited."}, status=status.HTTP_400_BAD_REQUEST)
-
-        Notification.objects.create(
-            recipient=invitee,
-            type=Notification.TYPE_GROUP_INVITE,
-            group_invite=invite,
-            message=f"You have been invited to join group '{group.name}'.",
-        )
-        return Response(GroupInviteSerializer(invite, context={"request": request}).data, status=status.HTTP_201_CREATED)
-
-
-class GroupInviteViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = GroupInviteSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return GroupInvite.objects.filter(invitee=self.request.user).select_related("group", "invited_by", "group__created_by")
-
-    @action(detail=True, methods=["post"], url_path="respond")
-    def respond(self, request, pk=None):
-        invite = self.get_object()
-        decision = request.data.get("decision")
-        if decision not in {GroupInvite.STATUS_ACCEPTED, GroupInvite.STATUS_DECLINED}:
-            return Response({"detail": "Invalid decision."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if invite.status != GroupInvite.STATUS_PENDING:
-            return Response({"detail": "Invite already handled."}, status=status.HTTP_400_BAD_REQUEST)
-
-        invite.status = decision
-        invite.responded_at = timezone.now()
-        invite.save(update_fields=["status", "responded_at"])
-
-        if decision == GroupInvite.STATUS_ACCEPTED:
-            invite.group.members.add(self.request.user)
-
-        Notification.objects.filter(group_invite=invite).update(is_read=True)
-        return Response(GroupInviteSerializer(invite, context={"request": request}).data)
-
-
-class EventInviteViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = EventInviteSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return EventInvite.objects.filter(invitee=self.request.user).select_related("event", "event__created_by", "invited_by")
-
-    @action(detail=True, methods=["post"], url_path="respond")
-    def respond(self, request, pk=None):
-        invite = self.get_object()
-        decision = request.data.get("decision")
-        if decision not in {EventInvite.STATUS_ACCEPTED, EventInvite.STATUS_DECLINED}:
-            return Response({"detail": "Invalid decision."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if invite.status != EventInvite.STATUS_PENDING:
-            return Response({"detail": "Invite already handled."}, status=status.HTTP_400_BAD_REQUEST)
-
-        invite.status = decision
-        invite.responded_at = timezone.now()
-        invite.save(update_fields=["status", "responded_at"])
-
-        if decision == EventInvite.STATUS_ACCEPTED:
-            invite.event.participants.add(self.request.user)
-
-        Notification.objects.filter(event_invite=invite).update(is_read=True)
-        return Response(EventInviteSerializer(invite, context={"request": request}).data)
-
-
-class EventGroupInviteViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = EventGroupInviteSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        # group invitations visible to group owners
-        return EventGroupInvite.objects.filter(group__created_by=self.request.user).select_related(
-            "group", "event", "invited_by"
-        )
-
-    @action(detail=True, methods=["post"], url_path="respond")
-    def respond(self, request, pk=None):
-        invite = self.get_object()
-        if invite.group.created_by != request.user:
-            return Response({"detail": "Only the group owner can respond."}, status=status.HTTP_403_FORBIDDEN)
-
-        decision = request.data.get("decision")
-        if decision not in {EventGroupInvite.STATUS_ACCEPTED, EventGroupInvite.STATUS_DECLINED}:
-            return Response({"detail": "Invalid decision."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if invite.status != EventGroupInvite.STATUS_PENDING:
-            return Response({"detail": "Invite already handled."}, status=status.HTTP_400_BAD_REQUEST)
-
-        invite.status = decision
-        invite.responded_at = timezone.now()
-        invite.save(update_fields=["status", "responded_at"])
-
-        if decision == EventGroupInvite.STATUS_ACCEPTED:
-            invite.event.groups.add(invite.group)
-
-        Notification.objects.filter(event_group_invite=invite).update(is_read=True)
-        return Response(EventGroupInviteSerializer(invite, context={"request": request}).data)
-
-
-class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = NotificationSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Notification.objects.filter(recipient=self.request.user)
-
-    @action(detail=True, methods=["post"], url_path="read")
-    def mark_read(self, request, pk=None):
-        notification = self.get_object()
-        notification.mark_read()
-        return Response(NotificationSerializer(notification, context={"request": request}).data)
 
 
 class QRCodeViewSet(viewsets.ModelViewSet):

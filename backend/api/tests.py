@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from .models import Assignment, Event, EventCheckIn, QRCode, Shift, ShiftSignup, Skill, UserGroup
+from .models import Assignment, Event, EventCheckIn, QRCode, Shift, ShiftSignup, Skill
 
 User = get_user_model()
 
@@ -519,16 +519,6 @@ class OwnershipEnforcementRegressionTests(TestCase):
         self.assertEqual(update.status_code, 403)
         self.assertEqual(delete.status_code, 403)
         self.assertTrue(Event.objects.filter(pk=event.pk, title="Alternativ Jul").exists())
-
-    def test_non_owner_cannot_update_or_delete_group(self):
-        group = UserGroup.objects.create(name="Kjøkkengjengen", created_by=self.owner)
-
-        update = self.client.patch(f"/api/groups/{group.id}/", {"name": "hijacked"}, format="json")
-        delete = self.client.delete(f"/api/groups/{group.id}/")
-
-        self.assertEqual(update.status_code, 403)
-        self.assertEqual(delete.status_code, 403)
-        self.assertTrue(UserGroup.objects.filter(pk=group.pk, name="Kjøkkengjengen").exists())
 
     def test_non_owner_cannot_create_update_or_delete_shift_on_someone_elses_event(self):
         event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)

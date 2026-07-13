@@ -43,21 +43,10 @@ class User(AbstractUser):
         return self.username
 
 
-class UserGroup(models.Model):
-    name = models.CharField(max_length=100)
-    code = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="groups_created",
-    )
-    members = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name="user_groups", blank=True)
-
-    def __str__(self) -> str:
-        return self.name
-
-
 class Event(models.Model):
+    """A single year's Alternativ Jul. One dedicated org, one event at a
+    time in practice, but modeled per-year since the org runs annually."""
+
     CHECKIN_MODE_PERSONAL_QR = "personal_qr"
     CHECKIN_MODE_EVENT_QR = "event_qr"
     CHECKIN_MODE_CHOICES = (
@@ -69,7 +58,6 @@ class Event(models.Model):
     description = models.TextField(blank=True)
     date = models.DateTimeField(null=True, blank=True)
     code = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
-    auto_approve = models.BooleanField(default=False)
     checkin_mode = models.CharField(
         max_length=20,
         choices=CHECKIN_MODE_CHOICES,
@@ -79,16 +67,6 @@ class Event(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="events_created",
-    )
-    participants = models.ManyToManyField(
-        settings.AUTH_USER_MODEL,
-        related_name="events_participating",
-        blank=True,
-    )
-    groups = models.ManyToManyField(
-        UserGroup,
-        related_name="events",
-        blank=True,
     )
 
     def __str__(self) -> str:
@@ -115,69 +93,6 @@ class QRCode(models.Model):
         return self.data
 
 
-class GroupInvite(models.Model):
-    STATUS_PENDING = "pending"
-    STATUS_ACCEPTED = "accepted"
-    STATUS_DECLINED = "declined"
-    STATUS_CHOICES = (
-        (STATUS_PENDING, "Pending"),
-        (STATUS_ACCEPTED, "Accepted"),
-        (STATUS_DECLINED, "Declined"),
-    )
-
-    group = models.ForeignKey(UserGroup, on_delete=models.CASCADE, related_name="invites")
-    invitee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_invites")
-    invited_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_invites_sent")
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    created_at = models.DateTimeField(auto_now_add=True)
-    responded_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        unique_together = ("group", "invitee")
-
-
-class EventInvite(models.Model):
-    STATUS_PENDING = "pending"
-    STATUS_ACCEPTED = "accepted"
-    STATUS_DECLINED = "declined"
-    STATUS_CHOICES = (
-        (STATUS_PENDING, "Pending"),
-        (STATUS_ACCEPTED, "Accepted"),
-        (STATUS_DECLINED, "Declined"),
-    )
-
-    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="user_invites")
-    invitee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="event_invites")
-    invited_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="event_invites_sent")
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    created_at = models.DateTimeField(auto_now_add=True)
-    responded_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        unique_together = ("event", "invitee")
-
-
-class EventGroupInvite(models.Model):
-    STATUS_PENDING = "pending"
-    STATUS_ACCEPTED = "accepted"
-    STATUS_DECLINED = "declined"
-    STATUS_CHOICES = (
-        (STATUS_PENDING, "Pending"),
-        (STATUS_ACCEPTED, "Accepted"),
-        (STATUS_DECLINED, "Declined"),
-    )
-
-    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="group_invites")
-    group = models.ForeignKey(UserGroup, on_delete=models.CASCADE, related_name="event_invites")
-    invited_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="event_group_invites_sent")
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    created_at = models.DateTimeField(auto_now_add=True)
-    responded_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        unique_together = ("event", "group")
-
-
 class Shift(models.Model):
     """A single oppgave (task/role) within an Event on a given day, e.g.
     'Kjøkken' on 24 Dec, 18:00-22:00."""
@@ -200,7 +115,6 @@ class Shift(models.Model):
         choices=CRITICALITY_CHOICES,
         default=CRITICALITY_NORMAL,
     )
-    auto_approve = models.BooleanField(default=False)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -322,31 +236,3 @@ class Assignment(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user} assigned to {self.shift}"
-
-
-class Notification(models.Model):
-    TYPE_EVENT_INVITE = "event_invite"
-    TYPE_GROUP_INVITE = "group_invite"
-    TYPE_EVENT_GROUP_INVITE = "event_group_invite"
-    TYPE_CHOICES = (
-        (TYPE_EVENT_INVITE, "Event Invite"),
-        (TYPE_GROUP_INVITE, "Group Invite"),
-        (TYPE_EVENT_GROUP_INVITE, "Event Group Invite"),
-    )
-
-    recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications")
-    type = models.CharField(max_length=32, choices=TYPE_CHOICES)
-    event_invite = models.ForeignKey(EventInvite, null=True, blank=True, on_delete=models.CASCADE)
-    group_invite = models.ForeignKey(GroupInvite, null=True, blank=True, on_delete=models.CASCADE)
-    event_group_invite = models.ForeignKey(EventGroupInvite, null=True, blank=True, on_delete=models.CASCADE)
-    message = models.CharField(max_length=255)
-    is_read = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["-created_at"]
-
-    def mark_read(self):
-        if not self.is_read:
-            self.is_read = True
-            self.save(update_fields=["is_read"])
