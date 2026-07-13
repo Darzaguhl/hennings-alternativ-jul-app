@@ -97,9 +97,15 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'backend.wsgi.application'
 
-# Set DJANGO_CORS_ALLOW_ALL=False and configure CORS_ALLOWED_ORIGINS for
-# a real deployment -- wide open is fine for local dev only.
+# Set DJANGO_CORS_ALLOW_ALL=False and DJANGO_CORS_ALLOWED_ORIGINS (comma-
+# separated) for a real deployment -- wide open is fine for local dev only.
 CORS_ALLOW_ALL_ORIGINS = os.environ.get("DJANGO_CORS_ALLOW_ALL", "True") == "True"
+if not CORS_ALLOW_ALL_ORIGINS:
+    CORS_ALLOWED_ORIGINS = [
+        origin.strip()
+        for origin in os.environ.get("DJANGO_CORS_ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
