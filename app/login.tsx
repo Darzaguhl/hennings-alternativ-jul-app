@@ -8,19 +8,19 @@ import { useAuth } from "./AuthContext";
 export default function LoginScreen() {
   const { login } = useAuth();
   const router = useRouter();
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleLogin = async () => {
-    if (!username || !password) {
+    if (!email || !password) {
       Alert.alert("Feil", "Skriv inn både e-post og passord");
       return;
     }
 
     setLoading(true);
     try {
-      await login(username, password);
+      await login(email, password);
       router.replace("/events");
     } catch (err: any) {
       const message = err?.message ?? "Noe gikk galt";
@@ -41,8 +41,8 @@ export default function LoginScreen() {
         autoCapitalize="none"
         keyboardType="email-address"
         autoComplete="email"
-        value={username}
-        onChangeText={setUsername}
+        value={email}
+        onChangeText={setEmail}
       />
       <TextInput
         style={styles.input}

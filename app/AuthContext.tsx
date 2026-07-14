@@ -26,7 +26,7 @@ interface AuthContextType {
   refreshToken: string | null;
   currentUser: AuthUser | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   apiFetch: (...args: FetchArgs) => ReturnType<typeof fetch>;
 }
@@ -126,17 +126,17 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     setRefreshToken(null);
   }, []);
 
-  const login = useCallback(async (username: string, password: string) => {
+  const login = useCallback(async (email: string, password: string) => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/token/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ email, password }),
       });
 
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({}));
-        const message = errorBody?.detail ?? "Invalid credentials";
+        const message = errorBody?.detail ?? errorBody?.email?.[0] ?? "Invalid credentials";
         throw new Error(message);
       }
 
