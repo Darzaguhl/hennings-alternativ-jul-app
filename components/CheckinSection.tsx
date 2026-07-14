@@ -13,7 +13,7 @@ import {
 import QRCode from "react-native-qrcode-svg";
 import { theme } from "../constants/theme";
 import { useAuth } from "../app/AuthContext";
-import type { Shift } from "./OppgaverSection";
+import type { Shift } from "./VakterSection";
 
 type CheckinStatus = "assigned" | "already_assigned" | "pending_pool";
 
@@ -30,13 +30,13 @@ export default function CheckinSection({
   eventId,
   eventCode,
   checkinMode,
-  isOwner,
+  isCheckinStaff,
   onResolved,
 }: {
   eventId: number;
   eventCode?: string;
   checkinMode: "personal_qr" | "event_qr";
-  isOwner: boolean;
+  isCheckinStaff: boolean;
   onResolved?: () => void;
 }) {
   const { apiFetch } = useAuth();
@@ -188,13 +188,13 @@ export default function CheckinSection({
         <TouchableOpacity style={styles.primaryButton} onPress={() => openScanModal("self")}>
           <Text style={styles.primaryButtonText}>Scan to check in</Text>
         </TouchableOpacity>
-        {isOwner && eventCode && (
+        {isCheckinStaff && eventCode && (
           <TouchableOpacity style={styles.secondaryButton} onPress={() => setDisplayModalVisible(true)}>
             <Text style={styles.secondaryButtonText}>Show check-in code</Text>
           </TouchableOpacity>
         )}
         {scanModal}
-        {isOwner && eventCode && (
+        {isCheckinStaff && eventCode && (
           <Modal
             visible={displayModalVisible}
             animationType="slide"
@@ -222,7 +222,7 @@ export default function CheckinSection({
     );
   }
 
-  if (!isOwner) {
+  if (!isCheckinStaff) {
     return (
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Check-in</Text>
