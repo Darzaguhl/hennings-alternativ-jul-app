@@ -115,6 +115,8 @@ class EventSerializer(serializers.ModelSerializer):
         user = getattr(request, "user", None)
         if not user or not user.is_authenticated:
             return None
+        if obj.is_owner(user):
+            return Membership.ROLE_OWNER
         if obj.is_superadmin(user):
             return Membership.ROLE_SUPERADMIN
         if obj.is_checkin_staff(user):

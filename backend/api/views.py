@@ -211,7 +211,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         event = serializer.save(created_by=self.request.user)
-        Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_SUPERADMIN)
+        Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_OWNER)
 
     def perform_destroy(self, instance):
         if not instance.is_superadmin(self.request.user):
@@ -363,8 +363,14 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get", "post"], url_path="memberships")
     def memberships(self, request, pk=None):
-        """List (GET) or add (POST) superadmin/check-in-staff roles for this
-        event. Oppgave leadership isn't managed here — see Shift.leaders."""
+        """List (GET) or add (POST) owner/superadmin/check-in-staff roles
+        for this event. Oppgave leadership isn't managed here — see
+        Shift.leaders.
+
+        Granting owner or superadmin requires being an owner yourself, so no
+        single superadmin can unilaterally create more superadmins or lock
+        out the rest. A plain superadmin can still add/remove check-in
+        staff."""
 
         event = self.get_object()
         if not event.is_superadmin(request.user):
@@ -373,6 +379,12 @@ class EventViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             qs = Membership.objects.filter(event=event).select_related("user")
             return Response(MembershipSerializer(qs, many=True, context={"request": request}).data)
+
+        requested_role = request.data.get("role")
+        if requested_role in (Membership.ROLE_OWNER, Membership.ROLE_SUPERADMIN) and not event.is_owner(request.user):
+            return Response(
+                {"detail": "Only an owner can grant owner or superadmin access."}, status=status.HTTP_403_FORBIDDEN
+            )
 
         serializer = MembershipSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
@@ -392,9 +404,18 @@ class EventViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Only a superadmin can manage members."}, status=status.HTTP_403_FORBIDDEN)
 
         membership_id = request.data.get("membership_id")
-        deleted, _ = Membership.objects.filter(event=event, pk=membership_id).delete()
-        if not deleted:
+        membership = Membership.objects.filter(event=event, pk=membership_id).first()
+        if not membership:
             return Response({"detail": "Membership not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if membership.role in (Membership.ROLE_OWNER, Membership.ROLE_SUPERADMIN) and not event.is_owner(
+            request.user
+        ):
+            return Response(
+                {"detail": "Only an owner can remove owner or superadmin access."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        membership.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get"], url_path="metrics")
