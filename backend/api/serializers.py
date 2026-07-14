@@ -9,6 +9,7 @@ from .models import (
     EventCheckIn,
     Invite,
     Membership,
+    PasswordSetupToken,
     QRCode,
     Shift,
     ShiftSignup,
@@ -159,6 +160,27 @@ class AcceptInviteSerializer(serializers.Serializer):
         if not invite or not invite.is_usable:
             raise serializers.ValidationError("This invite link is invalid or has expired.")
         self.invite = invite
+        return value
+
+
+class PasswordSetupPreviewSerializer(serializers.Serializer):
+    """Public: what the set-password page shows before the volunteer picks
+    a password. No token in the response body, same reasoning as
+    InvitePreviewSerializer."""
+
+    email = serializers.EmailField(source="user.email", read_only=True)
+    is_usable = serializers.BooleanField(read_only=True)
+
+
+class SetPasswordSerializer(serializers.Serializer):
+    token = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8, validators=[validate_password_strength])
+
+    def validate_token(self, value):
+        setup_token = PasswordSetupToken.objects.filter(token=value).select_related("user").first()
+        if not setup_token or not setup_token.is_usable:
+            raise serializers.ValidationError("This link is invalid or has expired.")
+        self.setup_token = setup_token
         return value
 
 

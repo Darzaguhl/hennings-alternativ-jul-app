@@ -217,6 +217,46 @@ class Invite(models.Model):
         return self.accepted_at is None and not self.is_expired
 
 
+def generate_password_setup_token() -> str:
+    return uuid.uuid4().hex
+
+
+def default_password_setup_expiry():
+    return timezone.now() + timezone.timedelta(days=90)
+
+
+class PasswordSetupToken(models.Model):
+    """Lets a volunteer who registered without a password (the normal path
+    -- see RegisterSerializer, the public website deliberately doesn't
+    collect one) set one afterward so they can log in to the mobile app.
+    Created automatically right after a passwordless registration and
+    emailed to them (see email.send_password_setup_email); single-use like
+    Invite, and long-lived since volunteers often sign up months before the
+    event and may not act on the email right away."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="password_setup_tokens"
+    )
+    token = models.CharField(max_length=64, unique=True, default=generate_password_setup_token, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(default=default_password_setup_expiry)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"PasswordSetupToken({self.user.email})"
+
+    @property
+    def is_expired(self) -> bool:
+        return timezone.now() > self.expires_at
+
+    @property
+    def is_usable(self) -> bool:
+        return self.used_at is None and not self.is_expired
+
+
 def generate_qr_payload() -> str:
     """Return a stable, unique token to embed in a user's QR code."""
 
