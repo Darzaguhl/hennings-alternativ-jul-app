@@ -178,3 +178,8 @@ RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Hennings Alternativ Jul
 # link in invite emails. Differs between preprod/prod, so it's env-driven
 # like DJANGO_CORS_ALLOWED_ORIGINS rather than hardcoded.
 ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "http://localhost:5173")
+
+# Base URL of the public website, used to build the link in password-setup
+# emails (see email.send_password_setup_email). Differs between
+# preprod/prod, same reasoning as ADMIN_DASHBOARD_URL.
+WEBSITE_URL = os.environ.get("WEBSITE_URL", "http://localhost:4173")

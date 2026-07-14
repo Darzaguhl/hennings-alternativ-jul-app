@@ -4,7 +4,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (EmailTokenObtainPairView, EventViewSet, QRCodeViewSet,
                     RegisterView, ShiftViewSet, SkillViewSet, UserViewSet,
-                    accept_invite, invite_preview, public_event, public_skills)
+                    accept_invite, invite_preview, password_setup_preview,
+                    public_event, public_skills, set_password)
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet)
@@ -26,6 +27,10 @@ urlpatterns = [
     # Public: admin/staff invite accept flow
     path('invites/accept/', accept_invite, name='accept-invite'),
     path('invites/<str:token>/', invite_preview, name='invite-preview'),
+
+    # Public: volunteer password-setup flow (set-password.html on the website)
+    path('password-setup/confirm/', set_password, name='set-password'),
+    path('password-setup/<str:token>/', password_setup_preview, name='password-setup-preview'),
 
     # JWT token endpoints (login by email)
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),

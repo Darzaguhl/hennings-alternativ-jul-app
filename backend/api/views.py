@@ -11,13 +11,14 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .email import send_invite_email
+from .email import send_invite_email, send_password_setup_email
 from .models import (
     Assignment,
     Event,
     EventCheckIn,
     Invite,
     Membership,
+    PasswordSetupToken,
     QRCode,
     Shift,
     ShiftSignup,
@@ -31,9 +32,11 @@ from .serializers import (
     InvitePreviewSerializer,
     InviteSerializer,
     MembershipSerializer,
+    PasswordSetupPreviewSerializer,
     PublicEventSerializer,
     QRCodeSerializer,
     RegisterSerializer,
+    SetPasswordSerializer,
     ShiftSerializer,
     ShiftSignupSerializer,
     SkillSerializer,
@@ -126,14 +129,19 @@ def accept_invite(request):
 
 
 class RegisterView(generics.CreateAPIView):
-    """Public self-registration: email + password. Returns JWT tokens
-    immediately so the caller (website or app) can go straight into
+    """Public self-registration: email, optionally a password. Returns JWT
+    tokens immediately so the caller (website or app) can go straight into
     signing up for oppgaver without a separate login step.
 
     Gated by the active event's signup window (Event.signups_open) -- if
     there's no active event, or its window is closed, registration is
     refused rather than silently creating an account nobody can act on
-    yet."""
+    yet.
+
+    Registering without a password (the normal path -- the public website
+    deliberately doesn't collect one) also emails a link to set one later,
+    so the volunteer can log in to the mobile app instead of being stuck
+    with the one-time JWT this response returns. See PasswordSetupToken."""
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
@@ -149,6 +157,11 @@ class RegisterView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+
+        if not user.has_usable_password():
+            setup_token = PasswordSetupToken.objects.create(user=user)
+            send_password_setup_email(setup_token)
+
         refresh = RefreshToken.for_user(user)
         return Response(
             {
@@ -158,6 +171,41 @@ class RegisterView(generics.CreateAPIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+@api_view(["GET"])
+@permission_classes([permissions.AllowAny])
+def password_setup_preview(request, token):
+    """Unauthenticated: what the set-password page shows before the
+    volunteer picks a password -- which email, whether the link is still
+    usable. Same shape as invite_preview."""
+
+    setup_token = PasswordSetupToken.objects.select_related("user").filter(token=token).first()
+    if not setup_token:
+        return Response({"detail": "Link not found."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(PasswordSetupPreviewSerializer(setup_token).data)
+
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def set_password(request):
+    """Unauthenticated: redeem a PasswordSetupToken and set a password in
+    one step. Doesn't log the user in -- the whole point is they'll log in
+    later from the mobile app, which is a separate device/session."""
+
+    serializer = SetPasswordSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    setup_token = serializer.setup_token
+    password = serializer.validated_data["password"]
+
+    with transaction.atomic():
+        user = setup_token.user
+        user.set_password(password)
+        user.save(update_fields=["password"])
+        setup_token.used_at = timezone.now()
+        setup_token.save(update_fields=["used_at"])
+
+    return Response({"detail": "Password set. You can now log in with the app."})
 
 
 def _rank_candidates(signups):

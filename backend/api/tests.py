@@ -6,7 +6,18 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import Assignment, Event, EventCheckIn, Invite, Membership, QRCode, Shift, ShiftSignup, Skill
+from .models import (
+    Assignment,
+    Event,
+    EventCheckIn,
+    Invite,
+    Membership,
+    PasswordSetupToken,
+    QRCode,
+    Shift,
+    ShiftSignup,
+    Skill,
+)
 
 User = get_user_model()
 
@@ -830,6 +841,103 @@ class SignupWindowTests(TestCase):
         self.assertTrue(response.data["signups_open"])
         self.assertIsNotNone(response.data["signup_opens_at"])
         self.assertIsNotNone(response.data["signup_closes_at"])
+
+
+class PasswordSetupTests(TestCase):
+    """Registering without a password (the normal website path) should
+    leave the volunteer a way back in to the mobile app -- a
+    PasswordSetupToken, emailed to them, that lets them set one later."""
+
+    def setUp(self):
+        self.client = APIClient()
+        make_event(title="Hennings Alternativ Jul")
+
+    def test_passwordless_registration_creates_a_setup_token(self):
+        response = self.client.post("/api/register/", {"email": "passwordless@example.com"}, format="json")
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="passwordless@example.com")
+        self.assertTrue(PasswordSetupToken.objects.filter(user=user).exists())
+
+    def test_registration_with_a_password_does_not_create_a_setup_token(self):
+        response = self.client.post(
+            "/api/register/", {"email": "haspassword@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="haspassword@example.com")
+        self.assertFalse(PasswordSetupToken.objects.filter(user=user).exists())
+
+    def test_preview_shows_email_for_a_usable_token(self):
+        user = User.objects.create_user(username="preview@example.com", email="preview@example.com", password=None)
+        token = PasswordSetupToken.objects.create(user=user)
+        response = self.client.get(f"/api/password-setup/{token.token}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["email"], "preview@example.com")
+        self.assertTrue(response.data["is_usable"])
+
+    def test_preview_unknown_token_404s(self):
+        response = self.client.get("/api/password-setup/not-a-real-token/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_set_password_lets_the_user_log_in_afterward(self):
+        user = User.objects.create_user(username="setme@example.com", email="setme@example.com", password=None)
+        token = PasswordSetupToken.objects.create(user=user)
+
+        response = self.client.post(
+            "/api/password-setup/confirm/",
+            {"token": token.token, "password": "correct horse battery staple"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+        login = self.client.post(
+            "/api/token/", {"email": "setme@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertIn("access", login.data)
+
+    def test_set_password_marks_the_token_used(self):
+        user = User.objects.create_user(username="onceonly@example.com", email="onceonly@example.com", password=None)
+        token = PasswordSetupToken.objects.create(user=user)
+        self.client.post(
+            "/api/password-setup/confirm/",
+            {"token": token.token, "password": "correct horse battery staple"},
+            format="json",
+        )
+        token.refresh_from_db()
+        self.assertIsNotNone(token.used_at)
+        self.assertFalse(token.is_usable)
+
+    def test_set_password_rejects_an_already_used_token(self):
+        user = User.objects.create_user(username="reused@example.com", email="reused@example.com", password=None)
+        token = PasswordSetupToken.objects.create(user=user, used_at=timezone.now())
+        response = self.client.post(
+            "/api/password-setup/confirm/",
+            {"token": token.token, "password": "correct horse battery staple"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_set_password_rejects_an_expired_token(self):
+        user = User.objects.create_user(username="expired@example.com", email="expired@example.com", password=None)
+        token = PasswordSetupToken.objects.create(
+            user=user, expires_at=timezone.now() - datetime.timedelta(days=1)
+        )
+        response = self.client.post(
+            "/api/password-setup/confirm/",
+            {"token": token.token, "password": "correct horse battery staple"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_set_password_rejects_weak_password(self):
+        user = User.objects.create_user(username="weak@example.com", email="weak@example.com", password=None)
+        token = PasswordSetupToken.objects.create(user=user)
+        response = self.client.post(
+            "/api/password-setup/confirm/", {"token": token.token, "password": "1234"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        token.refresh_from_db()
+        self.assertTrue(token.is_usable)
 
 
 class MembershipRolesTests(TestCase):
