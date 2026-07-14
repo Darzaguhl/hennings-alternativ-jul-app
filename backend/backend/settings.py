@@ -167,3 +167,14 @@ STORAGES = {
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Resend (email) -- used for admin/staff invite emails. RESEND_API_KEY unset
+# means invite emails are skipped (logged instead), so local dev/tests don't
+# need a real key. RESEND_FROM_EMAIL must be on a domain verified in Resend.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Hennings Alternativ Jul <onboarding@resend.dev>")
+
+# Base URL of the admin dashboard for this environment, used to build the
+# link in invite emails. Differs between preprod/prod, so it's env-driven
+# like DJANGO_CORS_ALLOWED_ORIGINS rather than hardcoded.
+ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "http://localhost:5173")

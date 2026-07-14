@@ -6,7 +6,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import Assignment, Event, EventCheckIn, Membership, QRCode, Shift, ShiftSignup, Skill
+from .models import Assignment, Event, EventCheckIn, Invite, Membership, QRCode, Shift, ShiftSignup, Skill
 
 User = get_user_model()
 
@@ -1000,6 +1000,172 @@ class OwnerRoleTests(TestCase):
         event_id = response.data["id"]
         membership = Membership.objects.get(event_id=event_id, user=self.candidate)
         self.assertEqual(membership.role, Membership.ROLE_OWNER)
+
+
+class InviteTests(TestCase):
+    """Admin/staff invites: owner-gated for owner/admin roles (same tiering
+    as memberships), open to plain admins for check-in staff, and
+    accept_invite handles both brand-new emails and emails that already
+    have a passwordless volunteer account."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner", password="pw")
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        Membership.objects.create(event=self.event, user=self.admin, role=Membership.ROLE_ADMIN)
+        self.client = APIClient()
+
+    def test_owner_can_invite_admin(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/invites/",
+            {"email": "new-admin@example.com", "role": Membership.ROLE_ADMIN},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Invite.objects.filter(email="new-admin@example.com", role=Membership.ROLE_ADMIN).exists())
+
+    def test_plain_admin_cannot_invite_admin_or_owner(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/invites/",
+            {"email": "sneaky@example.com", "role": Membership.ROLE_ADMIN},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Invite.objects.filter(email="sneaky@example.com").exists())
+
+    def test_plain_admin_can_invite_checkin_staff(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/invites/",
+            {"email": "new-staff@example.com", "role": Membership.ROLE_CHECKIN_STAFF},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_volunteer_cannot_invite_anyone(self):
+        volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.client.force_authenticate(user=volunteer)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/invites/",
+            {"email": "x@example.com", "role": Membership.ROLE_CHECKIN_STAFF},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_invite_preview_shows_role_and_event(self):
+        invite = Invite.objects.create(
+            event=self.event, email="preview@example.com", role=Membership.ROLE_CHECKIN_STAFF, invited_by=self.owner
+        )
+        response = self.client.get(f"/api/invites/{invite.token}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["email"], "preview@example.com")
+        self.assertEqual(response.data["role"], Membership.ROLE_CHECKIN_STAFF)
+        self.assertEqual(response.data["event_title"], "Alternativ Jul")
+        self.assertTrue(response.data["is_usable"])
+
+    def test_invite_preview_unknown_token_404s(self):
+        response = self.client.get("/api/invites/not-a-real-token/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_accept_invite_creates_new_user_and_membership(self):
+        invite = Invite.objects.create(
+            event=self.event, email="brandnew@example.com", role=Membership.ROLE_ADMIN, invited_by=self.owner
+        )
+        response = self.client.post(
+            "/api/invites/accept/", {"token": invite.token, "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        user = User.objects.get(email="brandnew@example.com")
+        self.assertTrue(user.check_password("correct horse battery staple"))
+        self.assertTrue(Membership.objects.filter(event=self.event, user=user, role=Membership.ROLE_ADMIN).exists())
+        invite.refresh_from_db()
+        self.assertIsNotNone(invite.accepted_at)
+
+    def test_accept_invite_reuses_existing_passwordless_account(self):
+        """A volunteer who signed up passwordless via the website, later
+        invited as admin, gets a password added to their SAME account --
+        not a duplicate."""
+
+        existing = User.objects.create_user(username="already@example.com", email="already@example.com", password=None)
+        self.assertFalse(existing.has_usable_password())
+        invite = Invite.objects.create(
+            event=self.event, email="already@example.com", role=Membership.ROLE_CHECKIN_STAFF, invited_by=self.owner
+        )
+
+        response = self.client.post(
+            "/api/invites/accept/", {"token": invite.token, "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(User.objects.filter(email="already@example.com").count(), 1)
+        existing.refresh_from_db()
+        self.assertTrue(existing.has_usable_password())
+        self.assertTrue(existing.check_password("correct horse battery staple"))
+
+    def test_accept_invite_rejects_expired_token(self):
+        invite = Invite.objects.create(
+            event=self.event, email="late@example.com", role=Membership.ROLE_CHECKIN_STAFF, invited_by=self.owner
+        )
+        Invite.objects.filter(pk=invite.pk).update(expires_at=timezone.now() - datetime.timedelta(days=1))
+        response = self.client.post(
+            "/api/invites/accept/", {"token": invite.token, "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_accept_invite_rejects_already_accepted_token(self):
+        invite = Invite.objects.create(
+            event=self.event,
+            email="reused@example.com",
+            role=Membership.ROLE_CHECKIN_STAFF,
+            invited_by=self.owner,
+            accepted_at=timezone.now(),
+        )
+        response = self.client.post(
+            "/api/invites/accept/", {"token": invite.token, "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_accept_invite_rejects_weak_password(self):
+        invite = Invite.objects.create(
+            event=self.event, email="weak@example.com", role=Membership.ROLE_CHECKIN_STAFF, invited_by=self.owner
+        )
+        response = self.client.post("/api/invites/accept/", {"token": invite.token, "password": "1234"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(User.objects.filter(email="weak@example.com").exists())
+
+    def test_owner_can_revoke_admin_invite(self):
+        invite = Invite.objects.create(
+            event=self.event, email="revoke-me@example.com", role=Membership.ROLE_ADMIN, invited_by=self.owner
+        )
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/revoke-invite/", {"invite_id": invite.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Invite.objects.filter(pk=invite.pk).exists())
+
+    def test_plain_admin_cannot_revoke_admin_invite(self):
+        invite = Invite.objects.create(
+            event=self.event, email="protected@example.com", role=Membership.ROLE_ADMIN, invited_by=self.owner
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/revoke-invite/", {"invite_id": invite.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Invite.objects.filter(pk=invite.pk).exists())
+
+    def test_plain_admin_can_revoke_checkin_staff_invite(self):
+        invite = Invite.objects.create(
+            event=self.event, email="staff-invite@example.com", role=Membership.ROLE_CHECKIN_STAFF, invited_by=self.owner
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/revoke-invite/", {"invite_id": invite.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 204)
 
 
 class PoolFifoOrderingTests(TestCase):
