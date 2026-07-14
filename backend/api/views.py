@@ -32,6 +32,7 @@ from .serializers import (
     ShiftSerializer,
     ShiftSignupSerializer,
     SkillSerializer,
+    UserAdminNoteSerializer,
     UserSerializer,
 )
 
@@ -131,6 +132,18 @@ def _can_view_pool(event, user) -> bool:
     return Shift.objects.filter(event=event, leaders=user).exists()
 
 
+def _is_any_event_admin(user) -> bool:
+    """Admin notes on a User aren't scoped to one event -- the org runs one
+    event at a time in practice -- so this checks admin/owner status on any
+    event rather than requiring an event in the URL."""
+
+    if not user.is_authenticated:
+        return False
+    if Event.objects.filter(created_by=user).exists():
+        return True
+    return Membership.objects.filter(user=user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]).exists()
+
+
 def _resolve_checkin(event, user, performed_by):
     """Check `user` in to `event` for today and try to resolve a single
     Assignment automatically.
@@ -203,6 +216,25 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(request.user)
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get", "patch"], url_path="notes")
+    def notes(self, request, pk=None):
+        """Private admin notes about a volunteer (behavior, previous years,
+        etc.) -- deliberately not on the regular User serializer, which the
+        volunteer themselves can see via /me and which is embedded all over
+        the API (shift participants, pool, leaders)."""
+
+        if not _is_any_event_admin(request.user):
+            return Response({"detail": "Only an event admin can view or edit notes."}, status=status.HTTP_403_FORBIDDEN)
+
+        user = self.get_object()
+        if request.method == "GET":
+            return Response(UserAdminNoteSerializer(user).data)
+
+        serializer = UserAdminNoteSerializer(user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
 
 class EventViewSet(viewsets.ModelViewSet):
     queryset = Event.objects.all().select_related("created_by")
@@ -214,13 +246,13 @@ class EventViewSet(viewsets.ModelViewSet):
         Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_OWNER)
 
     def perform_destroy(self, instance):
-        if not instance.is_superadmin(self.request.user):
-            raise PermissionDenied("Only a superadmin can delete this event.")
+        if not instance.is_admin(self.request.user):
+            raise PermissionDenied("Only a admin can delete this event.")
         instance.delete()
 
     def perform_update(self, serializer):
-        if not self.get_object().is_superadmin(self.request.user):
-            raise PermissionDenied("Only a superadmin can update this event.")
+        if not self.get_object().is_admin(self.request.user):
+            raise PermissionDenied("Only a admin can update this event.")
         serializer.save()
 
     @action(detail=True, methods=["post"], url_path="checkin")
@@ -329,7 +361,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
-        """Superadmin or the target oppgave's leader confirms a specific
+        """Admin or the target oppgave's leader confirms a specific
         oppgave for a checked-in, unassigned volunteer — the final step out
         of the pool."""
 
@@ -343,9 +375,9 @@ class EventViewSet(viewsets.ModelViewSet):
         attendee = get_object_or_404(User, pk=user_id)
         shift = get_object_or_404(Shift, pk=shift_id, event=event)
 
-        if not (event.is_superadmin(request.user) or shift.is_led_by(request.user)):
+        if not (event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only a superadmin or this oppgave's leader can assign it."},
+                {"detail": "Only a admin or this oppgave's leader can assign it."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -368,27 +400,27 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get", "post"], url_path="memberships")
     def memberships(self, request, pk=None):
-        """List (GET) or add (POST) owner/superadmin/check-in-staff roles
+        """List (GET) or add (POST) owner/admin/check-in-staff roles
         for this event. Oppgave leadership isn't managed here — see
         Shift.leaders.
 
-        Granting owner or superadmin requires being an owner yourself, so no
-        single superadmin can unilaterally create more superadmins or lock
-        out the rest. A plain superadmin can still add/remove check-in
+        Granting owner or admin requires being an owner yourself, so no
+        single admin can unilaterally create more admins or lock
+        out the rest. A plain admin can still add/remove check-in
         staff."""
 
         event = self.get_object()
-        if not event.is_superadmin(request.user):
-            return Response({"detail": "Only a superadmin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only a admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
 
         if request.method == "GET":
             qs = Membership.objects.filter(event=event).select_related("user")
             return Response(MembershipSerializer(qs, many=True, context={"request": request}).data)
 
         requested_role = request.data.get("role")
-        if requested_role in (Membership.ROLE_OWNER, Membership.ROLE_SUPERADMIN) and not event.is_owner(request.user):
+        if requested_role in (Membership.ROLE_OWNER, Membership.ROLE_ADMIN) and not event.is_owner(request.user):
             return Response(
-                {"detail": "Only an owner can grant owner or superadmin access."}, status=status.HTTP_403_FORBIDDEN
+                {"detail": "Only an owner can grant owner or admin access."}, status=status.HTTP_403_FORBIDDEN
             )
 
         serializer = MembershipSerializer(data=request.data, context={"request": request})
@@ -405,19 +437,19 @@ class EventViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="remove-membership")
     def remove_membership(self, request, pk=None):
         event = self.get_object()
-        if not event.is_superadmin(request.user):
-            return Response({"detail": "Only a superadmin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only a admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
 
         membership_id = request.data.get("membership_id")
         membership = Membership.objects.filter(event=event, pk=membership_id).first()
         if not membership:
             return Response({"detail": "Membership not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if membership.role in (Membership.ROLE_OWNER, Membership.ROLE_SUPERADMIN) and not event.is_owner(
+        if membership.role in (Membership.ROLE_OWNER, Membership.ROLE_ADMIN) and not event.is_owner(
             request.user
         ):
             return Response(
-                {"detail": "Only an owner can remove owner or superadmin access."}, status=status.HTTP_403_FORBIDDEN
+                {"detail": "Only an owner can remove owner or admin access."}, status=status.HTTP_403_FORBIDDEN
             )
 
         membership.delete()
@@ -482,22 +514,22 @@ class ShiftViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         event = serializer.validated_data["event"]
-        if not event.is_superadmin(self.request.user):
-            raise PermissionDenied("Only a superadmin can add vakter.")
+        if not event.is_admin(self.request.user):
+            raise PermissionDenied("Only a admin can add vakter.")
         serializer.save(created_by=self.request.user)
 
     def perform_update(self, serializer):
         shift = self.get_object()
-        is_superadmin = shift.event.is_superadmin(self.request.user)
-        if not (is_superadmin or shift.is_led_by(self.request.user)):
-            raise PermissionDenied("Only a superadmin or this oppgave's leader can edit it.")
-        if "leaders" in serializer.validated_data and not is_superadmin:
-            raise PermissionDenied("Only a superadmin can change this oppgave's leaders.")
+        is_admin = shift.event.is_admin(self.request.user)
+        if not (is_admin or shift.is_led_by(self.request.user)):
+            raise PermissionDenied("Only a admin or this oppgave's leader can edit it.")
+        if "leaders" in serializer.validated_data and not is_admin:
+            raise PermissionDenied("Only a admin can change this oppgave's leaders.")
         serializer.save()
 
     def perform_destroy(self, instance):
-        if not instance.event.is_superadmin(self.request.user):
-            raise PermissionDenied("Only a superadmin can delete this vakt.")
+        if not instance.event.is_admin(self.request.user):
+            raise PermissionDenied("Only a admin can delete this vakt.")
         instance.delete()
 
     @action(detail=True, methods=["post"], url_path="signup")
@@ -558,9 +590,9 @@ class ShiftViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="assignments")
     def assignments(self, request, pk=None):
         shift = self.get_object()
-        if not (shift.event.is_superadmin(request.user) or shift.is_led_by(request.user)):
+        if not (shift.event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only a superadmin or this oppgave's leader can view assignments."},
+                {"detail": "Only a admin or this oppgave's leader can view assignments."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         serializer = AssignmentSerializer(
