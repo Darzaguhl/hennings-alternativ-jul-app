@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.password_validation import validate_password as validate_password_strength
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
@@ -38,13 +38,33 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ["id", "username", "email", "skills", "skill_ids", "experience_notes"]
 
 
-class RegisterSerializer(serializers.ModelSerializer):
-    """Public self-registration: email + password. `username` is set equal
-    to the email internally so the rest of the codebase (which still refers
-    to User.username in places) keeps working without change; login itself
-    goes through EmailBackend, not username."""
+class UserAdminNoteSerializer(serializers.ModelSerializer):
+    """Deliberately separate from UserSerializer, which is embedded all over
+    the API (shift participants, leaders, pool entries, /me) and returned to
+    the volunteer themselves. admin_notes must never appear in that path --
+    only fetched/edited via UserViewSet.notes, which checks the requester is
+    an event admin/owner first."""
 
-    password = serializers.CharField(write_only=True, min_length=8, validators=[validate_password])
+    class Meta:
+        model = User
+        fields = ["id", "email", "admin_notes"]
+        read_only_fields = ["id", "email"]
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    """Public self-registration: email, optionally a password. `username` is
+    set equal to the email internally so the rest of the codebase (which
+    still refers to User.username in places) keeps working without change;
+    login itself goes through EmailBackend, not username.
+
+    Volunteers don't need a password -- they get a JWT session immediately
+    on registration and that's enough to use the app/site they signed up
+    from. Admins/staff who need to log in to the admin dashboard from
+    scratch should supply a password so they can do a real email+password
+    login later; omitting it leaves the account with Django's standard
+    unusable-password marker (set_password(None)), not a guessable default."""
+
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default="")
     skill_ids = serializers.PrimaryKeyRelatedField(
         source="skills",
         queryset=Skill.objects.all(),
@@ -62,12 +82,21 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("An account with this email already exists.")
         return value
 
+    def validate_password(self, value):
+        if not value:
+            return value
+        if len(value) < 8:
+            raise serializers.ValidationError("Password must be at least 8 characters.")
+        validate_password_strength(value)
+        return value
+
     def create(self, validated_data):
         skills = validated_data.pop("skills", [])
+        password = validated_data.get("password") or None
         user = User.objects.create_user(
             username=validated_data["email"],
             email=validated_data["email"],
-            password=validated_data["password"],
+            password=password,
         )
         if skills:
             user.skills.set(skills)
@@ -117,8 +146,8 @@ class EventSerializer(serializers.ModelSerializer):
             return None
         if obj.is_owner(user):
             return Membership.ROLE_OWNER
-        if obj.is_superadmin(user):
-            return Membership.ROLE_SUPERADMIN
+        if obj.is_admin(user):
+            return Membership.ROLE_ADMIN
         if obj.is_checkin_staff(user):
             return Membership.ROLE_CHECKIN_STAFF
         if obj.shifts.filter(leaders=user).exists():

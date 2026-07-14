@@ -506,6 +506,62 @@ class UserSkillsTests(TestCase):
         self.assertEqual([s["name"] for s in response.data["skills"]], ["Vekter"])
 
 
+class AdminNoteTests(TestCase):
+    """admin_notes is private staff-only commentary on a volunteer (e.g.
+    behavior from previous years) -- must never leak via the regular
+    UserSerializer, and only event admins/owners can view or edit it."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner", password="pw")
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.checkin_staff = User.objects.create_user(username="staff", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        Membership.objects.create(event=self.event, user=self.admin, role=Membership.ROLE_ADMIN)
+        Membership.objects.create(event=self.event, user=self.checkin_staff, role=Membership.ROLE_CHECKIN_STAFF)
+        self.volunteer.admin_notes = "No-showed for an assigned vakt in 2025."
+        self.volunteer.save()
+
+    def test_event_admin_can_read_notes(self):
+        client = APIClient()
+        client.force_authenticate(user=self.admin)
+        response = client.get(f"/api/users/{self.volunteer.id}/notes/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["admin_notes"], "No-showed for an assigned vakt in 2025.")
+
+    def test_owner_can_write_notes(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.patch(
+            f"/api/users/{self.volunteer.id}/notes/", {"admin_notes": "Great with kids, ask for again."}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.volunteer.refresh_from_db()
+        self.assertEqual(self.volunteer.admin_notes, "Great with kids, ask for again.")
+
+    def test_checkin_staff_cannot_view_or_edit_notes(self):
+        client = APIClient()
+        client.force_authenticate(user=self.checkin_staff)
+        response = client.get(f"/api/users/{self.volunteer.id}/notes/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_plain_volunteer_cannot_view_or_edit_notes(self):
+        client = APIClient()
+        client.force_authenticate(user=self.volunteer)
+        response = client.get(f"/api/users/{self.volunteer.id}/notes/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_notes_never_appear_on_regular_user_serializer(self):
+        client = APIClient()
+        client.force_authenticate(user=self.volunteer)
+        response = client.get("/api/users/me/")
+        self.assertNotIn("admin_notes", response.data)
+
+        client.force_authenticate(user=self.admin)
+        response = client.get(f"/api/users/{self.volunteer.id}/")
+        self.assertNotIn("admin_notes", response.data)
+
+
 class UserOwnershipTests(TestCase):
     def setUp(self):
         self.alice = User.objects.create_user(username="alice", password="pw")
@@ -609,6 +665,31 @@ class RegistrationAndEmailLoginTests(TestCase):
         self.assertEqual(response.data["user"]["email"], "new.volunteer@example.com")
         self.assertTrue(User.objects.filter(email="new.volunteer@example.com").exists())
 
+    def test_register_without_password_still_works_and_returns_tokens(self):
+        """Volunteers don't need a password -- they get a usable JWT session
+        immediately from registration, same as everyone else."""
+
+        response = self.client.post(
+            "/api/register/",
+            {"email": "passwordless.volunteer@example.com"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("access", response.data)
+        user = User.objects.get(email="passwordless.volunteer@example.com")
+        self.assertFalse(user.has_usable_password())
+
+    def test_register_without_password_cannot_be_logged_into_later(self):
+        """An unusable password means nobody -- including an attacker
+        guessing a password -- can log in via /api/token/."""
+
+        self.client.post("/api/register/", {"email": "passwordless2@example.com"}, format="json")
+        response = self.client.post(
+            "/api/token/", {"email": "passwordless2@example.com", "password": "some guessed password"}, format="json"
+        )
+        self.assertNotEqual(response.status_code, 200)
+        self.assertNotIn("access", response.data)
+
     def test_register_accepts_skill_ids_and_sets_them_on_the_user(self):
         kokk = Skill.objects.create(name="Kokk")
         vertskap = Skill.objects.create(name="Vertskap")
@@ -675,13 +756,13 @@ class RegistrationAndEmailLoginTests(TestCase):
 
 class MembershipRolesTests(TestCase):
     def setUp(self):
-        self.superadmin = User.objects.create_user(username="super", password="pw")
+        self.admin = User.objects.create_user(username="super", password="pw")
         self.staff = User.objects.create_user(username="staff", password="pw")
         self.leader = User.objects.create_user(username="leader", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
         self.event = Event.objects.create(
             title="Alternativ Jul",
-            created_by=self.superadmin,
+            created_by=self.admin,
             checkin_mode=Event.CHECKIN_MODE_PERSONAL_QR,
         )
         Membership.objects.create(event=self.event, user=self.staff, role=Membership.ROLE_CHECKIN_STAFF)
@@ -692,7 +773,7 @@ class MembershipRolesTests(TestCase):
             date=self.today,
             start_time=datetime.time(18, 0),
             end_time=datetime.time(22, 0),
-            created_by=self.superadmin,
+            created_by=self.admin,
         )
         self.kitchen.leaders.add(self.leader)
         self.hosting = Shift.objects.create(
@@ -701,14 +782,14 @@ class MembershipRolesTests(TestCase):
             date=self.today,
             start_time=datetime.time(18, 0),
             end_time=datetime.time(23, 0),
-            created_by=self.superadmin,
+            created_by=self.admin,
         )
 
-    def test_creator_is_auto_superadmin(self):
-        self.assertTrue(self.event.is_superadmin(self.superadmin))
+    def test_creator_is_auto_admin(self):
+        self.assertTrue(self.event.is_admin(self.admin))
 
-    def test_checkin_staff_is_not_superadmin(self):
-        self.assertFalse(self.event.is_superadmin(self.staff))
+    def test_checkin_staff_is_not_admin(self):
+        self.assertFalse(self.event.is_admin(self.staff))
         self.assertTrue(self.event.is_checkin_staff(self.staff))
 
     def test_shift_leader_is_scoped_to_their_shift_only(self):
@@ -790,9 +871,9 @@ class MembershipRolesTests(TestCase):
         )
         self.assertEqual(response.status_code, 403)
 
-    def test_superadmin_can_manage_memberships(self):
+    def test_admin_can_manage_memberships(self):
         client = APIClient()
-        client.force_authenticate(user=self.superadmin)
+        client.force_authenticate(user=self.admin)
 
         response = client.post(
             f"/api/events/{self.event.id}/memberships/",
@@ -806,7 +887,7 @@ class MembershipRolesTests(TestCase):
         self.assertEqual(listing.status_code, 200)
         self.assertEqual(len(listing.data), 2)  # staff + newly added volunteer
 
-    def test_non_superadmin_cannot_manage_memberships(self):
+    def test_non_admin_cannot_manage_memberships(self):
         client = APIClient()
         client.force_authenticate(user=self.staff)
         response = client.post(
@@ -818,24 +899,24 @@ class MembershipRolesTests(TestCase):
 
 
 class OwnerRoleTests(TestCase):
-    """Only an owner can grant or revoke owner/superadmin access -- a plain
-    superadmin (granted via Membership, not the event creator) can still
-    manage check-in staff but not the superadmin tier itself."""
+    """Only an owner can grant or revoke owner/admin access -- a plain
+    admin (granted via Membership, not the event creator) can still
+    manage check-in staff but not the admin tier itself."""
 
     def setUp(self):
         self.owner = User.objects.create_user(username="owner", password="pw")
-        self.granted_superadmin = User.objects.create_user(username="granted-super", password="pw")
+        self.granted_admin = User.objects.create_user(username="granted-super", password="pw")
         self.candidate = User.objects.create_user(username="candidate", password="pw")
         self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
-        Membership.objects.create(event=self.event, user=self.granted_superadmin, role=Membership.ROLE_SUPERADMIN)
+        Membership.objects.create(event=self.event, user=self.granted_admin, role=Membership.ROLE_ADMIN)
 
     def test_creator_is_owner(self):
         self.assertTrue(self.event.is_owner(self.owner))
-        self.assertTrue(self.event.is_superadmin(self.owner))
+        self.assertTrue(self.event.is_admin(self.owner))
 
-    def test_granted_superadmin_is_not_owner(self):
-        self.assertFalse(self.event.is_owner(self.granted_superadmin))
-        self.assertTrue(self.event.is_superadmin(self.granted_superadmin))
+    def test_granted_admin_is_not_owner(self):
+        self.assertFalse(self.event.is_owner(self.granted_admin))
+        self.assertTrue(self.event.is_admin(self.granted_admin))
 
     def test_viewer_role_reports_owner_distinctly(self):
         client = APIClient()
@@ -843,32 +924,32 @@ class OwnerRoleTests(TestCase):
         response = client.get(f"/api/events/{self.event.id}/")
         self.assertEqual(response.data["viewer_role"], "owner")
 
-        client.force_authenticate(user=self.granted_superadmin)
+        client.force_authenticate(user=self.granted_admin)
         response = client.get(f"/api/events/{self.event.id}/")
-        self.assertEqual(response.data["viewer_role"], "superadmin")
+        self.assertEqual(response.data["viewer_role"], "admin")
 
-    def test_owner_can_grant_superadmin(self):
+    def test_owner_can_grant_admin(self):
         client = APIClient()
         client.force_authenticate(user=self.owner)
         response = client.post(
             f"/api/events/{self.event.id}/memberships/",
-            {"user_id": self.candidate.id, "role": Membership.ROLE_SUPERADMIN},
+            {"user_id": self.candidate.id, "role": Membership.ROLE_ADMIN},
             format="json",
         )
         self.assertEqual(response.status_code, 201)
-        self.assertTrue(self.event.is_superadmin(self.candidate))
+        self.assertTrue(self.event.is_admin(self.candidate))
 
-    def test_plain_superadmin_cannot_grant_superadmin_or_owner(self):
+    def test_plain_admin_cannot_grant_admin_or_owner(self):
         client = APIClient()
-        client.force_authenticate(user=self.granted_superadmin)
+        client.force_authenticate(user=self.granted_admin)
 
         response = client.post(
             f"/api/events/{self.event.id}/memberships/",
-            {"user_id": self.candidate.id, "role": Membership.ROLE_SUPERADMIN},
+            {"user_id": self.candidate.id, "role": Membership.ROLE_ADMIN},
             format="json",
         )
         self.assertEqual(response.status_code, 403)
-        self.assertFalse(self.event.is_superadmin(self.candidate))
+        self.assertFalse(self.event.is_admin(self.candidate))
 
         response = client.post(
             f"/api/events/{self.event.id}/memberships/",
@@ -877,9 +958,9 @@ class OwnerRoleTests(TestCase):
         )
         self.assertEqual(response.status_code, 403)
 
-    def test_plain_superadmin_can_still_grant_checkin_staff(self):
+    def test_plain_admin_can_still_grant_checkin_staff(self):
         client = APIClient()
-        client.force_authenticate(user=self.granted_superadmin)
+        client.force_authenticate(user=self.granted_admin)
         response = client.post(
             f"/api/events/{self.event.id}/memberships/",
             {"user_id": self.candidate.id, "role": Membership.ROLE_CHECKIN_STAFF},
@@ -888,20 +969,20 @@ class OwnerRoleTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertTrue(self.event.is_checkin_staff(self.candidate))
 
-    def test_plain_superadmin_cannot_remove_another_superadmin(self):
+    def test_plain_admin_cannot_remove_another_admin(self):
         other_super = User.objects.create_user(username="other-super", password="pw")
-        membership = Membership.objects.create(event=self.event, user=other_super, role=Membership.ROLE_SUPERADMIN)
+        membership = Membership.objects.create(event=self.event, user=other_super, role=Membership.ROLE_ADMIN)
 
         client = APIClient()
-        client.force_authenticate(user=self.granted_superadmin)
+        client.force_authenticate(user=self.granted_admin)
         response = client.post(
             f"/api/events/{self.event.id}/remove-membership/", {"membership_id": membership.id}, format="json"
         )
         self.assertEqual(response.status_code, 403)
         self.assertTrue(Membership.objects.filter(pk=membership.pk).exists())
 
-    def test_owner_can_remove_a_superadmin(self):
-        membership = Membership.objects.get(user=self.granted_superadmin, event=self.event)
+    def test_owner_can_remove_a_admin(self):
+        membership = Membership.objects.get(user=self.granted_admin, event=self.event)
 
         client = APIClient()
         client.force_authenticate(user=self.owner)

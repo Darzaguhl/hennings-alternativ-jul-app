@@ -24,6 +24,11 @@ class User(AbstractUser):
         blank=True,
         help_text="Freeform background: previous experience, education, certifications.",
     )
+    admin_notes = models.TextField(
+        blank=True,
+        help_text="Private notes for admins only, e.g. behavior from previous years. "
+        "Never exposed to the volunteer themselves -- see UserAdminNoteSerializer.",
+    )
     groups = models.ManyToManyField(
         Group,
         related_name="api_user_groups",
@@ -79,35 +84,35 @@ class Event(models.Model):
             return True
         return self.memberships.filter(user=user, role=Membership.ROLE_OWNER).exists()
 
-    def is_superadmin(self, user) -> bool:
+    def is_admin(self, user) -> bool:
         if not user.is_authenticated:
             return False
         if self.is_owner(user):
             return True
-        return self.memberships.filter(user=user, role=Membership.ROLE_SUPERADMIN).exists()
+        return self.memberships.filter(user=user, role=Membership.ROLE_ADMIN).exists()
 
     def is_checkin_staff(self, user) -> bool:
-        if self.is_superadmin(user):
+        if self.is_admin(user):
             return True
         return self.memberships.filter(user=user, role=Membership.ROLE_CHECKIN_STAFF).exists()
 
 
 class Membership(models.Model):
     """Event-wide admin roles. The owner can manage everything, including
-    granting/revoking superadmin access -- superadmins can manage everything
+    granting/revoking admin access -- admins can manage everything
     else (vakter, check-in staff, pool/assignment) but can't create or
-    remove other superadmins/owners, so no single compromised or careless
-    superadmin account can lock out the rest. Oppgave-level leadership is
+    remove other admins/owners, so no single compromised or careless
+    admin account can lock out the rest. Oppgave-level leadership is
     scoped per-Shift instead (see Shift.leaders), since a leader's authority
     doesn't extend to the whole event.
     """
 
     ROLE_OWNER = "owner"
-    ROLE_SUPERADMIN = "superadmin"
+    ROLE_ADMIN = "admin"
     ROLE_CHECKIN_STAFF = "checkin_staff"
     ROLE_CHOICES = (
         (ROLE_OWNER, "Owner"),
-        (ROLE_SUPERADMIN, "Superadmin"),
+        (ROLE_ADMIN, "Admin"),
         (ROLE_CHECKIN_STAFF, "Check-in staff"),
     )
 
