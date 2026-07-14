@@ -223,6 +223,47 @@ class EventCheckinResolutionTests(TestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def test_manual_checkin_by_user_id_works(self):
+        """Check-in staff picking someone from a list (no QR scan) --
+        e.g. the admin dashboard's manual check-in flow."""
+
+        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "assigned")
+        self.assertTrue(EventCheckIn.objects.filter(event=self.event, user=self.volunteer).exists())
+
+    def test_manual_checkin_by_user_id_ignores_checkin_mode(self):
+        """Unlike user_code (tied to personal_qr mode), an admin manually
+        checking someone in works regardless of the event's checkin_mode."""
+
+        self.event.checkin_mode = Event.CHECKIN_MODE_EVENT_QR
+        self.event.save()
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 202)  # pending_pool, no candidates signed up
+
+    def test_manual_checkin_requires_checkin_staff(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/",
+            {"user_id": self.organizer.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_checkin_without_user_id_or_user_code_is_rejected(self):
+        response = self.client.post(f"/api/events/{self.event.id}/checkin/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+
 
 class SelfCheckinTests(TestCase):
     """Event-QR self check-in: the volunteer scans one shared code, no
