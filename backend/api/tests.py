@@ -17,9 +17,14 @@ def make_event(**kwargs):
     to created_by (ownership is purely a Membership role, so it stays
     revocable/transferable -- see Event.is_owner), so tests that create
     events directly instead of going through the API need this to end up
-    with the same permissions a real created event would have."""
+    with the same permissions a real created event would have.
+
+    Defaults is_active=True, since most tests just need a working event and
+    aren't concerned with activation -- pass is_active=False explicitly for
+    tests that are."""
 
     creator = kwargs.get("created_by")
+    kwargs.setdefault("is_active", True)
     event = Event.objects.create(**kwargs)
     if creator is not None:
         Membership.objects.create(event=event, user=creator, role=Membership.ROLE_OWNER)
@@ -1062,6 +1067,81 @@ class OwnerRoleTests(TestCase):
         self.assertTrue(self.event.is_owner(second_owner))
 
 
+class EventActivationTests(TestCase):
+    """Multiple Event rows can exist (e.g. next year's set up ahead of
+    time), but exactly one is ever active -- activate() is exclusive, and
+    only an owner can activate/deactivate/delete."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner", password="pw")
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.event_a = make_event(title="Alternativ Jul 2026", created_by=self.owner, is_active=True)
+        self.event_b = make_event(title="Alternativ Jul 2027", created_by=self.owner, is_active=False)
+        Membership.objects.create(event=self.event_a, user=self.admin, role=Membership.ROLE_ADMIN)
+        self.client = APIClient()
+
+    def test_new_event_starts_inactive(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.post("/api/events/", {"title": "Alternativ Jul 2028"}, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(response.data["is_active"])
+
+    def test_activating_one_event_deactivates_the_others(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.post(f"/api/events/{self.event_b.id}/activate/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["is_active"])
+
+        self.event_a.refresh_from_db()
+        self.event_b.refresh_from_db()
+        self.assertFalse(self.event_a.is_active)
+        self.assertTrue(self.event_b.is_active)
+
+    def test_deactivate_turns_off_just_that_event(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.post(f"/api/events/{self.event_a.id}/deactivate/")
+        self.assertEqual(response.status_code, 200)
+        self.event_a.refresh_from_db()
+        self.assertFalse(self.event_a.is_active)
+
+    def test_plain_admin_cannot_activate_or_deactivate(self):
+        client = APIClient()
+        client.force_authenticate(user=self.admin)
+
+        response = client.post(f"/api/events/{self.event_b.id}/activate/")
+        self.assertEqual(response.status_code, 403)
+
+        response = client.post(f"/api/events/{self.event_a.id}/deactivate/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_only_owner_can_delete_event(self):
+        client = APIClient()
+        client.force_authenticate(user=self.admin)
+        response = client.delete(f"/api/events/{self.event_b.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Event.objects.filter(pk=self.event_b.pk).exists())
+
+        client.force_authenticate(user=self.owner)
+        response = client.delete(f"/api/events/{self.event_b.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Event.objects.filter(pk=self.event_b.pk).exists())
+
+    def test_public_event_only_returns_the_active_one(self):
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.data["title"], "Alternativ Jul 2026")
+
+        self.event_b.is_active = True
+        self.event_b.save()
+        self.event_a.is_active = False
+        self.event_a.save()
+
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.data["title"], "Alternativ Jul 2027")
+
+
 class InviteTests(TestCase):
     """Admin/staff invites: owner-gated for owner/admin roles (same tiering
     as memberships), open to plain admins for check-in staff, and
@@ -1375,8 +1455,19 @@ class PublicEventEndpointTests(TestCase):
         response = self.client.get("/api/public/event/")
         self.assertEqual(response.status_code, 404)
 
-    def test_public_event_returns_most_recently_created_event(self):
-        newer = make_event(title="Alternativ Jul 2027", created_by=self.organizer)
+    def test_public_event_returns_whichever_event_is_active(self):
+        # A newer event existing isn't enough on its own -- see
+        # EventActivationTests for the full activate/deactivate behavior.
+        # This just confirms public_event follows is_active, not recency.
+        newer = make_event(title="Alternativ Jul 2027", created_by=self.organizer, is_active=False)
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.data["id"], self.event.id)
+
+        self.event.is_active = False
+        self.event.save()
+        newer.is_active = True
+        newer.save()
+
         response = self.client.get("/api/public/event/")
         self.assertEqual(response.data["id"], newer.id)
 

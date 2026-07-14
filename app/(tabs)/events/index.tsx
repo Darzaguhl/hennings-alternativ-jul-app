@@ -33,8 +33,10 @@ interface EventDetail {
   description?: string;
   date?: string;
   code?: string;
+  is_active?: boolean;
   checkin_mode?: CheckinMode;
   created_by?: { id: number; username: string };
+  viewer_role?: string | null;
 }
 
 const CHECKIN_MODE_OPTIONS: { value: CheckinMode; label: string }[] = [
@@ -55,21 +57,24 @@ const combineDateAndTime = (current: Date | null, mode: "date" | "time", incomin
 };
 
 /**
- * This app is dedicated to a single organization, so there's exactly one
- * event to manage rather than a browsable list. This screen fetches it
- * (the first/only result from /api/events/) and shows it directly. If none
- * exists yet, any signed-in user can create it once (first-time setup).
+ * Multiple events (years) can exist, but only one is ever "active" -- that's
+ * the one the public website/app show by default. This screen shows the
+ * active event, with a switcher (owner-only) to view/manage past or
+ * upcoming years and to activate/deactivate/delete them.
  */
 export default function EventScreen() {
   const { apiFetch, currentUser } = useAuth();
   const { timeFormat, dateFormat } = useSettings();
 
-  const [event, setEvent] = useState<EventDetail | null>(null);
+  const [events, setEvents] = useState<EventDetail[]>([]);
+  const [selectedEventId, setSelectedEventId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
 
   const [showFormModal, setShowFormModal] = useState(false);
+  const [formMode, setFormMode] = useState<"edit" | "create">("edit");
   const [saving, setSaving] = useState(false);
   const [formTitle, setFormTitle] = useState("");
   const [formDescription, setFormDescription] = useState("");
@@ -79,7 +84,7 @@ export default function EventScreen() {
   const [showPicker, setShowPicker] = useState(false);
   const [iosPickerValue, setIosPickerValue] = useState(() => new Date());
 
-  const loadEvent = useCallback(
+  const loadEvents = useCallback(
     async ({ silent = false }: { silent?: boolean } = {}) => {
       if (!silent) {
         setLoading(true);
@@ -87,11 +92,16 @@ export default function EventScreen() {
       }
       try {
         const response = await apiFetch("/api/events/");
-        if (!response.ok) throw new Error(`Unable to load event (${response.status})`);
+        if (!response.ok) throw new Error(`Unable to load events (${response.status})`);
         const data: EventDetail[] = await response.json();
-        setEvent(data[0] ?? null);
+        const sorted = [...data].sort((a, b) => b.id - a.id);
+        setEvents(sorted);
+        setSelectedEventId((prev) => {
+          if (prev && sorted.some((e) => e.id === prev)) return prev;
+          return sorted.find((e) => e.is_active)?.id ?? sorted[0]?.id ?? null;
+        });
       } catch (err) {
-        console.error("Error loading event", err);
+        console.error("Error loading events", err);
         if (!silent) setError("Could not load the event.");
       } finally {
         if (!silent) setLoading(false);
@@ -101,14 +111,19 @@ export default function EventScreen() {
   );
 
   useEffect(() => {
-    loadEvent();
-  }, [loadEvent]);
+    loadEvents();
+  }, [loadEvents]);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadEvent({ silent: true });
+    await loadEvents({ silent: true });
     setRefreshing(false);
-  }, [loadEvent]);
+  }, [loadEvents]);
+
+  const event = useMemo(
+    () => events.find((e) => e.id === selectedEventId) ?? null,
+    [events, selectedEventId]
+  );
 
   const formattedDate = useMemo(() => {
     if (!event?.date) return null;
@@ -166,20 +181,25 @@ export default function EventScreen() {
     [formDateTime, timeFormat]
   );
 
-  const openFormModal = useCallback(() => {
-    if (event) {
-      setFormTitle(event.title);
-      setFormDescription(event.description ?? "");
-      setFormCheckinMode(event.checkin_mode ?? "event_qr");
-      setFormDateTime(event.date ? new Date(event.date) : null);
-    } else {
-      setFormTitle("");
-      setFormDescription("");
-      setFormCheckinMode("event_qr");
-      setFormDateTime(null);
-    }
-    setShowFormModal(true);
-  }, [event]);
+  const openFormModal = useCallback(
+    (mode: "edit" | "create" = "edit") => {
+      const editingExisting = mode === "edit" && !!event;
+      setFormMode(editingExisting ? "edit" : "create");
+      if (editingExisting && event) {
+        setFormTitle(event.title);
+        setFormDescription(event.description ?? "");
+        setFormCheckinMode(event.checkin_mode ?? "event_qr");
+        setFormDateTime(event.date ? new Date(event.date) : null);
+      } else {
+        setFormTitle("");
+        setFormDescription("");
+        setFormCheckinMode("event_qr");
+        setFormDateTime(null);
+      }
+      setShowFormModal(true);
+    },
+    [event]
+  );
 
   const closeFormModal = useCallback(() => {
     setShowFormModal(false);
@@ -204,8 +224,9 @@ export default function EventScreen() {
 
     setSaving(true);
     try {
-      const url = event ? `/api/events/${event.id}/` : "/api/events/";
-      const method = event ? "PATCH" : "POST";
+      const editingExisting = formMode === "edit" && !!event;
+      const url = editingExisting ? `/api/events/${event!.id}/` : "/api/events/";
+      const method = editingExisting ? "PATCH" : "POST";
       const response = await apiFetch(url, {
         method,
         headers: { "Content-Type": "application/json" },
@@ -216,20 +237,24 @@ export default function EventScreen() {
         throw new Error(body?.detail ?? "Unable to save the event.");
       }
       const saved: EventDetail = await response.json();
-      setEvent(saved);
+      setEvents((prev) => {
+        const exists = prev.some((e) => e.id === saved.id);
+        return exists ? prev.map((e) => (e.id === saved.id ? saved : e)) : [saved, ...prev];
+      });
+      setSelectedEventId(saved.id);
       closeFormModal();
     } catch (err: any) {
       console.error("Error saving event", err);
       Alert.alert("Error", err?.message ?? "Failed to save the event.");
       setSaving(false);
     }
-  }, [apiFetch, event, formTitle, formDescription, formCheckinMode, formDateTime, closeFormModal]);
+  }, [apiFetch, event, formMode, formTitle, formDescription, formCheckinMode, formDateTime, closeFormModal]);
 
   const handleDelete = useCallback(() => {
     if (!event) return;
     Alert.alert(
       "Delete Event",
-      "Are you sure you want to delete this event? This removes all its oppgaver too.",
+      `Are you sure you want to delete "${event.title}"? This permanently removes all its oppgaver, vakter, and check-in history too. This cannot be undone.`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -242,7 +267,8 @@ export default function EventScreen() {
                 const body = await response.json().catch(() => ({}));
                 throw new Error(body?.detail ?? "Failed to delete event.");
               }
-              setEvent(null);
+              setEvents((prev) => prev.filter((e) => e.id !== event.id));
+              setSelectedEventId((prev) => (prev === event.id ? null : prev));
             } catch (err: any) {
               console.error(err);
               Alert.alert("Error", err?.message ?? "Unable to delete event.");
@@ -253,14 +279,60 @@ export default function EventScreen() {
     );
   }, [apiFetch, event]);
 
-  const isOwner = event?.created_by?.id === currentUser?.id;
+  const handleActivate = useCallback(async () => {
+    if (!event) return;
+    setSwitching(true);
+    try {
+      const response = await apiFetch(`/api/events/${event.id}/activate/`, { method: "POST" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.detail ?? "Unable to activate this event.");
+      }
+      await loadEvents({ silent: true });
+    } catch (err: any) {
+      console.error("Error activating event", err);
+      Alert.alert("Error", err?.message ?? "Failed to activate event.");
+    } finally {
+      setSwitching(false);
+    }
+  }, [apiFetch, event, loadEvents]);
+
+  const handleDeactivate = useCallback(async () => {
+    if (!event) return;
+    setSwitching(true);
+    try {
+      const response = await apiFetch(`/api/events/${event.id}/deactivate/`, { method: "POST" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.detail ?? "Unable to deactivate this event.");
+      }
+      await loadEvents({ silent: true });
+    } catch (err: any) {
+      console.error("Error deactivating event", err);
+      Alert.alert("Error", err?.message ?? "Failed to deactivate event.");
+    } finally {
+      setSwitching(false);
+    }
+  }, [apiFetch, event, loadEvents]);
+
+  const isOwner = event?.viewer_role === "owner";
+
+  const eventYearLabel = useCallback((candidate: EventDetail) => {
+    if (candidate.date) {
+      const parsed = new Date(candidate.date);
+      if (!Number.isNaN(parsed.getTime())) return `${parsed.getFullYear()}`;
+    }
+    return candidate.title;
+  }, []);
 
   const formModal = (
     <Modal transparent animationType="slide" visible={showFormModal} onRequestClose={closeFormModal}>
       <View style={styles.modalOverlay}>
         <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.modalContainer}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>{event ? "Update event details" : "Create the event"}</Text>
+            <Text style={styles.modalTitle}>
+              {formMode === "edit" && event ? "Update event details" : "Create a new event"}
+            </Text>
             <ScrollView contentContainerStyle={styles.modalScroll}>
               <TextInput style={styles.input} placeholder="Title" value={formTitle} onChangeText={setFormTitle} />
 
@@ -372,7 +444,7 @@ export default function EventScreen() {
         <View style={styles.centered}>
           <Text style={styles.emptyTitle}>No event set up yet</Text>
           <Text style={styles.emptySubtitle}>Create the event to get started.</Text>
-          <TouchableOpacity style={styles.addButton} onPress={openFormModal}>
+          <TouchableOpacity style={styles.addButton} onPress={() => openFormModal("create")}>
             <Text style={styles.addButtonText}>+ Create event</Text>
           </TouchableOpacity>
         </View>
@@ -387,11 +459,49 @@ export default function EventScreen() {
         contentContainerStyle={styles.container}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
       >
+        {(isOwner || events.length > 1) && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.eventSwitcherRow}>
+            {events.map((e) => (
+              <TouchableOpacity
+                key={e.id}
+                style={[styles.eventChip, e.id === selectedEventId && styles.eventChipSelected]}
+                onPress={() => setSelectedEventId(e.id)}
+              >
+                {e.is_active && <View style={styles.eventChipDot} />}
+                <Text style={[styles.eventChipText, e.id === selectedEventId && styles.eventChipTextSelected]}>
+                  {eventYearLabel(e)}
+                </Text>
+              </TouchableOpacity>
+            ))}
+            {isOwner && (
+              <TouchableOpacity style={styles.eventChipAdd} onPress={() => openFormModal("create")}>
+                <Text style={styles.eventChipAddText}>+ New</Text>
+              </TouchableOpacity>
+            )}
+          </ScrollView>
+        )}
+
         <View style={styles.headerRow}>
-          <Text style={styles.title}>{event.title}</Text>
+          <View style={styles.titleColumn}>
+            <Text style={styles.title}>{event.title}</Text>
+            <View style={[styles.statusBadge, event.is_active ? styles.statusBadgeActive : styles.statusBadgeInactive]}>
+              <Text style={[styles.statusBadgeText, event.is_active && styles.statusBadgeTextActive]}>
+                {event.is_active ? "Active — shown on website & app" : "Inactive"}
+              </Text>
+            </View>
+          </View>
           {isOwner && (
             <View style={styles.headerActions}>
-              <TouchableOpacity style={styles.manageButton} onPress={openFormModal}>
+              {event.is_active ? (
+                <TouchableOpacity style={styles.manageButton} onPress={handleDeactivate} disabled={switching}>
+                  <Text style={styles.manageButtonText}>Deactivate</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity style={styles.manageButton} onPress={handleActivate} disabled={switching}>
+                  <Text style={styles.manageButtonText}>Activate</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity style={styles.manageButton} onPress={() => openFormModal("edit")}>
                 <Text style={styles.manageButtonText}>Edit</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.deleteButton} onPress={handleDelete}>
@@ -409,9 +519,10 @@ export default function EventScreen() {
 
         <CheckinSection
           eventId={event.id}
+          eventCode={event.code}
           checkinMode={event.checkin_mode ?? "event_qr"}
           isOwner={isOwner}
-          onResolved={() => loadEvent({ silent: true })}
+          onResolved={() => loadEvents({ silent: true })}
         />
 
         <OppgaverSection eventId={event.id} isOwner={isOwner} />
@@ -436,9 +547,40 @@ const styles = StyleSheet.create({
   emptySubtitle: { fontSize: 14, color: "#64748b", textAlign: "center" },
   addButton: { backgroundColor: theme.primary, paddingHorizontal: 18, paddingVertical: 10, borderRadius: 999, marginTop: 8 },
   addButtonText: { color: "white", fontWeight: "600" },
+  eventSwitcherRow: { flexDirection: "row", gap: 8, paddingBottom: 4 },
+  eventChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 20,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: "#d0d7e2",
+    backgroundColor: "#fff",
+  },
+  eventChipSelected: { backgroundColor: theme.primary, borderColor: theme.primary },
+  eventChipText: { color: "#1f2937", fontSize: 13, fontWeight: "500" },
+  eventChipTextSelected: { color: "#f8fafc" },
+  eventChipDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: theme.accent },
+  eventChipAdd: {
+    borderRadius: 20,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: "#d0d7e2",
+    borderStyle: "dashed",
+  },
+  eventChipAddText: { color: "#475569", fontSize: 13, fontWeight: "600" },
   headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
-  headerActions: { flexDirection: "row", gap: 8 },
-  title: { fontSize: 26, fontWeight: "700", color: "#0f172a", flex: 1 },
+  headerActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" },
+  titleColumn: { flex: 1, gap: 6 },
+  title: { fontSize: 26, fontWeight: "700", color: "#0f172a" },
+  statusBadge: { alignSelf: "flex-start", borderRadius: 999, paddingVertical: 3, paddingHorizontal: 10 },
+  statusBadgeActive: { backgroundColor: "#dcfce7" },
+  statusBadgeInactive: { backgroundColor: "#f1f5f9" },
+  statusBadgeText: { fontSize: 12, fontWeight: "600", color: "#64748b" },
+  statusBadgeTextActive: { color: "#166534" },
   meta: { fontSize: 14, color: "#475569" },
   description: { fontSize: 15, color: "#1f2937" },
   placeholder: { fontSize: 14, color: "#94a3b8", fontStyle: "italic" },

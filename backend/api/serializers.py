@@ -175,11 +175,15 @@ class EventSerializer(serializers.ModelSerializer):
             "description",
             "date",
             "code",
+            "is_active",
             "checkin_mode",
             "created_by",
             "viewer_role",
         ]
-        read_only_fields = ["created_by"]
+        # is_active is read-only here on purpose -- it's exclusive (only one
+        # event active at a time), so it only changes via the dedicated
+        # activate/deactivate actions, which handle deactivating the rest.
+        read_only_fields = ["created_by", "is_active"]
 
     def get_viewer_role(self, obj):
         request = self.context.get("request")

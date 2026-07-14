@@ -50,7 +50,7 @@ def public_event(request):
     than opening up EventViewSet/ShiftViewSet -- those embed full volunteer
     profiles (emails) in participants/leaders, which must stay private."""
 
-    event = Event.objects.order_by("-id").prefetch_related("shifts").first()
+    event = Event.objects.filter(is_active=True).prefetch_related("shifts").first()
     if not event:
         return Response({"detail": "No event configured yet."}, status=status.HTTP_404_NOT_FOUND)
     return Response(PublicEventSerializer(event, context={"request": request}).data)
@@ -301,14 +301,37 @@ class EventViewSet(viewsets.ModelViewSet):
         Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_OWNER)
 
     def perform_destroy(self, instance):
-        if not instance.is_admin(self.request.user):
-            raise PermissionDenied("Only an admin can delete this event.")
+        if not instance.is_owner(self.request.user):
+            raise PermissionDenied("Only an owner can delete this event.")
         instance.delete()
 
     def perform_update(self, serializer):
         if not self.get_object().is_admin(self.request.user):
             raise PermissionDenied("Only an admin can update this event.")
         serializer.save()
+
+    @action(detail=True, methods=["post"], url_path="activate")
+    def activate(self, request, pk=None):
+        """Make this the one active event -- deactivates every other event
+        in the same transaction, since exactly one is ever active."""
+
+        event = self.get_object()
+        if not event.is_owner(request.user):
+            raise PermissionDenied("Only an owner can activate an event.")
+        with transaction.atomic():
+            Event.objects.exclude(pk=event.pk).filter(is_active=True).update(is_active=False)
+            event.is_active = True
+            event.save(update_fields=["is_active"])
+        return Response(EventSerializer(event, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        event = self.get_object()
+        if not event.is_owner(request.user):
+            raise PermissionDenied("Only an owner can deactivate an event.")
+        event.is_active = False
+        event.save(update_fields=["is_active"])
+        return Response(EventSerializer(event, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="checkin")
     def checkin(self, request, pk=None):
