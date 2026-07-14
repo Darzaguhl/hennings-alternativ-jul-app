@@ -225,32 +225,37 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="checkin")
     def checkin(self, request, pk=None):
-        """Personal-QR check-in: check-in staff scan a volunteer's own badge.
+        """Check in a volunteer for today; resolves automatically when the
+        person has exactly one non-critical oppgave signed up for today,
+        otherwise they're added to the pool for admin assignment.
 
-        Used when Event.checkin_mode == CHECKIN_MODE_PERSONAL_QR. Resolves
-        automatically when the scanned person has exactly one non-critical
-        oppgave signed up for today; otherwise they're checked in and added
-        to the pool for admin assignment via `assign`.
-        """
+        Accepts either `user_code` (scan a personal QR badge -- only valid
+        when checkin_mode is personal_qr) or `user_id` (check-in staff pick
+        someone from a list manually, e.g. the admin dashboard's Innsjekk
+        page when there's no QR to scan -- available regardless of mode)."""
 
         event = self.get_object()
-        if event.checkin_mode != Event.CHECKIN_MODE_PERSONAL_QR:
-            return Response(
-                {"detail": "This event uses event-QR self check-in, not personal-QR admit."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         if not event.is_checkin_staff(request.user):
             return Response({"detail": "Only check-in staff can check in attendees."}, status=status.HTTP_403_FORBIDDEN)
 
+        user_id = request.data.get("user_id")
         user_code = request.data.get("user_code")
-        if not user_code:
-            return Response({"detail": "user_code is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        qr = QRCode.objects.filter(data=user_code).select_related("user").first()
-        if not qr:
-            return Response({"detail": "QR code not found"}, status=status.HTTP_404_NOT_FOUND)
+        if user_id:
+            attendee = get_object_or_404(User, pk=user_id)
+        elif user_code:
+            if event.checkin_mode != Event.CHECKIN_MODE_PERSONAL_QR:
+                return Response(
+                    {"detail": "This event uses event-QR self check-in, not personal-QR admit."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qr = QRCode.objects.filter(data=user_code).select_related("user").first()
+            if not qr:
+                return Response({"detail": "QR code not found"}, status=status.HTTP_404_NOT_FOUND)
+            attendee = qr.user
+        else:
+            return Response({"detail": "user_id or user_code is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        attendee = qr.user
         result = _resolve_checkin(event, attendee, performed_by=request.user)
         return _checkin_response(attendee, result, request)
 
