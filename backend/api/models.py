@@ -49,8 +49,11 @@ class User(AbstractUser):
 
 
 class Event(models.Model):
-    """A single year's Alternativ Jul. One dedicated org, one event at a
-    time in practice, but modeled per-year since the org runs annually."""
+    """The org's event -- effectively permanent (runs every December until
+    the org itself winds down), not recreated per year. created_by is kept
+    purely as a record of who originally set it up; it carries no ongoing
+    permission weight (see is_owner) and losing that account must not take
+    the event down with it, hence SET_NULL rather than CASCADE."""
 
     CHECKIN_MODE_PERSONAL_QR = "personal_qr"
     CHECKIN_MODE_EVENT_QR = "event_qr"
@@ -70,7 +73,9 @@ class Event(models.Model):
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="events_created",
     )
 
@@ -78,10 +83,14 @@ class Event(models.Model):
         return f"{self.title} ({self.code})"
 
     def is_owner(self, user) -> bool:
+        """Ownership is purely a Membership role -- no permanent fallback
+        tied to whoever historically created the row. perform_create still
+        grants the creator an owner Membership up front (see EventViewSet),
+        but from then on it's a normal, revocable/transferable role like
+        any other, and remove_membership refuses to remove the last one."""
+
         if not user.is_authenticated:
             return False
-        if self.created_by_id == user.pk:
-            return True
         return self.memberships.filter(user=user, role=Membership.ROLE_OWNER).exists()
 
     def is_admin(self, user) -> bool:

@@ -11,6 +11,21 @@ from .models import Assignment, Event, EventCheckIn, Invite, Membership, QRCode,
 User = get_user_model()
 
 
+def make_event(**kwargs):
+    """Create an Event plus the owner Membership its creator would get via
+    EventViewSet.perform_create in real usage. is_owner() has no fallback
+    to created_by (ownership is purely a Membership role, so it stays
+    revocable/transferable -- see Event.is_owner), so tests that create
+    events directly instead of going through the API need this to end up
+    with the same permissions a real created event would have."""
+
+    creator = kwargs.get("created_by")
+    event = Event.objects.create(**kwargs)
+    if creator is not None:
+        Membership.objects.create(event=event, user=creator, role=Membership.ROLE_OWNER)
+    return event
+
+
 class ShiftSignupTests(TestCase):
     """Signup is now just a candidate shortlist: a user may hold several
     ShiftSignups for the same day. The old one-vakt-per-day exclusivity
@@ -19,7 +34,7 @@ class ShiftSignupTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
         self.kitchen = Shift.objects.create(
             event=self.event,
             title="Kjøkken",
@@ -70,7 +85,7 @@ class AssignmentConstraintTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
         self.kitchen = Shift.objects.create(
             event=self.event,
             title="Kjøkken",
@@ -123,7 +138,7 @@ class EventCheckinResolutionTests(TestCase):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
         self.qr = QRCode.objects.create(user=self.volunteer)
-        self.event = Event.objects.create(
+        self.event = make_event(
             title="Alternativ Jul",
             created_by=self.organizer,
             checkin_mode=Event.CHECKIN_MODE_PERSONAL_QR,
@@ -272,7 +287,7 @@ class SelfCheckinTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(
+        self.event = make_event(
             title="Alternativ Jul",
             created_by=self.organizer,
             checkin_mode=Event.CHECKIN_MODE_EVENT_QR,
@@ -312,7 +327,7 @@ class PoolAndAssignTests(TestCase):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.cook = User.objects.create_user(username="cook", password="pw")
         self.newbie = User.objects.create_user(username="newbie", password="pw")
-        self.event = Event.objects.create(
+        self.event = make_event(
             title="Alternativ Jul",
             created_by=self.organizer,
             checkin_mode=Event.CHECKIN_MODE_EVENT_QR,
@@ -418,7 +433,7 @@ class ShiftSignupEndpointTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
         self.kitchen = Shift.objects.create(
             event=self.event,
             title="Kjøkken",
@@ -516,7 +531,7 @@ class AdminNoteTests(TestCase):
         self.admin = User.objects.create_user(username="admin", password="pw")
         self.checkin_staff = User.objects.create_user(username="staff", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        self.event = make_event(title="Alternativ Jul", created_by=self.owner)
         Membership.objects.create(event=self.event, user=self.admin, role=Membership.ROLE_ADMIN)
         Membership.objects.create(event=self.event, user=self.checkin_staff, role=Membership.ROLE_CHECKIN_STAFF)
         self.volunteer.admin_notes = "No-showed for an assigned vakt in 2025."
@@ -609,7 +624,7 @@ class OwnershipEnforcementRegressionTests(TestCase):
         self.client.force_authenticate(user=self.intruder)
 
     def test_non_owner_cannot_update_or_delete_event(self):
-        event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        event = make_event(title="Alternativ Jul", created_by=self.owner)
 
         update = self.client.patch(f"/api/events/{event.id}/", {"title": "hijacked"}, format="json")
         delete = self.client.delete(f"/api/events/{event.id}/")
@@ -619,7 +634,7 @@ class OwnershipEnforcementRegressionTests(TestCase):
         self.assertTrue(Event.objects.filter(pk=event.pk, title="Alternativ Jul").exists())
 
     def test_non_owner_cannot_create_update_or_delete_shift_on_someone_elses_event(self):
-        event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        event = make_event(title="Alternativ Jul", created_by=self.owner)
         shift = Shift.objects.create(
             event=event,
             title="Kjøkken",
@@ -760,7 +775,7 @@ class MembershipRolesTests(TestCase):
         self.staff = User.objects.create_user(username="staff", password="pw")
         self.leader = User.objects.create_user(username="leader", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(
+        self.event = make_event(
             title="Alternativ Jul",
             created_by=self.admin,
             checkin_mode=Event.CHECKIN_MODE_PERSONAL_QR,
@@ -885,7 +900,7 @@ class MembershipRolesTests(TestCase):
 
         listing = client.get(f"/api/events/{self.event.id}/memberships/")
         self.assertEqual(listing.status_code, 200)
-        self.assertEqual(len(listing.data), 2)  # staff + newly added volunteer
+        self.assertEqual(len(listing.data), 3)  # creator's owner membership + staff + newly added volunteer
 
     def test_non_admin_cannot_manage_memberships(self):
         client = APIClient()
@@ -907,7 +922,7 @@ class OwnerRoleTests(TestCase):
         self.owner = User.objects.create_user(username="owner", password="pw")
         self.granted_admin = User.objects.create_user(username="granted-super", password="pw")
         self.candidate = User.objects.create_user(username="candidate", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        self.event = make_event(title="Alternativ Jul", created_by=self.owner)
         Membership.objects.create(event=self.event, user=self.granted_admin, role=Membership.ROLE_ADMIN)
 
     def test_creator_is_owner(self):
@@ -1001,6 +1016,51 @@ class OwnerRoleTests(TestCase):
         membership = Membership.objects.get(event_id=event_id, user=self.candidate)
         self.assertEqual(membership.role, Membership.ROLE_OWNER)
 
+    def test_created_by_alone_grants_no_permissions(self):
+        """The event is permanent, not owned forever by whoever happened to
+        create the row -- created_by carries no special access unless
+        there's also an explicit owner Membership."""
+
+        bystander = User.objects.create_user(username="bystander", password="pw")
+        bare_event = Event.objects.create(title="No membership row", created_by=bystander)
+        self.assertFalse(bare_event.is_owner(bystander))
+        self.assertFalse(bare_event.is_admin(bystander))
+
+    def test_deleting_creator_account_does_not_delete_the_event(self):
+        creator = User.objects.create_user(username="temp-creator", password="pw")
+        event = make_event(title="Survives creator deletion", created_by=creator)
+        event_id = event.id
+
+        creator.delete()
+
+        survived = Event.objects.get(pk=event_id)
+        self.assertIsNone(survived.created_by)
+
+    def test_cannot_remove_the_last_owner(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        owner_membership = Membership.objects.get(event=self.event, user=self.owner, role=Membership.ROLE_OWNER)
+
+        response = client.post(
+            f"/api/events/{self.event.id}/remove-membership/", {"membership_id": owner_membership.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(Membership.objects.filter(pk=owner_membership.pk).exists())
+
+    def test_can_remove_an_owner_when_another_owner_remains(self):
+        second_owner = User.objects.create_user(username="second-owner", password="pw")
+        Membership.objects.create(event=self.event, user=second_owner, role=Membership.ROLE_OWNER)
+
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        owner_membership = Membership.objects.get(event=self.event, user=self.owner, role=Membership.ROLE_OWNER)
+
+        response = client.post(
+            f"/api/events/{self.event.id}/remove-membership/", {"membership_id": owner_membership.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(self.event.is_owner(second_owner))
+
 
 class InviteTests(TestCase):
     """Admin/staff invites: owner-gated for owner/admin roles (same tiering
@@ -1011,7 +1071,7 @@ class InviteTests(TestCase):
     def setUp(self):
         self.owner = User.objects.create_user(username="owner", password="pw")
         self.admin = User.objects.create_user(username="admin", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        self.event = make_event(title="Alternativ Jul", created_by=self.owner)
         Membership.objects.create(event=self.event, user=self.admin, role=Membership.ROLE_ADMIN)
         self.client = APIClient()
 
@@ -1173,7 +1233,7 @@ class PoolFifoOrderingTests(TestCase):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.first_arrival = User.objects.create_user(username="first", password="pw")
         self.second_arrival = User.objects.create_user(username="second", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
         self.today = datetime.date.today()
 
         first_checkin = EventCheckIn.objects.create(event=self.event, user=self.first_arrival, date=self.today)
@@ -1196,7 +1256,7 @@ class MetricsTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
         self.today = datetime.date.today()
         self.kitchen = Shift.objects.create(
             event=self.event,
@@ -1230,7 +1290,7 @@ class MetricsTests(TestCase):
 class ShiftCapacityTests(TestCase):
     def test_is_understaffed_reflects_min_capacity(self):
         organizer = User.objects.create_user(username="organizer", password="pw")
-        event = Event.objects.create(title="Alternativ Jul", created_by=organizer)
+        event = make_event(title="Alternativ Jul", created_by=organizer)
         shift = Shift.objects.create(
             event=event,
             title="Kjøkken",
@@ -1255,7 +1315,7 @@ class CancelAssignmentTests(TestCase):
     def test_volunteer_can_cancel_their_own_assignment(self):
         organizer = User.objects.create_user(username="organizer", password="pw")
         volunteer = User.objects.create_user(username="volunteer", password="pw")
-        event = Event.objects.create(title="Alternativ Jul", created_by=organizer)
+        event = make_event(title="Alternativ Jul", created_by=organizer)
         shift = Shift.objects.create(
             event=event,
             title="Kjøkken",
@@ -1277,7 +1337,7 @@ class CancelAssignmentTests(TestCase):
 class PublicEventEndpointTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", email="organizer@example.com", password="pw")
-        self.event = Event.objects.create(title="Alternativ Jul", description="Julefeiring for alle", created_by=self.organizer)
+        self.event = make_event(title="Alternativ Jul", description="Julefeiring for alle", created_by=self.organizer)
         self.kitchen = Shift.objects.create(
             event=self.event,
             title="Kjøkken",
@@ -1316,7 +1376,7 @@ class PublicEventEndpointTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_public_event_returns_most_recently_created_event(self):
-        newer = Event.objects.create(title="Alternativ Jul 2027", created_by=self.organizer)
+        newer = make_event(title="Alternativ Jul 2027", created_by=self.organizer)
         response = self.client.get("/api/public/event/")
         self.assertEqual(response.data["id"], newer.id)
 
