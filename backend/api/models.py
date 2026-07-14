@@ -49,11 +49,18 @@ class User(AbstractUser):
 
 
 class Event(models.Model):
-    """The org's event -- effectively permanent (runs every December until
-    the org itself winds down), not recreated per year. created_by is kept
-    purely as a record of who originally set it up; it carries no ongoing
-    permission weight (see is_owner) and losing that account must not take
-    the event down with it, hence SET_NULL rather than CASCADE."""
+    """One year's Alternativ Jul. Multiple Event rows can exist (next year's
+    can be set up ahead of time while this year's is still live), but
+    exactly one is ever "active" -- is_active -- which is what the public
+    website/app show volunteers (see public_event) and what the app's
+    single-event screen loads. Activating one deactivates all others (see
+    EventViewSet.activate); a freshly created event starts inactive so
+    setting one up ahead of time doesn't silently replace what's live.
+
+    created_by is kept purely as a record of who originally set it up; it
+    carries no ongoing permission weight (see is_owner) and losing that
+    account must not take the event down with it, hence SET_NULL rather
+    than CASCADE."""
 
     CHECKIN_MODE_PERSONAL_QR = "personal_qr"
     CHECKIN_MODE_EVENT_QR = "event_qr"
@@ -66,6 +73,10 @@ class Event(models.Model):
     description = models.TextField(blank=True)
     date = models.DateTimeField(null=True, blank=True)
     code = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
+    is_active = models.BooleanField(
+        default=False,
+        help_text="The one event the public website/app show. Only one event is active at a time.",
+    )
     checkin_mode = models.CharField(
         max_length=20,
         choices=CHECKIN_MODE_CHOICES,
