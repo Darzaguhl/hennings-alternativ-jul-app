@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { theme } from "../../constants/theme";
 import { useAuth } from "../AuthContext";
 import { useSettings } from "../SettingsContext";
 
@@ -230,9 +231,9 @@ const styles = StyleSheet.create({
     backgroundColor: "#f8fafc",
     color: "#0f172a",
   },
-  saveButton: { backgroundColor: "#2563eb", paddingVertical: 10, borderRadius: 8, alignItems: "center" },
+  saveButton: { backgroundColor: theme.accent, paddingVertical: 10, borderRadius: 8, alignItems: "center" },
   saveButtonDisabled: { opacity: 0.5 },
-  saveButtonText: { color: "white", fontWeight: "600" },
+  saveButtonText: { color: theme.primaryDark, fontWeight: "600" },
   optionRow: { flexDirection: "row", gap: 12, flexWrap: "wrap" },
   optionButton: {
     paddingVertical: 10,
@@ -243,8 +244,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#f8fafc",
   },
   optionButtonActive: {
-    backgroundColor: "#2563eb",
-    borderColor: "#2563eb",
+    backgroundColor: theme.primary,
+    borderColor: theme.primary,
   },
   optionText: { color: "#0f172a", fontWeight: "500" },
   optionTextActive: { color: "#ffffff" },

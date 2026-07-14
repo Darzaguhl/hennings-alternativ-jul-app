@@ -2,6 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { Tabs, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Animated, StyleSheet, TouchableOpacity, View } from "react-native";
+import { theme } from "../../constants/theme";
 import { useAuth } from "../AuthContext";
 
 export default function TabsLayout() {
@@ -39,7 +40,7 @@ export default function TabsLayout() {
   if (loading) {
     return (
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#007AFF" />
+        <ActivityIndicator size="large" color={theme.primary} />
       </View>
     );
   }
@@ -47,7 +48,7 @@ export default function TabsLayout() {
   if (!token) {
     return (
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#007AFF" />
+        <ActivityIndicator size="large" color={theme.primary} />
       </View>
     );
   }
@@ -56,7 +57,12 @@ export default function TabsLayout() {
     <View style={{ flex: 1 }}>
       <Tabs
         initialRouteName="events/index"
-        screenOptions={{ headerShown: false, tabBarShowLabel: false }}
+        screenOptions={{
+          headerShown: false,
+          tabBarShowLabel: false,
+          tabBarActiveTintColor: theme.primary,
+          tabBarInactiveTintColor: theme.textMuted,
+        }}
       >
         <Tabs.Screen
           name="events/index"
@@ -107,7 +113,7 @@ export default function TabsLayout() {
                     router.push(item.route);
                   }}
                 >
-                  <Ionicons name={item.icon as any} size={28} color="#007AFF" />
+                  <Ionicons name={item.icon as any} size={28} color={theme.primary} />
                 </TouchableOpacity>
               </Animated.View>
             );
@@ -125,7 +131,7 @@ const styles = StyleSheet.create({
   loadingContainer: { flex: 1, justifyContent: "center", alignItems: "center" },
   fabContainer: { position: "absolute", bottom: 90, right: 10, alignItems: "center" },
   fab: {
-    backgroundColor: "#007AFF",
+    backgroundColor: theme.accent,
     width: 60,
     height: 60,
     borderRadius: 30,

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { theme } from "../constants/theme";
 import { useAuth } from "../app/AuthContext";
 import type { Shift } from "./OppgaverSection";
 
@@ -174,7 +175,7 @@ const styles = StyleSheet.create({
   section: { gap: 12, marginBottom: 20 },
   sectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   sectionTitle: { fontSize: 18, fontWeight: "700", color: "#0f172a" },
-  refreshText: { color: "#007AFF", fontWeight: "600" },
+  refreshText: { color: theme.primary, fontWeight: "600" },
   placeholder: { color: "#64748b", fontSize: 14 },
   card: { backgroundColor: "#f8fafc", borderRadius: 12, padding: 14, gap: 8, borderWidth: 1, borderColor: "#e2e8f0" },
   userName: { fontSize: 16, fontWeight: "700", color: "#0f172a" },
@@ -200,7 +201,7 @@ const styles = StyleSheet.create({
   suggestedBadgeText: { color: "#166534", fontSize: 11, fontWeight: "700" },
   criticalBadge: { backgroundColor: "#fee2e2", paddingHorizontal: 8, paddingVertical: 2, borderRadius: 999 },
   criticalBadgeText: { color: "#b91c1c", fontSize: 11, fontWeight: "700" },
-  assignButton: { backgroundColor: "#2563eb", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
-  assignButtonText: { color: "white", fontWeight: "600" },
+  assignButton: { backgroundColor: theme.accent, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
+  assignButtonText: { color: theme.primaryDark, fontWeight: "600" },
   buttonDisabled: { opacity: 0.5 },
 });

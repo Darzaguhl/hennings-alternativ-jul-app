@@ -1,7 +1,8 @@
 // app/login.tsx
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
-import { Alert, Button, Image, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Image, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { colors, fonts, theme } from "../constants/theme";
 import { useAuth } from "./AuthContext";
 
 export default function LoginScreen() {
@@ -13,7 +14,7 @@ export default function LoginScreen() {
 
   const handleLogin = async () => {
     if (!username || !password) {
-      Alert.alert("Error", "Please enter both username and password");
+      Alert.alert("Feil", "Skriv inn både e-post og passord");
       return;
     }
 
@@ -22,8 +23,8 @@ export default function LoginScreen() {
       await login(username, password);
       router.replace("/events");
     } catch (err: any) {
-      const message = err?.message ?? "Something went wrong";
-      Alert.alert("Login Failed", message);
+      const message = err?.message ?? "Noe gikk galt";
+      Alert.alert("Kunne ikke logge inn", message);
     } finally {
       setLoading(false);
     }
@@ -33,16 +34,63 @@ export default function LoginScreen() {
     <View style={styles.container}>
       <Image source={require("../assets/images/icon.png")} style={styles.logo} />
       <Text style={styles.title}>Hennings Alternativ Jul</Text>
-      <TextInput style={styles.input} placeholder="Username" autoCapitalize="none" value={username} onChangeText={setUsername} />
-      <TextInput style={styles.input} placeholder="Password" secureTextEntry value={password} onChangeText={setPassword} />
-      <Button title={loading ? "Logging in..." : "Login"} onPress={handleLogin} />
+      <TextInput
+        style={styles.input}
+        placeholder="E-post"
+        placeholderTextColor={colors.ink400}
+        autoCapitalize="none"
+        keyboardType="email-address"
+        autoComplete="email"
+        value={username}
+        onChangeText={setUsername}
+      />
+      <TextInput
+        style={styles.input}
+        placeholder="Passord"
+        placeholderTextColor={colors.ink400}
+        secureTextEntry
+        autoComplete="password"
+        value={password}
+        onChangeText={setPassword}
+      />
+      <TouchableOpacity style={styles.button} onPress={handleLogin} disabled={loading}>
+        {loading ? (
+          <ActivityIndicator color={theme.primaryDark} />
+        ) : (
+          <Text style={styles.buttonText}>Logg inn</Text>
+        )}
+      </TouchableOpacity>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: "center", padding: 20 },
+  container: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: theme.background },
   logo: { width: 96, height: 96, borderRadius: 48, alignSelf: "center", marginBottom: 16 },
-  title: { fontSize: 22, fontWeight: "bold", marginBottom: 20, textAlign: "center", color: "#1b4332" },
-  input: { borderWidth: 1, borderColor: "#ccc", padding: 12, marginBottom: 15, borderRadius: 6 },
+  title: {
+    fontSize: 22,
+    fontFamily: fonts.displayBold,
+    marginBottom: 24,
+    textAlign: "center",
+    color: theme.primaryDark,
+  },
+  input: {
+    borderWidth: 1.5,
+    borderColor: colors.cream200,
+    backgroundColor: colors.white,
+    padding: 14,
+    marginBottom: 14,
+    borderRadius: 10,
+    fontFamily: fonts.body,
+    fontSize: 15,
+    color: theme.text,
+  },
+  button: {
+    backgroundColor: theme.accent,
+    paddingVertical: 14,
+    borderRadius: 999,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  buttonText: { fontFamily: fonts.bodySemiBold, fontSize: 16, color: theme.primaryDark },
 });

@@ -15,6 +15,7 @@ import {
 import DateTimePicker, {
   DateTimePickerAndroid,
 } from "@react-native-community/datetimepicker";
+import { theme } from "../constants/theme";
 import { useAuth } from "../app/AuthContext";
 
 type Criticality = "normal" | "critical";
@@ -410,7 +411,7 @@ const styles = StyleSheet.create({
   section: { gap: 12, marginBottom: 20 },
   sectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   sectionTitle: { fontSize: 18, fontWeight: "700", color: "#0f172a" },
-  addButton: { backgroundColor: "#007AFF", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
+  addButton: { backgroundColor: theme.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
   addButtonText: { color: "white", fontWeight: "600", fontSize: 13 },
   placeholder: { color: "#64748b", fontSize: 14 },
   card: { backgroundColor: "#f8fafc", borderRadius: 12, padding: 14, gap: 6, borderWidth: 1, borderColor: "#e2e8f0" },
@@ -419,8 +420,8 @@ const styles = StyleSheet.create({
   cardMeta: { fontSize: 13, color: "#475569" },
   criticalBadge: { backgroundColor: "#fee2e2", paddingHorizontal: 10, paddingVertical: 3, borderRadius: 999 },
   criticalBadgeText: { color: "#b91c1c", fontSize: 12, fontWeight: "700" },
-  signupButton: { backgroundColor: "#2563eb", paddingVertical: 8, borderRadius: 8, alignItems: "center", marginTop: 4 },
-  signupButtonText: { color: "white", fontWeight: "600" },
+  signupButton: { backgroundColor: theme.accent, paddingVertical: 8, borderRadius: 8, alignItems: "center", marginTop: 4 },
+  signupButtonText: { color: theme.primaryDark, fontWeight: "600" },
   withdrawButton: { backgroundColor: "#e2e8f0", paddingVertical: 8, borderRadius: 8, alignItems: "center", marginTop: 4 },
   withdrawButtonText: { color: "#334155", fontWeight: "600" },
   buttonDisabled: { opacity: 0.5 },
@@ -434,11 +435,11 @@ const styles = StyleSheet.create({
   selectorButton: { borderWidth: 1, borderColor: "#d0d7e2", borderRadius: 10, paddingVertical: 10, paddingHorizontal: 14, backgroundColor: "#f8fafc" },
   selectorText: { color: "#0f172a", fontWeight: "500" },
   iosPickerWrapper: { backgroundColor: "#0f172a", borderRadius: 16, padding: 10, gap: 8, alignItems: "flex-end" },
-  iosPickerDoneText: { color: "#bfdbfe", fontWeight: "600", paddingHorizontal: 8 },
+  iosPickerDoneText: { color: theme.accentLight, fontWeight: "600", paddingHorizontal: 8 },
   sectionHeading: { fontSize: 15, fontWeight: "600", color: "#0f172a" },
   chipWrap: { flexDirection: "row", flexWrap: "wrap", columnGap: 8, rowGap: 8 },
   chip: { borderRadius: 20, paddingVertical: 6, paddingHorizontal: 14, borderWidth: 1, borderColor: "#d0d7e2", backgroundColor: "#fff" },
-  chipSelected: { backgroundColor: "#1d4ed8", borderColor: "#1d4ed8" },
+  chipSelected: { backgroundColor: theme.primary, borderColor: theme.primary },
   chipText: { color: "#1f2937", fontSize: 14, fontWeight: "500" },
   chipTextSelected: { color: "#f8fafc" },
   switchRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
@@ -447,6 +448,6 @@ const styles = StyleSheet.create({
   modalButton: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
   cancelButton: { backgroundColor: "#e2e8f0" },
   cancelButtonText: { color: "#334155", fontWeight: "500" },
-  saveButton: { backgroundColor: "#2563eb" },
-  saveButtonText: { color: "white", fontWeight: "600" },
+  saveButton: { backgroundColor: theme.accent },
+  saveButtonText: { color: theme.primaryDark, fontWeight: "600" },
 });

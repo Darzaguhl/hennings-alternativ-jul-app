@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { theme } from "../constants/theme";
 import { useAuth } from "../app/AuthContext";
 import type { Shift } from "./OppgaverSection";
 
@@ -207,8 +208,8 @@ const styles = StyleSheet.create({
   section: { gap: 10, marginBottom: 20 },
   sectionTitle: { fontSize: 18, fontWeight: "700", color: "#0f172a" },
   helperText: { fontSize: 13, color: "#64748b" },
-  primaryButton: { backgroundColor: "#2563eb", paddingVertical: 12, borderRadius: 10, alignItems: "center" },
-  primaryButtonText: { color: "white", fontWeight: "700" },
+  primaryButton: { backgroundColor: theme.accent, paddingVertical: 12, borderRadius: 10, alignItems: "center" },
+  primaryButtonText: { color: theme.primaryDark, fontWeight: "700" },
   buttonDisabled: { opacity: 0.5 },
   resultText: { fontSize: 14, color: "#0f172a", fontWeight: "600" },
   scanSafeArea: { flex: 1, backgroundColor: "#000" },
@@ -226,5 +227,5 @@ const styles = StyleSheet.create({
   centered: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20 },
   scanResultArea: { padding: 16, gap: 8, backgroundColor: "#0f172a" },
   scanAgainButton: { alignSelf: "flex-start" },
-  scanAgainButtonText: { color: "#bfdbfe", fontWeight: "600" },
+  scanAgainButtonText: { color: theme.accentLight, fontWeight: "600" },
 });
