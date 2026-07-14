@@ -128,6 +128,52 @@ class Membership(models.Model):
         return f"{self.user} — {self.role} @ {self.event}"
 
 
+def generate_invite_token() -> str:
+    return uuid.uuid4().hex
+
+
+def default_invite_expiry():
+    return timezone.now() + timezone.timedelta(days=7)
+
+
+class Invite(models.Model):
+    """An admin/staff invite: owner or admin invites someone by email to a
+    role on an event. Distinct from Membership -- an Invite is a pending
+    offer with its own token/expiry; accepting one (via /api/invites/accept/)
+    creates (or reuses) the User and the actual Membership row.
+
+    Unlike volunteer self-registration, invited roles need a real password
+    so the person can log in to the admin dashboard -- accept_invite sets
+    one, whether the account is new or already existed as a passwordless
+    volunteer signup.
+    """
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="invites")
+    email = models.EmailField()
+    role = models.CharField(max_length=20, choices=Membership.ROLE_CHOICES)
+    token = models.CharField(max_length=64, unique=True, default=generate_invite_token, editable=False)
+    invited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="invites_sent"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(default=default_invite_expiry)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Invite({self.email} → {self.role} @ {self.event})"
+
+    @property
+    def is_expired(self) -> bool:
+        return timezone.now() > self.expires_at
+
+    @property
+    def is_usable(self) -> bool:
+        return self.accepted_at is None and not self.is_expired
+
+
 def generate_qr_payload() -> str:
     """Return a stable, unique token to embed in a user's QR code."""
 

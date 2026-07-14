@@ -7,6 +7,7 @@ from .models import (
     Assignment,
     Event,
     EventCheckIn,
+    Invite,
     Membership,
     QRCode,
     Shift,
@@ -118,6 +119,47 @@ class MembershipSerializer(serializers.ModelSerializer):
         model = Membership
         fields = ["id", "event", "user", "user_id", "role", "created_at"]
         read_only_fields = ["event", "user", "created_at"]
+
+
+class InviteSerializer(serializers.ModelSerializer):
+    """Admin-facing: creating/listing pending invites for an event. Token is
+    intentionally excluded -- the invite link is only ever sent by email,
+    never shown back to the inviter, so a shoulder-surfed screen can't be
+    used to accept someone else's invite."""
+
+    invited_by = UserSerializer(read_only=True)
+    is_usable = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Invite
+        fields = ["id", "event", "email", "role", "invited_by", "created_at", "expires_at", "accepted_at", "is_usable"]
+        read_only_fields = ["event", "invited_by", "created_at", "expires_at", "accepted_at", "is_usable"]
+
+
+class InvitePreviewSerializer(serializers.ModelSerializer):
+    """Public: what the accept-invite page shows before the person sets a
+    password. No token in the response body -- the frontend already has it
+    from the URL, and echoing it back serves no purpose."""
+
+    event_title = serializers.CharField(source="event.title", read_only=True)
+    is_usable = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Invite
+        fields = ["email", "role", "event_title", "is_usable"]
+        read_only_fields = fields
+
+
+class AcceptInviteSerializer(serializers.Serializer):
+    token = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8, validators=[validate_password_strength])
+
+    def validate_token(self, value):
+        invite = Invite.objects.filter(token=value).select_related("event").first()
+        if not invite or not invite.is_usable:
+            raise serializers.ValidationError("This invite link is invalid or has expired.")
+        self.invite = invite
+        return value
 
 
 class EventSerializer(serializers.ModelSerializer):

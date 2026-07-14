@@ -11,10 +11,12 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .email import send_invite_email
 from .models import (
     Assignment,
     Event,
     EventCheckIn,
+    Invite,
     Membership,
     QRCode,
     Shift,
@@ -22,9 +24,12 @@ from .models import (
     Skill,
 )
 from .serializers import (
+    AcceptInviteSerializer,
     AssignmentSerializer,
     EmailTokenObtainPairSerializer,
     EventSerializer,
+    InvitePreviewSerializer,
+    InviteSerializer,
     MembershipSerializer,
     PublicEventSerializer,
     QRCodeSerializer,
@@ -68,6 +73,56 @@ class EmailTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailTokenObtainPairSerializer
 
 User = get_user_model()
+
+
+@api_view(["GET"])
+@permission_classes([permissions.AllowAny])
+def invite_preview(request, token):
+    """Unauthenticated: what the accept-invite page shows before the person
+    sets a password -- which role, which event, whether the link is still
+    usable. Looked up by token in the URL, not authenticated, since the
+    invitee has no account (or isn't logged in) yet."""
+
+    invite = Invite.objects.select_related("event").filter(token=token).first()
+    if not invite:
+        return Response({"detail": "Invite not found."}, status=status.HTTP_404_NOT_FOUND)
+    return Response(InvitePreviewSerializer(invite).data)
+
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def accept_invite(request):
+    """Unauthenticated: set a password and redeem an invite token in one
+    step. Reuses the existing User if the email already has an account
+    (e.g. a passwordless volunteer signup being promoted to admin) rather
+    than creating a duplicate -- this is the one path that sets a password
+    on an already-existing account, which is why it's a dedicated endpoint
+    rather than going through RegisterSerializer."""
+
+    serializer = AcceptInviteSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    invite = serializer.invite
+    password = serializer.validated_data["password"]
+
+    with transaction.atomic():
+        user = User.objects.filter(email__iexact=invite.email).first()
+        if not user:
+            user = User(username=invite.email, email=invite.email)
+        user.set_password(password)
+        user.save()
+        Membership.objects.get_or_create(event=invite.event, user=user, role=invite.role)
+        invite.accepted_at = timezone.now()
+        invite.save(update_fields=["accepted_at"])
+
+    refresh = RefreshToken.for_user(user)
+    return Response(
+        {
+            "user": UserSerializer(user, context={"request": request}).data,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "event": EventSerializer(invite.event, context={"request": request}).data,
+        }
+    )
 
 
 class RegisterView(generics.CreateAPIView):
@@ -247,12 +302,12 @@ class EventViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         if not instance.is_admin(self.request.user):
-            raise PermissionDenied("Only a admin can delete this event.")
+            raise PermissionDenied("Only an admin can delete this event.")
         instance.delete()
 
     def perform_update(self, serializer):
         if not self.get_object().is_admin(self.request.user):
-            raise PermissionDenied("Only a admin can update this event.")
+            raise PermissionDenied("Only an admin can update this event.")
         serializer.save()
 
     @action(detail=True, methods=["post"], url_path="checkin")
@@ -377,7 +432,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
         if not (event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only a admin or this oppgave's leader can assign it."},
+                {"detail": "Only an admin or this oppgave's leader can assign it."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -411,7 +466,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
         event = self.get_object()
         if not event.is_admin(request.user):
-            return Response({"detail": "Only a admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"detail": "Only an admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
 
         if request.method == "GET":
             qs = Membership.objects.filter(event=event).select_related("user")
@@ -438,7 +493,7 @@ class EventViewSet(viewsets.ModelViewSet):
     def remove_membership(self, request, pk=None):
         event = self.get_object()
         if not event.is_admin(request.user):
-            return Response({"detail": "Only a admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"detail": "Only an admin can manage members."}, status=status.HTTP_403_FORBIDDEN)
 
         membership_id = request.data.get("membership_id")
         membership = Membership.objects.filter(event=event, pk=membership_id).first()
@@ -453,6 +508,58 @@ class EventViewSet(viewsets.ModelViewSet):
             )
 
         membership.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get", "post"], url_path="invites")
+    def invites(self, request, pk=None):
+        """List (GET) or send (POST) admin/staff invites for this event.
+
+        Same tiering as memberships: only an owner can invite someone as
+        owner/admin; a plain admin can still invite check-in staff. Unlike
+        memberships, this doesn't require the invitee to already have an
+        account -- accept_invite creates one if needed."""
+
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can manage invites."}, status=status.HTTP_403_FORBIDDEN)
+
+        if request.method == "GET":
+            qs = Invite.objects.filter(event=event).select_related("invited_by")
+            return Response(InviteSerializer(qs, many=True, context={"request": request}).data)
+
+        requested_role = request.data.get("role")
+        if requested_role in (Membership.ROLE_OWNER, Membership.ROLE_ADMIN) and not event.is_owner(request.user):
+            return Response(
+                {"detail": "Only an owner can invite someone as owner or admin."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        email = (request.data.get("email") or "").strip()
+        if not email:
+            return Response({"detail": "email is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if requested_role not in dict(Membership.ROLE_CHOICES):
+            return Response({"detail": "Invalid role"}, status=status.HTTP_400_BAD_REQUEST)
+
+        invite = Invite.objects.create(event=event, email=email, role=requested_role, invited_by=request.user)
+        send_invite_email(invite)
+        return Response(InviteSerializer(invite, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="revoke-invite")
+    def revoke_invite(self, request, pk=None):
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can manage invites."}, status=status.HTTP_403_FORBIDDEN)
+
+        invite_id = request.data.get("invite_id")
+        invite = Invite.objects.filter(event=event, pk=invite_id).first()
+        if not invite:
+            return Response({"detail": "Invite not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if invite.role in (Membership.ROLE_OWNER, Membership.ROLE_ADMIN) and not event.is_owner(request.user):
+            return Response(
+                {"detail": "Only an owner can revoke an owner or admin invite."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        invite.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get"], url_path="metrics")
@@ -515,21 +622,21 @@ class ShiftViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         event = serializer.validated_data["event"]
         if not event.is_admin(self.request.user):
-            raise PermissionDenied("Only a admin can add vakter.")
+            raise PermissionDenied("Only an admin can add vakter.")
         serializer.save(created_by=self.request.user)
 
     def perform_update(self, serializer):
         shift = self.get_object()
         is_admin = shift.event.is_admin(self.request.user)
         if not (is_admin or shift.is_led_by(self.request.user)):
-            raise PermissionDenied("Only a admin or this oppgave's leader can edit it.")
+            raise PermissionDenied("Only an admin or this oppgave's leader can edit it.")
         if "leaders" in serializer.validated_data and not is_admin:
-            raise PermissionDenied("Only a admin can change this oppgave's leaders.")
+            raise PermissionDenied("Only an admin can change this oppgave's leaders.")
         serializer.save()
 
     def perform_destroy(self, instance):
         if not instance.event.is_admin(self.request.user):
-            raise PermissionDenied("Only a admin can delete this vakt.")
+            raise PermissionDenied("Only an admin can delete this vakt.")
         instance.delete()
 
     @action(detail=True, methods=["post"], url_path="signup")
@@ -592,7 +699,7 @@ class ShiftViewSet(viewsets.ModelViewSet):
         shift = self.get_object()
         if not (shift.event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only a admin or this oppgave's leader can view assignments."},
+                {"detail": "Only an admin or this oppgave's leader can view assignments."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         serializer = AssignmentSerializer(
