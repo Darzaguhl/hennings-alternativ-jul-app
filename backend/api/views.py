@@ -507,6 +507,14 @@ class EventViewSet(viewsets.ModelViewSet):
                 {"detail": "Only an owner can remove owner or admin access."}, status=status.HTTP_403_FORBIDDEN
             )
 
+        if membership.role == Membership.ROLE_OWNER:
+            other_owners = Membership.objects.filter(event=event, role=Membership.ROLE_OWNER).exclude(pk=membership.pk)
+            if not other_owners.exists():
+                return Response(
+                    {"detail": "Cannot remove the last owner. Make someone else an owner first."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         membership.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
