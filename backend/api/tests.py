@@ -776,6 +776,110 @@ class MembershipRolesTests(TestCase):
         self.assertEqual(response.status_code, 403)
 
 
+class OwnerRoleTests(TestCase):
+    """Only an owner can grant or revoke owner/superadmin access -- a plain
+    superadmin (granted via Membership, not the event creator) can still
+    manage check-in staff but not the superadmin tier itself."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner", password="pw")
+        self.granted_superadmin = User.objects.create_user(username="granted-super", password="pw")
+        self.candidate = User.objects.create_user(username="candidate", password="pw")
+        self.event = Event.objects.create(title="Alternativ Jul", created_by=self.owner)
+        Membership.objects.create(event=self.event, user=self.granted_superadmin, role=Membership.ROLE_SUPERADMIN)
+
+    def test_creator_is_owner(self):
+        self.assertTrue(self.event.is_owner(self.owner))
+        self.assertTrue(self.event.is_superadmin(self.owner))
+
+    def test_granted_superadmin_is_not_owner(self):
+        self.assertFalse(self.event.is_owner(self.granted_superadmin))
+        self.assertTrue(self.event.is_superadmin(self.granted_superadmin))
+
+    def test_viewer_role_reports_owner_distinctly(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.get(f"/api/events/{self.event.id}/")
+        self.assertEqual(response.data["viewer_role"], "owner")
+
+        client.force_authenticate(user=self.granted_superadmin)
+        response = client.get(f"/api/events/{self.event.id}/")
+        self.assertEqual(response.data["viewer_role"], "superadmin")
+
+    def test_owner_can_grant_superadmin(self):
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.candidate.id, "role": Membership.ROLE_SUPERADMIN},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(self.event.is_superadmin(self.candidate))
+
+    def test_plain_superadmin_cannot_grant_superadmin_or_owner(self):
+        client = APIClient()
+        client.force_authenticate(user=self.granted_superadmin)
+
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.candidate.id, "role": Membership.ROLE_SUPERADMIN},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(self.event.is_superadmin(self.candidate))
+
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.candidate.id, "role": Membership.ROLE_OWNER},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_plain_superadmin_can_still_grant_checkin_staff(self):
+        client = APIClient()
+        client.force_authenticate(user=self.granted_superadmin)
+        response = client.post(
+            f"/api/events/{self.event.id}/memberships/",
+            {"user_id": self.candidate.id, "role": Membership.ROLE_CHECKIN_STAFF},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(self.event.is_checkin_staff(self.candidate))
+
+    def test_plain_superadmin_cannot_remove_another_superadmin(self):
+        other_super = User.objects.create_user(username="other-super", password="pw")
+        membership = Membership.objects.create(event=self.event, user=other_super, role=Membership.ROLE_SUPERADMIN)
+
+        client = APIClient()
+        client.force_authenticate(user=self.granted_superadmin)
+        response = client.post(
+            f"/api/events/{self.event.id}/remove-membership/", {"membership_id": membership.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Membership.objects.filter(pk=membership.pk).exists())
+
+    def test_owner_can_remove_a_superadmin(self):
+        membership = Membership.objects.get(user=self.granted_superadmin, event=self.event)
+
+        client = APIClient()
+        client.force_authenticate(user=self.owner)
+        response = client.post(
+            f"/api/events/{self.event.id}/remove-membership/", {"membership_id": membership.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Membership.objects.filter(pk=membership.pk).exists())
+
+    def test_new_event_creator_gets_owner_membership(self):
+        client = APIClient()
+        client.force_authenticate(user=self.candidate)
+        response = client.post("/api/events/", {"title": "Alternativ Jul 2027"}, format="json")
+        self.assertEqual(response.status_code, 201)
+        event_id = response.data["id"]
+        membership = Membership.objects.get(event_id=event_id, user=self.candidate)
+        self.assertEqual(membership.role, Membership.ROLE_OWNER)
+
+
 class PoolFifoOrderingTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")

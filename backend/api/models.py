@@ -72,10 +72,17 @@ class Event(models.Model):
     def __str__(self) -> str:
         return f"{self.title} ({self.code})"
 
-    def is_superadmin(self, user) -> bool:
+    def is_owner(self, user) -> bool:
         if not user.is_authenticated:
             return False
         if self.created_by_id == user.pk:
+            return True
+        return self.memberships.filter(user=user, role=Membership.ROLE_OWNER).exists()
+
+    def is_superadmin(self, user) -> bool:
+        if not user.is_authenticated:
+            return False
+        if self.is_owner(user):
             return True
         return self.memberships.filter(user=user, role=Membership.ROLE_SUPERADMIN).exists()
 
@@ -86,15 +93,20 @@ class Event(models.Model):
 
 
 class Membership(models.Model):
-    """Event-wide admin roles. Superadmins can manage everything on the
-    event; check-in staff can only operate check-in stations. Oppgave-level
-    leadership is scoped per-Shift instead (see Shift.leaders), since a
-    leader's authority doesn't extend to the whole event.
+    """Event-wide admin roles. The owner can manage everything, including
+    granting/revoking superadmin access -- superadmins can manage everything
+    else (vakter, check-in staff, pool/assignment) but can't create or
+    remove other superadmins/owners, so no single compromised or careless
+    superadmin account can lock out the rest. Oppgave-level leadership is
+    scoped per-Shift instead (see Shift.leaders), since a leader's authority
+    doesn't extend to the whole event.
     """
 
+    ROLE_OWNER = "owner"
     ROLE_SUPERADMIN = "superadmin"
     ROLE_CHECKIN_STAFF = "checkin_staff"
     ROLE_CHOICES = (
+        (ROLE_OWNER, "Owner"),
         (ROLE_SUPERADMIN, "Superadmin"),
         (ROLE_CHECKIN_STAFF, "Check-in staff"),
     )
