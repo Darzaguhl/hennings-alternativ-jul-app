@@ -18,6 +18,7 @@ import DateTimePicker, {
   DateTimePickerEvent,
 } from "@react-native-community/datetimepicker";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { theme } from "../../../constants/theme";
 import { useAuth } from "../../AuthContext";
 import { useSettings } from "../../SettingsContext";
 import OppgaverSection from "../../../components/OppgaverSection";
@@ -433,7 +434,7 @@ const styles = StyleSheet.create({
   errorText: { fontSize: 16, color: "#b00020", textAlign: "center" },
   emptyTitle: { fontSize: 20, fontWeight: "700", color: "#0f172a" },
   emptySubtitle: { fontSize: 14, color: "#64748b", textAlign: "center" },
-  addButton: { backgroundColor: "#007AFF", paddingHorizontal: 18, paddingVertical: 10, borderRadius: 999, marginTop: 8 },
+  addButton: { backgroundColor: theme.primary, paddingHorizontal: 18, paddingVertical: 10, borderRadius: 999, marginTop: 8 },
   addButtonText: { color: "white", fontWeight: "600" },
   headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
   headerActions: { flexDirection: "row", gap: 8 },
@@ -459,19 +460,19 @@ const styles = StyleSheet.create({
   selectorText: { color: "#0f172a", fontWeight: "500" },
   clearButton: { alignSelf: "flex-start" },
   clearButtonText: { color: "#ef4444", fontWeight: "600" },
-  iosPickerWrapper: { width: "100%", backgroundColor: "#0f172a", borderRadius: 16, marginTop: 12, paddingVertical: 12, paddingHorizontal: 10, gap: 8, borderWidth: 1, borderColor: "rgba(37,99,235,0.35)" },
+  iosPickerWrapper: { width: "100%", backgroundColor: "#0f172a", borderRadius: 16, marginTop: 12, paddingVertical: 12, paddingHorizontal: 10, gap: 8, borderWidth: 1, borderColor: "rgba(201,154,61,0.35)" },
   iosPicker: { alignSelf: "stretch", backgroundColor: "transparent" },
   iosPickerActions: { alignItems: "flex-end" },
-  iosPickerActionText: { color: "#bfdbfe", fontWeight: "600" },
+  iosPickerActionText: { color: theme.accentLight, fontWeight: "600" },
   chipWrap: { flexDirection: "row", flexWrap: "wrap", columnGap: 8, rowGap: 8 },
   chip: { borderRadius: 20, paddingVertical: 6, paddingHorizontal: 14, borderWidth: 1, borderColor: "#d0d7e2", backgroundColor: "#fff" },
-  chipSelected: { backgroundColor: "#1d4ed8", borderColor: "#1d4ed8" },
+  chipSelected: { backgroundColor: theme.primary, borderColor: theme.primary },
   chipText: { color: "#1f2937", fontSize: 14, fontWeight: "500" },
   chipTextSelected: { color: "#f8fafc" },
   modalButtons: { flexDirection: "row", justifyContent: "flex-end", gap: 12 },
   modalButton: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
   cancelButton: { backgroundColor: "#e2e8f0" },
   cancelButtonText: { color: "#334155", fontWeight: "500" },
-  saveButton: { backgroundColor: "#2563eb" },
-  saveButtonText: { color: "white", fontWeight: "600" },
+  saveButton: { backgroundColor: theme.accent },
+  saveButtonText: { color: theme.primaryDark, fontWeight: "600" },
 });

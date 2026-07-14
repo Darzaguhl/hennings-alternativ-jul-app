@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
+import { colors, fonts, theme } from '../../constants/theme';
 import { useAuth } from '../AuthContext';
 
 export default function QRCodeScreen() {
@@ -16,7 +17,7 @@ export default function QRCodeScreen() {
       if (!currentUser) {
         if (active) {
           setQrValue(null);
-          setError('Log in to view your QR code.');
+          setError('Logg inn for å se din QR-kode.');
           setLoading(false);
         }
         return;
@@ -37,12 +38,12 @@ export default function QRCodeScreen() {
             setError(null);
           }
         } else if (active) {
-          setError('No QR code available for this account yet.');
+          setError('Ingen QR-kode tilgjengelig for denne kontoen ennå.');
         }
       } catch (err) {
         console.error('Failed to fetch QR code', err);
         if (active) {
-          setError('We could not load your QR code. Pull to refresh or try again later.');
+          setError('Kunne ikke laste QR-koden. Dra for å oppdatere eller prøv igjen senere.');
         }
       } finally {
         if (active) setLoading(false);
@@ -58,13 +59,17 @@ export default function QRCodeScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Your QR Code</Text>
-      {loading && <ActivityIndicator size="large" color="#333" />}
-      {!loading && qrValue && <QRCode value={qrValue} size={200} />}
-      {!loading && !qrValue && <Text style={styles.error}>{error ?? 'No QR code available.'}</Text>}
+      <Text style={styles.title}>Din QR-kode</Text>
+      {loading && <ActivityIndicator size="large" color={theme.primary} />}
+      {!loading && qrValue && (
+        <View style={styles.qrWrapper}>
+          <QRCode value={qrValue} size={200} color={theme.primaryDark} />
+        </View>
+      )}
+      {!loading && !qrValue && <Text style={styles.error}>{error ?? 'Ingen QR-kode tilgjengelig.'}</Text>}
       {!loading && qrValue && (
         <Text style={styles.info}>
-          Show this QR code to the event master to check in.
+          Vis denne QR-koden til en innsjekk-ansvarlig for å sjekke inn.
         </Text>
       )}
     </View>
@@ -72,8 +77,9 @@ export default function QRCodeScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
-  title: { fontSize: 24, fontWeight: 'bold', marginBottom: 20 },
-  info: { marginTop: 20, fontSize: 16, textAlign: 'center' },
-  error: { marginTop: 20, fontSize: 16, textAlign: 'center', color: 'crimson' },
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, backgroundColor: theme.background },
+  title: { fontSize: 24, fontFamily: fonts.displayBold, marginBottom: 20, color: theme.primaryDark },
+  qrWrapper: { padding: 20, backgroundColor: colors.white, borderRadius: 16 },
+  info: { marginTop: 20, fontSize: 16, textAlign: 'center', fontFamily: fonts.body, color: theme.textMuted },
+  error: { marginTop: 20, fontSize: 16, textAlign: 'center', fontFamily: fonts.body, color: theme.danger },
 });
