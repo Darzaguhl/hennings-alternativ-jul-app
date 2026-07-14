@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { theme } from "../constants/theme";
 import { useAuth } from "../app/AuthContext";
-import type { Shift } from "./OppgaverSection";
+import type { Shift } from "./VakterSection";
 
 interface UserSummary {
   id: number;
@@ -67,7 +67,7 @@ export default function PoolSection({ eventId }: { eventId: number }) {
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(body?.detail ?? "Unable to assign this oppgave.");
+          throw new Error(body?.detail ?? "Unable to assign this vakt.");
         }
         await loadPool();
       } catch (err: any) {
@@ -110,7 +110,7 @@ export default function PoolSection({ eventId }: { eventId: number }) {
             ) : null}
 
             {entry.candidates.length === 0 ? (
-              <Text style={styles.placeholder}>Not signed up for any oppgave today.</Text>
+              <Text style={styles.placeholder}>Not signed up for any vakt today.</Text>
             ) : (
               entry.candidates.map((candidate) => {
                 const shift = candidate.shift;

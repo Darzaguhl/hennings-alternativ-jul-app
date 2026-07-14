@@ -22,6 +22,7 @@ import { theme } from "../../../constants/theme";
 import { useAuth } from "../../AuthContext";
 import { useSettings } from "../../SettingsContext";
 import OppgaverSection from "../../../components/OppgaverSection";
+import VakterSection from "../../../components/VakterSection";
 import PoolSection from "../../../components/PoolSection";
 import CheckinSection from "../../../components/CheckinSection";
 
@@ -254,7 +255,7 @@ export default function EventScreen() {
     if (!event) return;
     Alert.alert(
       "Delete Event",
-      `Are you sure you want to delete "${event.title}"? This permanently removes all its oppgaver, vakter, and check-in history too. This cannot be undone.`,
+      `Are you sure you want to delete "${event.title}"? This permanently removes all its vakter and check-in history too. This cannot be undone.`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -316,6 +317,8 @@ export default function EventScreen() {
   }, [apiFetch, event, loadEvents]);
 
   const isOwner = event?.viewer_role === "owner";
+  const isAdmin = isOwner || event?.viewer_role === "admin";
+  const isCheckinStaff = isAdmin || event?.viewer_role === "checkin_staff";
 
   const eventYearLabel = useCallback((candidate: EventDetail) => {
     if (candidate.date) {
@@ -473,7 +476,7 @@ export default function EventScreen() {
                 </Text>
               </TouchableOpacity>
             ))}
-            {isOwner && (
+            {isAdmin && (
               <TouchableOpacity style={styles.eventChipAdd} onPress={() => openFormModal("create")}>
                 <Text style={styles.eventChipAddText}>+ New</Text>
               </TouchableOpacity>
@@ -490,23 +493,29 @@ export default function EventScreen() {
               </Text>
             </View>
           </View>
-          {isOwner && (
+          {isAdmin && (
             <View style={styles.headerActions}>
-              {event.is_active ? (
-                <TouchableOpacity style={styles.manageButton} onPress={handleDeactivate} disabled={switching}>
-                  <Text style={styles.manageButtonText}>Deactivate</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity style={styles.manageButton} onPress={handleActivate} disabled={switching}>
-                  <Text style={styles.manageButtonText}>Activate</Text>
-                </TouchableOpacity>
+              {isOwner && (
+                <>
+                  {event.is_active ? (
+                    <TouchableOpacity style={styles.manageButton} onPress={handleDeactivate} disabled={switching}>
+                      <Text style={styles.manageButtonText}>Deactivate</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity style={styles.manageButton} onPress={handleActivate} disabled={switching}>
+                      <Text style={styles.manageButtonText}>Activate</Text>
+                    </TouchableOpacity>
+                  )}
+                </>
               )}
               <TouchableOpacity style={styles.manageButton} onPress={() => openFormModal("edit")}>
                 <Text style={styles.manageButtonText}>Edit</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.deleteButton} onPress={handleDelete}>
-                <Text style={styles.deleteButtonText}>Delete</Text>
-              </TouchableOpacity>
+              {isOwner && (
+                <TouchableOpacity style={styles.deleteButton} onPress={handleDelete}>
+                  <Text style={styles.deleteButtonText}>Delete</Text>
+                </TouchableOpacity>
+              )}
             </View>
           )}
         </View>
@@ -521,13 +530,15 @@ export default function EventScreen() {
           eventId={event.id}
           eventCode={event.code}
           checkinMode={event.checkin_mode ?? "event_qr"}
-          isOwner={isOwner}
+          isCheckinStaff={isCheckinStaff}
           onResolved={() => loadEvents({ silent: true })}
         />
 
-        <OppgaverSection eventId={event.id} isOwner={isOwner} />
+        <VakterSection eventId={event.id} isAdmin={isAdmin} />
 
-        {isOwner && <PoolSection eventId={event.id} />}
+        <OppgaverSection />
+
+        {isCheckinStaff && <PoolSection eventId={event.id} />}
 
         {event.code && <Text style={styles.codeHint}>ID: {event.code}</Text>}
       </ScrollView>

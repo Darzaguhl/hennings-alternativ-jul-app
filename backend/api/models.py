@@ -77,6 +77,16 @@ class Event(models.Model):
         default=False,
         help_text="The one event the public website/app show. Only one event is active at a time.",
     )
+    signup_opens_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Volunteer registration is closed before this time. Blank = no lower bound.",
+    )
+    signup_closes_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Volunteer registration is closed after this time. Blank = no upper bound.",
+    )
     checkin_mode = models.CharField(
         max_length=20,
         choices=CHECKIN_MODE_CHOICES,
@@ -92,6 +102,19 @@ class Event(models.Model):
 
     def __str__(self) -> str:
         return f"{self.title} ({self.code})"
+
+    @property
+    def signups_open(self) -> bool:
+        """Whether new volunteers can register right now. Both bounds are
+        optional -- an unset opens_at/closes_at means no lower/upper bound,
+        so a fresh event with neither set is open by default."""
+
+        now = timezone.now()
+        if self.signup_opens_at and now < self.signup_opens_at:
+            return False
+        if self.signup_closes_at and now > self.signup_closes_at:
+            return False
+        return True
 
     def is_owner(self, user) -> bool:
         """Ownership is purely a Membership role -- no permanent fallback

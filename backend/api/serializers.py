@@ -166,6 +166,7 @@ class EventSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
     code = serializers.CharField(read_only=True)
     viewer_role = serializers.SerializerMethodField()
+    signups_open = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Event
@@ -176,6 +177,9 @@ class EventSerializer(serializers.ModelSerializer):
             "date",
             "code",
             "is_active",
+            "signup_opens_at",
+            "signup_closes_at",
+            "signups_open",
             "checkin_mode",
             "created_by",
             "viewer_role",
@@ -230,13 +234,16 @@ class PublicShiftSerializer(serializers.ModelSerializer):
 class PublicEventSerializer(serializers.ModelSerializer):
     """Safe subset for the public website signup page -- no created_by
     (would embed the admin's email/profile), just enough to render a
-    signup form: name, blurb, and the day's oppgaver."""
+    signup form: name, blurb, the day's oppgaver, and whether the signup
+    window is currently open so the site can show the form or a
+    closed/not-yet-open message."""
 
     shifts = PublicShiftSerializer(many=True, read_only=True)
+    signups_open = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Event
-        fields = ["id", "title", "description", "date", "shifts"]
+        fields = ["id", "title", "description", "date", "shifts", "signup_opens_at", "signup_closes_at", "signups_open"]
         read_only_fields = fields
 
 

@@ -672,6 +672,7 @@ class OwnershipEnforcementRegressionTests(TestCase):
 class RegistrationAndEmailLoginTests(TestCase):
     def setUp(self):
         self.client = APIClient()
+        make_event(title="Hennings Alternativ Jul")
 
     def test_register_creates_user_and_returns_tokens(self):
         response = self.client.post(
@@ -772,6 +773,63 @@ class RegistrationAndEmailLoginTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 401)
+
+
+class SignupWindowTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_registration_succeeds_when_no_window_is_set(self):
+        make_event(title="Hennings Alternativ Jul")
+        response = self.client.post(
+            "/api/register/", {"email": "open.window@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_registration_rejected_before_signup_opens(self):
+        make_event(title="Hennings Alternativ Jul", signup_opens_at=timezone.now() + datetime.timedelta(days=1))
+        response = self.client.post(
+            "/api/register/", {"email": "too.early@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(User.objects.filter(email="too.early@example.com").exists())
+
+    def test_registration_rejected_after_signup_closes(self):
+        make_event(title="Hennings Alternativ Jul", signup_closes_at=timezone.now() - datetime.timedelta(days=1))
+        response = self.client.post(
+            "/api/register/", {"email": "too.late@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(User.objects.filter(email="too.late@example.com").exists())
+
+    def test_registration_succeeds_inside_the_window(self):
+        make_event(
+            title="Hennings Alternativ Jul",
+            signup_opens_at=timezone.now() - datetime.timedelta(days=1),
+            signup_closes_at=timezone.now() + datetime.timedelta(days=1),
+        )
+        response = self.client.post(
+            "/api/register/", {"email": "inside.window@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_registration_rejected_when_no_active_event(self):
+        response = self.client.post(
+            "/api/register/", {"email": "no.event@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_public_event_exposes_signup_window(self):
+        make_event(
+            title="Hennings Alternativ Jul",
+            signup_opens_at=timezone.now() - datetime.timedelta(days=1),
+            signup_closes_at=timezone.now() + datetime.timedelta(days=1),
+        )
+        response = self.client.get("/api/public/event/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["signups_open"])
+        self.assertIsNotNone(response.data["signup_opens_at"])
+        self.assertIsNotNone(response.data["signup_closes_at"])
 
 
 class MembershipRolesTests(TestCase):

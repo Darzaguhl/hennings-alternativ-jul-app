@@ -128,13 +128,24 @@ def accept_invite(request):
 class RegisterView(generics.CreateAPIView):
     """Public self-registration: email + password. Returns JWT tokens
     immediately so the caller (website or app) can go straight into
-    signing up for oppgaver without a separate login step."""
+    signing up for oppgaver without a separate login step.
+
+    Gated by the active event's signup window (Event.signups_open) -- if
+    there's no active event, or its window is closed, registration is
+    refused rather than silently creating an account nobody can act on
+    yet."""
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
     queryset = User.objects.all()
 
     def create(self, request, *args, **kwargs):
+        event = Event.objects.filter(is_active=True).first()
+        if not event:
+            return Response({"detail": "No event configured yet."}, status=status.HTTP_404_NOT_FOUND)
+        if not event.signups_open:
+            return Response({"detail": "Signups are not open right now."}, status=status.HTTP_403_FORBIDDEN)
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
@@ -243,9 +254,9 @@ def _checkin_response(attendee, result, request):
     else:  # pending_pool
         payload["candidates"] = ShiftSerializer(result["candidates"], many=True, context={"request": request}).data
         if result["reason"] == "no_candidates":
-            payload["message"] = "Checked in. Not signed up for any oppgave today — added to the pool for manual assignment."
+            payload["message"] = "Checked in. Not signed up for any vakt today — added to the pool for manual assignment."
         else:
-            payload["message"] = "Checked in. Needs admin review to pick an oppgave — added to the pool."
+            payload["message"] = "Checked in. Needs admin review to pick a vakt — added to the pool."
         status_code = status.HTTP_202_ACCEPTED
 
     return Response(payload, status=status_code)
@@ -455,7 +466,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
         if not (event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only an admin or this oppgave's leader can assign it."},
+                {"detail": "Only an admin or this vakt's leader can assign it."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -467,7 +478,7 @@ class EventViewSet(viewsets.ModelViewSet):
                 assignment = Assignment.objects.create(shift=shift, user=attendee, confirmed_by=request.user)
         except IntegrityError:
             return Response(
-                {"detail": "This person already has a confirmed oppgave today."},
+                {"detail": "This person already has a confirmed vakt today."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -660,9 +671,9 @@ class ShiftViewSet(viewsets.ModelViewSet):
         shift = self.get_object()
         is_admin = shift.event.is_admin(self.request.user)
         if not (is_admin or shift.is_led_by(self.request.user)):
-            raise PermissionDenied("Only an admin or this oppgave's leader can edit it.")
+            raise PermissionDenied("Only an admin or this vakt's leader can edit it.")
         if "leaders" in serializer.validated_data and not is_admin:
-            raise PermissionDenied("Only an admin can change this oppgave's leaders.")
+            raise PermissionDenied("Only an admin can change this vakt's leaders.")
         serializer.save()
 
     def perform_destroy(self, instance):
@@ -730,7 +741,7 @@ class ShiftViewSet(viewsets.ModelViewSet):
         shift = self.get_object()
         if not (shift.event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only an admin or this oppgave's leader can view assignments."},
+                {"detail": "Only an admin or this vakt's leader can view assignments."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         serializer = AssignmentSerializer(
