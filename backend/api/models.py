@@ -3,6 +3,7 @@ import uuid
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser, Group, Permission
 from django.db import models
+from django.db.models.functions import Lower
 from django.utils import timezone
 
 
@@ -43,6 +44,29 @@ class User(AbstractUser):
         help_text="Specific permissions for this user.",
         verbose_name="user permissions",
     )
+
+    class Meta:
+        constraints = [
+            # Case-insensitive uniqueness: AbstractUser.email has no
+            # uniqueness at all by default, and every lookup in this
+            # codebase already treats email as case-insensitive
+            # (email__iexact) -- a plain unique=True wouldn't actually
+            # match that and would still let "Foo@x.com" and "foo@x.com"
+            # collide. EmailBackend.authenticate's User.objects.get(...)
+            # throws an uncaught MultipleObjectsReturned (500) if two
+            # accounts ever share an email, so this was a live crash-on-
+            # login risk, not just a data-hygiene one.
+            #
+            # Excludes blank email: AbstractUser.email is blank=True, and
+            # plenty of accounts legitimately have none (Django-admin-only
+            # staff, various test fixtures) -- those aren't "the same
+            # account" just because both happen to have no email.
+            models.UniqueConstraint(
+                Lower("email"),
+                name="unique_user_email_ci",
+                condition=~models.Q(email=""),
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.username

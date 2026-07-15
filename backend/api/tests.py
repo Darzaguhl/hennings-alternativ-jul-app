@@ -6,6 +6,7 @@ from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     Assignment,
@@ -593,6 +594,23 @@ class AdminNoteTests(TestCase):
         response = client.get(f"/api/users/{self.volunteer.id}/")
         self.assertNotIn("admin_notes", response.data)
 
+    def test_created_by_alone_does_not_grant_notes_access(self):
+        """Regression test for a closed privilege-escalation path:
+        _is_any_event_admin used to also trust Event.created_by, which
+        combined with any authenticated user being able to create an event
+        (see OwnerRoleTests.test_plain_user_cannot_create_an_event) let
+        anyone self-escalate into reading/editing every volunteer's
+        private notes. Both halves of that chain are closed now, but this
+        pins the notes-access half directly."""
+
+        bystander = User.objects.create_user(username="bystander-notes", password="pw")
+        Event.objects.create(title="Bystander's own event", created_by=bystander)
+
+        client = APIClient()
+        client.force_authenticate(user=bystander)
+        response = client.get(f"/api/users/{self.volunteer.id}/notes/")
+        self.assertEqual(response.status_code, 403)
+
 
 class UserOwnershipTests(TestCase):
     def setUp(self):
@@ -625,6 +643,69 @@ class UserOwnershipTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.alice.refresh_from_db()
         self.assertEqual(self.alice.experience_notes, "5 years as a nurse")
+
+
+class RosterVisibilityTests(TestCase):
+    """UserViewSet list/retrieve used to be readable by any authenticated
+    user -- every volunteer's email and experience_notes, not just people
+    you happen to share a shift with. Only people who'd actually need the
+    roster (owner/admin, check-in staff, oppgave leaders -- the same set
+    the admin dashboard's own nav gates on) get more than themselves back."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="roster-owner", password="pw")
+        self.checkin_staff = User.objects.create_user(username="roster-staff", password="pw")
+        self.leader = User.objects.create_user(username="roster-leader", password="pw")
+        self.volunteer_a = User.objects.create_user(username="roster-a", password="pw")
+        self.volunteer_b = User.objects.create_user(username="roster-b", password="pw")
+        self.event = make_event(title="Roster event", created_by=self.owner)
+        Membership.objects.create(event=self.event, user=self.checkin_staff, role=Membership.ROLE_CHECKIN_STAFF)
+        shift = Shift.objects.create(
+            event=self.event,
+            title="Kjøkken",
+            date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(22, 0),
+            created_by=self.owner,
+        )
+        shift.leaders.add(self.leader)
+        self.client = APIClient()
+
+    def test_plain_volunteer_only_sees_themselves_in_the_list(self):
+        self.client.force_authenticate(user=self.volunteer_a)
+        response = self.client.get("/api/users/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([u["id"] for u in response.data], [self.volunteer_a.id])
+
+    def test_plain_volunteer_cannot_retrieve_another_user_by_id(self):
+        self.client.force_authenticate(user=self.volunteer_a)
+        response = self.client.get(f"/api/users/{self.volunteer_b.id}/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_plain_volunteer_can_still_retrieve_their_own_id(self):
+        self.client.force_authenticate(user=self.volunteer_a)
+        response = self.client.get(f"/api/users/{self.volunteer_a.id}/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_owner_sees_the_full_roster(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get("/api/users/")
+        self.assertEqual(response.status_code, 200)
+        ids = {u["id"] for u in response.data}
+        self.assertIn(self.volunteer_a.id, ids)
+        self.assertIn(self.volunteer_b.id, ids)
+
+    def test_checkin_staff_sees_the_full_roster(self):
+        self.client.force_authenticate(user=self.checkin_staff)
+        response = self.client.get("/api/users/")
+        ids = {u["id"] for u in response.data}
+        self.assertIn(self.volunteer_a.id, ids)
+
+    def test_oppgave_leader_sees_the_full_roster(self):
+        self.client.force_authenticate(user=self.leader)
+        response = self.client.get("/api/users/")
+        ids = {u["id"] for u in response.data}
+        self.assertIn(self.volunteer_a.id, ids)
 
 
 class OwnershipEnforcementRegressionTests(TestCase):
@@ -1305,14 +1386,51 @@ class OwnerRoleTests(TestCase):
         self.assertEqual(response.status_code, 204)
         self.assertFalse(Membership.objects.filter(pk=membership.pk).exists())
 
-    def test_new_event_creator_gets_owner_membership(self):
+    def test_removing_a_membership_revokes_the_users_sessions(self):
+        """A JWT is otherwise stateless -- it doesn't care that the role it
+        was issued under just got revoked. remove_membership blacklists
+        the person's outstanding refresh tokens, so a previously-valid
+        session actually stops working rather than staying live until it
+        happens to expire."""
+
+        membership = Membership.objects.get(user=self.granted_admin, event=self.event)
+        refresh = RefreshToken.for_user(self.granted_admin)
+
         client = APIClient()
-        client.force_authenticate(user=self.candidate)
+        client.force_authenticate(user=self.owner)
+        response = client.post(
+            f"/api/events/{self.event.id}/remove-membership/", {"membership_id": membership.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 204)
+
+        refresh_response = APIClient().post("/api/token/refresh/", {"refresh": str(refresh)}, format="json")
+        self.assertNotEqual(refresh_response.status_code, 200)
+
+    def test_admin_creating_a_new_event_becomes_its_owner(self):
+        """perform_create still grants the creator an owner Membership on
+        the new event -- this now additionally requires the creator to
+        already be an admin/owner of an existing event (see
+        test_plain_user_cannot_create_an_event)."""
+
+        client = APIClient()
+        client.force_authenticate(user=self.granted_admin)
         response = client.post("/api/events/", {"title": "Alternativ Jul 2027"}, format="json")
         self.assertEqual(response.status_code, 201)
         event_id = response.data["id"]
-        membership = Membership.objects.get(event_id=event_id, user=self.candidate)
+        membership = Membership.objects.get(event_id=event_id, user=self.granted_admin)
         self.assertEqual(membership.role, Membership.ROLE_OWNER)
+
+    def test_plain_user_cannot_create_an_event(self):
+        """A user with no admin/owner Membership anywhere can't create an
+        event at all -- previously they could, and became that event's
+        owner, which was enough to self-escalate into "any event admin"
+        (see AdminNoteTests.test_created_by_alone_does_not_grant_notes_access)."""
+
+        client = APIClient()
+        client.force_authenticate(user=self.candidate)
+        response = client.post("/api/events/", {"title": "Sneaky event"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Event.objects.filter(title="Sneaky event").exists())
 
     def test_created_by_alone_grants_no_permissions(self):
         """The event is permanent, not owned forever by whoever happened to
@@ -1763,6 +1881,49 @@ class PublicEventEndpointTests(TestCase):
 
         response = self.client.get("/api/public/event/")
         self.assertEqual(response.data["id"], newer.id)
+
+
+class SkillPermissionTests(TestCase):
+    """The oppgave catalogue is shared across every volunteer's signup and
+    every event -- browsing it stays open to anyone authenticated, but
+    only an admin/owner can add, rename, or delete entries out from under
+    everyone else."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="skill-admin", password="pw")
+        self.volunteer = User.objects.create_user(username="skill-volunteer", password="pw")
+        make_event(title="Skill event", created_by=self.admin)
+        self.skill = Skill.objects.create(name="Kokk")
+        self.client = APIClient()
+
+    def test_any_authenticated_user_can_list_skills(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.get("/api/skills/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_plain_volunteer_cannot_create_a_skill(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.post("/api/skills/", {"name": "Sneaky new oppgave"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Skill.objects.filter(name="Sneaky new oppgave").exists())
+
+    def test_plain_volunteer_cannot_rename_a_skill(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.patch(f"/api/skills/{self.skill.id}/", {"name": "Renamed"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.name, "Kokk")
+
+    def test_plain_volunteer_cannot_delete_a_skill(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.delete(f"/api/skills/{self.skill.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Skill.objects.filter(pk=self.skill.pk).exists())
+
+    def test_admin_can_create_a_skill(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post("/api/skills/", {"name": "Vaktleder"}, format="json")
+        self.assertEqual(response.status_code, 201)
 
 
 class PublicSkillsEndpointTests(TestCase):

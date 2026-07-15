@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
@@ -54,6 +55,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     "rest_framework",   # add DRF
+    "rest_framework_simplejwt.token_blacklist",  # lets a session be revoked, not just expire on its own
     "api",              # your custom API app
     'corsheaders',
 ]
@@ -74,6 +76,22 @@ REST_FRAMEWORK = {
         "password_setup_request": "5/hour",
         "password_setup_confirm": "20/hour",
     },
+}
+
+# The event runs many consecutive days, so a short-lived session that
+# forces a daily re-login (djangorestframework-simplejwt's own defaults are
+# 5 minutes access / 1 day refresh) would be actively hostile to volunteers
+# mid-event. Rotating + blacklisting refresh tokens on every use means a
+# stolen/replayed one is caught the next time the legitimate device tries
+# to refresh, and -- combined with the token_blacklist app -- lets a
+# specific person's session actually be revoked (see
+# views.EventViewSet.remove_membership) instead of only ever expiring on
+# its own.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=1),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=14),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 MIDDLEWARE = [

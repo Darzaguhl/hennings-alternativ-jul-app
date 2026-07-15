@@ -8,6 +8,7 @@ from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
@@ -286,13 +287,51 @@ def _can_view_pool(event, user) -> bool:
 def _is_any_event_admin(user) -> bool:
     """Admin notes on a User aren't scoped to one event -- the org runs one
     event at a time in practice -- so this checks admin/owner status on any
-    event rather than requiring an event in the URL."""
+    event rather than requiring an event in the URL.
+
+    Deliberately Membership-only, same as Event.is_owner/is_admin --
+    created_by carries no permission weight (see
+    OwnershipEnforcementRegressionTests.test_created_by_alone_grants_no_permissions).
+    It used to also treat "created this event" as sufficient here, which
+    combined with EventViewSet.perform_create being open to any
+    authenticated user, meant anyone could self-escalate to "any event
+    admin" by creating a throwaway event. perform_create is now gated by
+    this same check, closing the loop."""
 
     if not user.is_authenticated:
         return False
-    if Event.objects.filter(created_by=user).exists():
-        return True
     return Membership.objects.filter(user=user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]).exists()
+
+
+def _can_view_roster(user) -> bool:
+    """Who can browse the full volunteer list (UserViewSet list/retrieve)
+    rather than just their own /me. Broader than _is_any_event_admin --
+    check-in staff and oppgave leaders legitimately need to look someone
+    up (manual check-in, coordinating their team), not just owners/admins
+    -- mirroring the admin dashboard's own canSeePool/canSeeInnsjekk gates
+    (Layout.tsx), so the backend enforces exactly what the UI already
+    implies rather than a stricter or looser rule."""
+
+    if not user.is_authenticated:
+        return False
+    if _is_any_event_admin(user):
+        return True
+    if Membership.objects.filter(user=user, role=Membership.ROLE_CHECKIN_STAFF).exists():
+        return True
+    return Shift.objects.filter(leaders=user).exists()
+
+
+def _revoke_all_sessions_for(user) -> None:
+    """Force a person's existing app/dashboard sessions to stop working,
+    rather than leaving them valid until they happen to expire on their
+    own (up to REFRESH_TOKEN_LIFETIME) -- a JWT is otherwise stateless and
+    doesn't care that the role it was issued under just got revoked. Used
+    when an owner/admin role is removed (see remove_membership); relies on
+    SIMPLE_JWT's ROTATE_REFRESH_TOKENS, which is what makes every issued
+    refresh token show up in OutstandingToken in the first place."""
+
+    for outstanding in OutstandingToken.objects.filter(user=user):
+        BlacklistedToken.objects.get_or_create(token=outstanding)
 
 
 def _resolve_checkin(event, user, performed_by):
@@ -352,6 +391,19 @@ class UserViewSet(viewsets.ModelViewSet):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_queryset(self):
+        # list/retrieve used to be readable by anyone authenticated --
+        # every volunteer's email and experience_notes, not just people
+        # you happen to share a shift with. perform_update/perform_destroy
+        # already restricted writes to "your own account"; this closes the
+        # matching gap on reads. Non-staff callers just see themselves,
+        # rather than a 403, so /api/users/<own id>/ keeps working as a
+        # /me equivalent.
+        queryset = super().get_queryset()
+        if self.action in ("list", "retrieve") and not _can_view_roster(self.request.user):
+            return queryset.filter(pk=self.request.user.pk)
+        return queryset
+
     def perform_update(self, serializer):
         if serializer.instance != self.request.user:
             raise PermissionDenied("You can only update your own profile.")
@@ -393,6 +445,14 @@ class EventViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def perform_create(self, serializer):
+        # Requires already being an admin/owner of an existing event (or
+        # Django staff, for bootstrapping the very first event in a fresh
+        # deployment via the Django admin) -- previously any authenticated
+        # user could create an event and become its owner, which (via
+        # _is_any_event_admin) was enough to self-escalate into reading and
+        # editing every volunteer's private admin notes.
+        if not (self.request.user.is_staff or _is_any_event_admin(self.request.user)):
+            raise PermissionDenied("Only an existing admin can create a new event.")
         event = serializer.save(created_by=self.request.user)
         Membership.objects.get_or_create(event=event, user=self.request.user, role=Membership.ROLE_OWNER)
 
@@ -634,7 +694,12 @@ class EventViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        removed_user = membership.user
         membership.delete()
+        # Their role here is gone, but any session issued while they still
+        # had it stays valid otherwise -- cut it off rather than leaving
+        # that to chance.
+        _revoke_all_sessions_for(removed_user)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"], url_path="invites")
@@ -857,6 +922,27 @@ class QRCodeViewSet(viewsets.ModelViewSet):
 
 
 class SkillViewSet(viewsets.ModelViewSet):
+    """The shared oppgave catalogue every volunteer picks from at signup
+    and every event reads from -- list/retrieve stays open to any
+    volunteer (they need to browse it), but writes used to be too, letting
+    any authenticated user rename or delete a skill out from under
+    everyone else."""
+
     queryset = Skill.objects.all()
     serializer_class = SkillSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can add oppgaver.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can edit oppgaver.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can delete oppgaver.")
+        instance.delete()
