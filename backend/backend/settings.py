@@ -65,6 +65,15 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+    # Per-IP limits on the sensitive unauthenticated endpoints -- see
+    # api.throttling. Not a DEFAULT_THROTTLE_CLASSES entry, since the rest
+    # of the API is already behind IsAuthenticated and doesn't need this.
+    "DEFAULT_THROTTLE_RATES": {
+        "register": "10/hour",
+        "login": "20/hour",
+        "password_setup_request": "5/hour",
+        "password_setup_confirm": "20/hour",
+    },
 }
 
 MIDDLEWARE = [

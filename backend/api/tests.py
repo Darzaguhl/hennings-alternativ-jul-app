@@ -1,6 +1,7 @@
 import datetime
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
@@ -682,6 +683,7 @@ class OwnershipEnforcementRegressionTests(TestCase):
 
 class RegistrationAndEmailLoginTests(TestCase):
     def setUp(self):
+        cache.clear()  # throttle counters live in the cache, not the DB -- see RequestPasswordSetupTests
         self.client = APIClient()
         make_event(title="Hennings Alternativ Jul")
 
@@ -788,6 +790,7 @@ class RegistrationAndEmailLoginTests(TestCase):
 
 class SignupWindowTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
 
     def test_registration_succeeds_when_no_window_is_set(self):
@@ -849,6 +852,7 @@ class PasswordSetupTests(TestCase):
     PasswordSetupToken, emailed to them, that lets them set one later."""
 
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
         make_event(title="Hennings Alternativ Jul")
 
@@ -946,6 +950,7 @@ class RequestPasswordSetupTests(TestCase):
     used to check which emails have accounts."""
 
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
 
     def test_request_for_passwordless_user_creates_a_new_token(self):
@@ -993,6 +998,73 @@ class RequestPasswordSetupTests(TestCase):
     def test_request_rejects_invalid_email(self):
         response = self.client.post("/api/password-setup/request/", {"email": "not-an-email"}, format="json")
         self.assertEqual(response.status_code, 400)
+
+
+class ThrottlingTests(TestCase):
+    """The sensitive public endpoints (register, login, password-setup
+    request/confirm) are individually rate-limited by IP -- see
+    api.throttling and DEFAULT_THROTTLE_RATES. These confirm the
+    configured limits actually bite, and that exhausting one endpoint's
+    quota doesn't affect another's (each has its own scope)."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        make_event(title="Hennings Alternativ Jul")
+
+    def test_register_endpoint_is_throttled(self):
+        for i in range(10):
+            response = self.client.post(
+                "/api/register/",
+                {"email": f"throttle{i}@example.com", "password": "correct horse battery staple"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 201)
+
+        response = self.client.post(
+            "/api/register/", {"email": "one.too.many@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 429)
+
+    def test_login_endpoint_is_throttled(self):
+        User.objects.create_user(username="rate@example.com", email="rate@example.com", password="correct horse battery staple")
+        for _ in range(20):
+            response = self.client.post("/api/token/", {"email": "rate@example.com", "password": "wrong"}, format="json")
+            self.assertEqual(response.status_code, 401)
+
+        response = self.client.post("/api/token/", {"email": "rate@example.com", "password": "wrong"}, format="json")
+        self.assertEqual(response.status_code, 429)
+
+    def test_password_setup_request_endpoint_is_throttled(self):
+        for _ in range(5):
+            response = self.client.post("/api/password-setup/request/", {"email": "throttled@example.com"}, format="json")
+            self.assertEqual(response.status_code, 200)
+
+        response = self.client.post("/api/password-setup/request/", {"email": "throttled@example.com"}, format="json")
+        self.assertEqual(response.status_code, 429)
+
+    def test_password_setup_confirm_endpoint_is_throttled(self):
+        for _ in range(20):
+            response = self.client.post(
+                "/api/password-setup/confirm/", {"token": "not-a-real-token", "password": "correct horse battery staple"}, format="json"
+            )
+            self.assertEqual(response.status_code, 400)
+
+        response = self.client.post(
+            "/api/password-setup/confirm/", {"token": "not-a-real-token", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 429)
+
+    def test_throttle_scopes_are_independent(self):
+        for _ in range(5):
+            self.client.post("/api/password-setup/request/", {"email": "scoped@example.com"}, format="json")
+
+        # password_setup_request's quota is now exhausted, but register --
+        # a different scope -- should be completely unaffected.
+        response = self.client.post(
+            "/api/register/", {"email": "still.works@example.com", "password": "correct horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
 
 
 class MembershipRolesTests(TestCase):
