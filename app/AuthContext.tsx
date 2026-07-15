@@ -1,5 +1,7 @@
 // app/AuthContext.tsx
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
 import React, {
   createContext,
   useCallback,
@@ -12,6 +14,26 @@ import React, {
 const ACCESS_TOKEN_KEY = "accessToken";
 const REFRESH_TOKEN_KEY = "refreshToken";
 const API_BASE_URL = "https://hennings-alternativ-jul-api-preprod.onrender.com";
+
+// Session tokens used to sit in plain AsyncStorage -- readable in the clear
+// by anyone with file-level access to the device (a lost/unlocked phone, a
+// backup, a jailbreak). SecureStore is backed by the iOS Keychain / Android
+// Keystore instead. It has no web implementation, though, and this app also
+// runs via `expo start --web` for local testing -- so web keeps using
+// AsyncStorage (fine there; a browser has no equivalent secure enclave to
+// reach for anyway) while real devices get the encrypted store.
+const tokenStorage =
+  Platform.OS === "web"
+    ? {
+        getItem: (key: string) => AsyncStorage.getItem(key),
+        setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
+        removeItem: (key: string) => AsyncStorage.removeItem(key),
+      }
+    : {
+        getItem: (key: string) => SecureStore.getItemAsync(key),
+        setItem: (key: string, value: string) => SecureStore.setItemAsync(key, value),
+        removeItem: (key: string) => SecureStore.deleteItemAsync(key),
+      };
 
 type FetchArgs = Parameters<typeof fetch>;
 
@@ -69,9 +91,9 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   useEffect(() => {
     const loadTokens = async () => {
       try {
-        const [[, storedAccess], [, storedRefresh]] = await AsyncStorage.multiGet([
-          ACCESS_TOKEN_KEY,
-          REFRESH_TOKEN_KEY,
+        const [storedAccess, storedRefresh] = await Promise.all([
+          tokenStorage.getItem(ACCESS_TOKEN_KEY),
+          tokenStorage.getItem(REFRESH_TOKEN_KEY),
         ]);
 
         setToken(storedAccess ?? null);
@@ -112,16 +134,19 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   }, [loading, token, currentUser, fetchCurrentUser]);
 
   const persistTokens = useCallback(async (access: string, refresh: string) => {
-    await AsyncStorage.multiSet([
-      [ACCESS_TOKEN_KEY, access],
-      [REFRESH_TOKEN_KEY, refresh],
+    await Promise.all([
+      tokenStorage.setItem(ACCESS_TOKEN_KEY, access),
+      tokenStorage.setItem(REFRESH_TOKEN_KEY, refresh),
     ]);
     setToken(access);
     setRefreshToken(refresh);
   }, []);
 
   const clearTokens = useCallback(async () => {
-    await AsyncStorage.multiRemove([ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY]);
+    await Promise.all([
+      tokenStorage.removeItem(ACCESS_TOKEN_KEY),
+      tokenStorage.removeItem(REFRESH_TOKEN_KEY),
+    ]);
     setToken(null);
     setRefreshToken(null);
   }, []);
@@ -198,13 +223,21 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
           return response;
         }
 
-        const refreshData: { access?: string } = await refreshResponse.json();
+        const refreshData: { access?: string; refresh?: string } = await refreshResponse.json();
         if (!refreshData.access) {
           await logout();
           return response;
         }
 
-        await AsyncStorage.setItem(ACCESS_TOKEN_KEY, refreshData.access);
+        // The backend rotates refresh tokens (a fresh one comes back on
+        // every /token/refresh/ call, and the one just used gets
+        // blacklisted) -- persist it too, or the *next* refresh attempt
+        // fails with an already-used token and force-logs the user out.
+        if (refreshData.refresh) {
+          await tokenStorage.setItem(REFRESH_TOKEN_KEY, refreshData.refresh);
+          setRefreshToken(refreshData.refresh);
+        }
+        await tokenStorage.setItem(ACCESS_TOKEN_KEY, refreshData.access);
         setToken(refreshData.access);
 
         const retryHeaders = buildHeaders(init?.headers);
