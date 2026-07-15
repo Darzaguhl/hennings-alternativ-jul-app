@@ -1,18 +1,60 @@
 import { useRouter } from "expo-router";
-import React from "react";
-import { ActivityIndicator, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
-import { theme } from "../../constants/theme";
+import React, { useEffect, useState } from "react";
+import {
+  ActivityIndicator,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { colors, theme } from "../../constants/theme";
 import { useAuth } from "../AuthContext";
 import { useSettings } from "../SettingsContext";
 
 export default function ProfileScreen() {
-  const { logout } = useAuth();
+  const { logout, currentUser, apiFetch, refreshCurrentUser } = useAuth();
   const router = useRouter();
   const { timeFormat, dateFormat, setTimeFormat, setDateFormat, loading } = useSettings();
+
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [savingName, setSavingName] = useState(false);
+  const [nameError, setNameError] = useState("");
+  const [nameSaved, setNameSaved] = useState(false);
+
+  useEffect(() => {
+    setFirstName(currentUser?.first_name ?? "");
+    setLastName(currentUser?.last_name ?? "");
+  }, [currentUser]);
 
   const handleLogout = async () => {
     await logout();
     router.replace("/login");
+  };
+
+  const saveName = async () => {
+    if (!currentUser) return;
+    setSavingName(true);
+    setNameError("");
+    setNameSaved(false);
+    try {
+      const response = await apiFetch(`/api/users/${currentUser.id}/`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ first_name: firstName.trim(), last_name: lastName.trim() }),
+      });
+      if (!response.ok) {
+        throw new Error("Could not save your name");
+      }
+      await refreshCurrentUser();
+      setNameSaved(true);
+    } catch {
+      setNameError("Could not save your name. Please try again.");
+    } finally {
+      setSavingName(false);
+    }
   };
 
   return (
@@ -21,6 +63,48 @@ export default function ProfileScreen() {
         <Text style={styles.heading}>Profile</Text>
         <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
           <Text style={styles.logoutButtonText}>Logout</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Name</Text>
+        <Text style={styles.sectionHint}>
+          Lets admins recognize you on the volunteer list instead of just your email.
+        </Text>
+        <View style={styles.nameRow}>
+          <TextInput
+            style={styles.nameInput}
+            value={firstName}
+            onChangeText={(text) => {
+              setFirstName(text);
+              setNameSaved(false);
+            }}
+            placeholder="First name"
+            autoCapitalize="words"
+          />
+          <TextInput
+            style={styles.nameInput}
+            value={lastName}
+            onChangeText={(text) => {
+              setLastName(text);
+              setNameSaved(false);
+            }}
+            placeholder="Last name"
+            autoCapitalize="words"
+          />
+        </View>
+        {nameError ? <Text style={styles.nameError}>{nameError}</Text> : null}
+        {nameSaved ? <Text style={styles.nameSaved}>Saved.</Text> : null}
+        <TouchableOpacity
+          style={[styles.saveButton, savingName && styles.saveButtonDisabled]}
+          onPress={saveName}
+          disabled={savingName}
+        >
+          {savingName ? (
+            <ActivityIndicator color={colors.white} />
+          ) : (
+            <Text style={styles.saveButtonText}>Save name</Text>
+          )}
         </TouchableOpacity>
       </View>
 
@@ -109,4 +193,26 @@ const styles = StyleSheet.create({
   },
   optionText: { color: "#0f172a", fontWeight: "500" },
   optionTextActive: { color: "#ffffff" },
+  sectionHint: { fontSize: 13, color: "#64748b" },
+  nameRow: { flexDirection: "row", gap: 12 },
+  nameInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#d0d7e2",
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 15,
+    backgroundColor: "#f8fafc",
+  },
+  nameError: { color: "#b91c1c", fontSize: 13 },
+  nameSaved: { color: colors.green700, fontSize: 13 },
+  saveButton: {
+    backgroundColor: theme.primary,
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  saveButtonDisabled: { opacity: 0.6 },
+  saveButtonText: { color: colors.white, fontWeight: "600" },
 });

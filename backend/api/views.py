@@ -480,7 +480,7 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_destroy(self, instance):
-        if instance != self.request.user:
+        if instance != self.request.user and not _is_any_event_admin(self.request.user):
             raise PermissionDenied("You can only delete your own account.")
         instance.delete()
 

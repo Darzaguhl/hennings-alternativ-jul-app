@@ -644,6 +644,44 @@ class UserOwnershipTests(TestCase):
         self.alice.refresh_from_db()
         self.assertEqual(self.alice.experience_notes, "5 years as a nurse")
 
+    def test_can_set_own_name(self):
+        response = self.client.patch(
+            f"/api/users/{self.alice.id}/",
+            {"first_name": "Alice", "last_name": "Nordmann"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.first_name, "Alice")
+        self.assertEqual(self.alice.last_name, "Nordmann")
+
+
+class UserDeletionByAdminTests(TestCase):
+    """perform_destroy used to only allow deleting your own account -- an
+    event admin removing a volunteer (e.g. a duplicate/spam signup) had no
+    way to do it short of the Django admin. See UserOwnershipTests for the
+    matching "still can't delete someone else's account" case for a
+    non-admin."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="deleter-admin", password="pw")
+        make_event(title="Deletion event", created_by=self.admin)
+        self.volunteer = User.objects.create_user(username="deletable-volunteer", password="pw")
+        self.client = APIClient()
+
+    def test_event_admin_can_delete_another_user(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.delete(f"/api/users/{self.volunteer.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(User.objects.filter(pk=self.volunteer.pk).exists())
+
+    def test_plain_volunteer_still_cannot_delete_another_user(self):
+        bystander = User.objects.create_user(username="delete-bystander", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.delete(f"/api/users/{self.volunteer.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(User.objects.filter(pk=self.volunteer.pk).exists())
+
 
 class RosterVisibilityTests(TestCase):
     """UserViewSet list/retrieve used to be readable by any authenticated

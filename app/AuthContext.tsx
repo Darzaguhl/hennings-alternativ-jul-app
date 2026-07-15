@@ -41,6 +41,8 @@ interface AuthUser {
   id: number;
   username: string;
   email: string;
+  first_name: string;
+  last_name: string;
 }
 
 interface AuthContextType {
@@ -51,6 +53,7 @@ interface AuthContextType {
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   apiFetch: (...args: FetchArgs) => ReturnType<typeof fetch>;
+  refreshCurrentUser: () => Promise<void>;
 }
 
 const noop = async () => {
@@ -65,6 +68,7 @@ const AuthContext = createContext<AuthContextType>({
   login: noop,
   logout: noop,
   apiFetch: () => Promise.reject(new Error("Auth context not initialised")),
+  refreshCurrentUser: noop,
 });
 
 const resolveUrl = (input: FetchArgs[0]) => {
@@ -257,9 +261,11 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     [token, refreshToken, logout]
   );
 
+  const refreshCurrentUser = useCallback(() => fetchCurrentUser(), [fetchCurrentUser]);
+
   const value = useMemo(
-    () => ({ token, refreshToken, currentUser, loading, login, logout, apiFetch }),
-    [token, refreshToken, currentUser, loading, login, logout, apiFetch]
+    () => ({ token, refreshToken, currentUser, loading, login, logout, apiFetch, refreshCurrentUser }),
+    [token, refreshToken, currentUser, loading, login, logout, apiFetch, refreshCurrentUser]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
