@@ -4,9 +4,9 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (EmailTokenObtainPairView, EventViewSet, QRCodeViewSet,
                     RegisterView, ShiftViewSet, SkillViewSet, UserViewSet,
-                    accept_invite, invite_preview, password_setup_preview,
-                    public_event, public_skills, request_password_setup,
-                    set_password)
+                    accept_invite, invite_preview, oppgave_history,
+                    password_setup_preview, public_event, public_skills,
+                    request_password_setup, set_password)
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet)
@@ -38,6 +38,10 @@ urlpatterns = [
     # JWT token endpoints (login by email)
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+
+    # Admin: cross-event history (signups vs. actual fill, for gauging
+    # how much to oversubscribe per oppgave to cover no-shows)
+    path('metrics/oppgave-history/', oppgave_history, name='oppgave-history'),
 
     # DRF router endpoints
     path('', include(router.urls)),  # this exposes /users/, /events/, /shifts/, /skills/, /qrcodes/

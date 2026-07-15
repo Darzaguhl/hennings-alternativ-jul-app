@@ -1778,6 +1778,95 @@ class MetricsTests(TestCase):
         self.assertTrue(shift_metric["is_understaffed"])
 
 
+class OppgaveHistoryTests(TestCase):
+    """Cross-event no-show/fill-rate tracking -- signups vs. actual
+    Assignments, grouped by shift title across every event regardless of
+    which one is active, so an admin can see how much they need to
+    oversubscribe a given oppgave to reliably end up with it filled."""
+
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="history-organizer", password="pw")
+        self.admin = User.objects.create_user(username="history-admin", password="pw")
+        self.volunteer = User.objects.create_user(username="history-volunteer", password="pw")
+
+        self.event_2026 = make_event(
+            title="Alternativ Jul 2026",
+            created_by=self.organizer,
+            date=datetime.datetime(2026, 12, 20, tzinfo=datetime.timezone.utc),
+        )
+        Membership.objects.create(event=self.event_2026, user=self.admin, role=Membership.ROLE_ADMIN)
+
+        self.event_2027 = make_event(
+            title="Alternativ Jul 2027",
+            created_by=self.organizer,
+            is_active=False,
+            date=datetime.datetime(2027, 12, 20, tzinfo=datetime.timezone.utc),
+        )
+
+        kitchen_2026 = Shift.objects.create(
+            event=self.event_2026, title="Kjøkken", date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        kitchen_2027 = Shift.objects.create(
+            event=self.event_2027, title=" kjøkken ", date=datetime.date(2027, 12, 24),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        hosting_2027 = Shift.objects.create(
+            event=self.event_2027, title="Vertskap", date=datetime.date(2027, 12, 24),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+
+        volunteers_2026 = [User.objects.create_user(username=f"v2026-{i}", password="pw") for i in range(4)]
+        for v in volunteers_2026:
+            ShiftSignup.objects.create(shift=kitchen_2026, user=v)
+        for v in volunteers_2026[:2]:
+            Assignment.objects.create(shift=kitchen_2026, user=v, confirmed_by=self.organizer)
+
+        volunteers_2027 = [User.objects.create_user(username=f"v2027-{i}", password="pw") for i in range(2)]
+        for v in volunteers_2027:
+            ShiftSignup.objects.create(shift=kitchen_2027, user=v)
+            Assignment.objects.create(shift=kitchen_2027, user=v, confirmed_by=self.organizer)
+
+        hosting_volunteers = [User.objects.create_user(username=f"h2027-{i}", password="pw") for i in range(3)]
+        for v in hosting_volunteers:
+            ShiftSignup.objects.create(shift=hosting_2027, user=v)
+
+        self.client = APIClient()
+
+    def _get(self, user):
+        self.client.force_authenticate(user=user)
+        return self.client.get("/api/metrics/oppgave-history/")
+
+    def test_plain_volunteer_cannot_view_history(self):
+        response = self._get(self.volunteer)
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_view_history(self):
+        response = self._get(self.admin)
+        self.assertEqual(response.status_code, 200)
+
+    def test_shifts_with_the_same_title_merge_across_years_case_insensitively(self):
+        response = self._get(self.organizer)
+        kjokken = next(r for r in response.data if r["title"].lower() == "kjøkken")
+        self.assertEqual(kjokken["total_signups"], 6)
+        self.assertEqual(kjokken["total_assigned"], 4)
+        self.assertEqual({y["year"] for y in kjokken["years"]}, {"2026", "2027"})
+
+    def test_fill_rate_and_oversubscription_factor(self):
+        response = self._get(self.organizer)
+        kjokken = next(r for r in response.data if r["title"].lower() == "kjøkken")
+        self.assertAlmostEqual(kjokken["fill_rate"], 4 / 6, places=3)
+        self.assertAlmostEqual(kjokken["oversubscription_factor"], 6 / 4, places=2)
+
+    def test_zero_fill_rate_has_no_oversubscription_factor(self):
+        response = self._get(self.organizer)
+        hosting = next(r for r in response.data if r["title"] == "Vertskap")
+        self.assertEqual(hosting["total_signups"], 3)
+        self.assertEqual(hosting["total_assigned"], 0)
+        self.assertEqual(hosting["fill_rate"], 0)
+        self.assertIsNone(hosting["oversubscription_factor"])
+
+
 class ShiftCapacityTests(TestCase):
     def test_is_understaffed_reflects_min_capacity(self):
         organizer = User.objects.create_user(username="organizer", password="pw")

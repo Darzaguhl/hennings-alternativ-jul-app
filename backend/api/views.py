@@ -2,6 +2,7 @@ import datetime
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
+from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status, viewsets
@@ -384,6 +385,75 @@ def _checkin_response(attendee, result, request):
         status_code = status.HTTP_202_ACCEPTED
 
     return Response(payload, status=status_code)
+
+
+def _event_year_label(event) -> str:
+    """A stable per-event label for grouping oppgave history by year --
+    falls back to the event's title when it has no date set."""
+
+    if event.date:
+        return str(event.date.year)
+    return event.title
+
+
+@api_view(["GET"])
+@permission_classes([permissions.IsAuthenticated])
+def oppgave_history(request):
+    """Cross-event history: for each distinct vakt/oppgave (grouped by
+    shift title, case-insensitively, across every event regardless of
+    which one is active), how many people signed up vs. how many actually
+    ended up assigned (i.e. showed up and were placed).
+
+    The gap between those two numbers is no-shows -- signing up doesn't
+    mean showing up, and Assignment only happens at check-in time (see
+    _resolve_checkin). fill_rate is assigned/signups; oversubscription_
+    factor is its inverse, i.e. roughly how many signups to accept per
+    seat you actually want filled, based on history. Only meaningful once
+    a few years of real data exist -- with one or two, it's a rough
+    starting point, not a forecast."""
+
+    if not _is_any_event_admin(request.user):
+        return Response({"detail": "Only an admin can view this."}, status=status.HTTP_403_FORBIDDEN)
+
+    shifts = Shift.objects.select_related("event").annotate(
+        signup_total=Count("signups", distinct=True),
+        assigned_total=Count("assignments", distinct=True),
+    )
+
+    groups: dict = {}
+    for shift in shifts:
+        key = shift.title.strip().lower()
+        if not key:
+            continue
+        year = _event_year_label(shift.event)
+        entry = groups.setdefault(
+            key, {"title": shift.title.strip(), "years": {}, "total_signups": 0, "total_assigned": 0}
+        )
+        yearly = entry["years"].setdefault(year, {"signups": 0, "assigned": 0})
+        yearly["signups"] += shift.signup_total
+        yearly["assigned"] += shift.assigned_total
+        entry["total_signups"] += shift.signup_total
+        entry["total_assigned"] += shift.assigned_total
+
+    results = []
+    for entry in groups.values():
+        fill_rate = entry["total_assigned"] / entry["total_signups"] if entry["total_signups"] else None
+        results.append(
+            {
+                "title": entry["title"],
+                "years": [
+                    {"year": year, "signups": v["signups"], "assigned": v["assigned"]}
+                    for year, v in sorted(entry["years"].items())
+                ],
+                "total_signups": entry["total_signups"],
+                "total_assigned": entry["total_assigned"],
+                "fill_rate": round(fill_rate, 3) if fill_rate is not None else None,
+                "oversubscription_factor": round(1 / fill_rate, 2) if fill_rate else None,
+            }
+        )
+
+    results.sort(key=lambda r: r["title"].lower())
+    return Response(results)
 
 
 class UserViewSet(viewsets.ModelViewSet):
