@@ -869,6 +869,77 @@ class EventViewSet(viewsets.ModelViewSet):
         )
 
 
+def _shift_datetime_range(shift):
+    """(start, end) as combined date+time, handling vakter that cross
+    midnight (end_time <= start_time means it ends the following day)."""
+
+    start = datetime.datetime.combine(shift.date, shift.start_time)
+    end_date = shift.date if shift.end_time > shift.start_time else shift.date + datetime.timedelta(days=1)
+    end = datetime.datetime.combine(end_date, shift.end_time)
+    return start, end
+
+
+def _overlapping_signup(user, shift):
+    """The user's existing ShiftSignup in this event whose vakt overlaps
+    `shift`'s time range, if any -- a volunteer can't physically work two
+    vakter at once. This is what makes the real site's explicit "can't
+    combine vakt 6+7 or 9+10" rule fall out for free: those are simply the
+    two vakt pairs whose times actually overlap (a night vakt ending 09:15,
+    the next starting 08:30), so checking real overlap generalizes instead
+    of hardcoding that pair list."""
+
+    candidate_start, candidate_end = _shift_datetime_range(shift)
+    existing = ShiftSignup.objects.filter(event=shift.event, user=user).select_related("shift")
+    for signup in existing:
+        other_start, other_end = _shift_datetime_range(signup.shift)
+        if candidate_start < other_end and other_start < candidate_end:
+            return signup.shift
+    return None
+
+
+def _would_complete_three_consecutive(user, shift):
+    """True if signing up for `shift` would give the user 3 (or more)
+    numbered-consecutive vakter in the event's chronological order --
+    the real site's burnout rule ("ikke mulig å melde seg på tre
+    sammenhengende vakter"). "Consecutive" means adjacent positions in the
+    event's full vakt sequence (date, start_time order), not merely
+    touching in time."""
+
+    ordered_ids = list(Shift.objects.filter(event=shift.event).order_by("date", "start_time").values_list("id", flat=True))
+    if shift.id not in ordered_ids:
+        return False
+    index = ordered_ids.index(shift.id)
+
+    signed_up_ids = set(
+        ShiftSignup.objects.filter(event=shift.event, user=user).values_list("shift_id", flat=True)
+    )
+    signed_up_ids.add(shift.id)
+
+    for window_start in (index - 2, index - 1, index):
+        window = range(window_start, window_start + 3)
+        if window_start < 0 or window.stop > len(ordered_ids):
+            continue
+        if all(ordered_ids[i] in signed_up_ids for i in window):
+            return True
+    return False
+
+
+def _phase_incompatible(user, shift):
+    """True if the shift has a categorized phase, the user has picked at
+    least one oppgave (Skill), and none of them are allowed in that phase.
+    Blank shift.phase (uncategorized) and a user with zero skills both
+    bypass this check -- see Skill.allowed_in_* and Shift.phase docstrings
+    for why those default to permissive."""
+
+    if not shift.phase:
+        return False
+    skills = list(user.skills.all())
+    if not skills:
+        return False
+    phase_field = f"allowed_in_{shift.phase}"
+    return not any(getattr(skill, phase_field) for skill in skills)
+
+
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.select_related("event", "created_by").prefetch_related("participants", "leaders")
     serializer_class = ShiftSerializer
@@ -917,6 +988,25 @@ class ShiftViewSet(viewsets.ModelViewSet):
 
         if ShiftSignup.objects.filter(shift=shift, user=user).exists():
             return Response({"detail": "Already signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
+
+        overlapping = _overlapping_signup(user, shift)
+        if overlapping:
+            return Response(
+                {"detail": f"Denne vakten overlapper med «{overlapping.title}», som du allerede er påmeldt til."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if _would_complete_three_consecutive(user, shift):
+            return Response(
+                {"detail": "Det er ikke mulig å melde seg på tre sammenhengende vakter."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if _phase_incompatible(user, shift):
+            return Response(
+                {"detail": "Ingen av oppgavene du har krysset av for gjelder denne vakten."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         has_experience = request.data.get("has_relevant_experience")
         if isinstance(has_experience, str):

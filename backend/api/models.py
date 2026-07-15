@@ -10,6 +10,15 @@ from django.utils import timezone
 class Skill(models.Model):
     name = models.CharField(max_length=100, unique=True)
 
+    # Which of Shift.phase this oppgave is valid for -- e.g. "Vertskap" is
+    # guest-facing only, "Hva som helst på ryddevakt" is teardown only.
+    # Default True on all three: until an admin actually curates these, an
+    # oppgave is treated as unrestricted rather than silently blocking every
+    # signup that uses it. See ShiftViewSet.signup for how this is enforced.
+    allowed_in_setup = models.BooleanField(default=True)
+    allowed_in_guest = models.BooleanField(default=True)
+    allowed_in_teardown = models.BooleanField(default=True)
+
     class Meta:
         ordering = ["name"]
 
@@ -304,14 +313,26 @@ class QRCode(models.Model):
 
 
 class Shift(models.Model):
-    """A single oppgave (task/role) within an Event on a given day, e.g.
-    'Kjøkken' on 24 Dec, 18:00-22:00."""
+    """A vakt: a numbered time slot within an Event (e.g. "Vakt 5", 24 Dec
+    13:00-23:00). Distinct from Skill ("oppgave") -- a single vakt has many
+    volunteers doing many different oppgaver at once; a vakt is when, an
+    oppgave is what. See `phase`, and Skill.allowed_in_* for how the two
+    are related."""
 
     CRITICALITY_NORMAL = "normal"
     CRITICALITY_CRITICAL = "critical"
     CRITICALITY_CHOICES = (
         (CRITICALITY_NORMAL, "Normal"),
         (CRITICALITY_CRITICAL, "Critical — requires relevant experience"),
+    )
+
+    PHASE_SETUP = "setup"
+    PHASE_GUEST = "guest"
+    PHASE_TEARDOWN = "teardown"
+    PHASE_CHOICES = (
+        (PHASE_SETUP, "Forberedelse"),
+        (PHASE_GUEST, "Gjester til stede"),
+        (PHASE_TEARDOWN, "Rydding"),
     )
 
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="shifts")
@@ -328,6 +349,10 @@ class Shift(models.Model):
         choices=CRITICALITY_CHOICES,
         default=CRITICALITY_NORMAL,
     )
+    # Blank = uncategorized, treated as compatible with every oppgave (see
+    # ShiftViewSet.signup) so shifts created before this field existed don't
+    # retroactively start rejecting signups.
+    phase = models.CharField(max_length=10, choices=PHASE_CHOICES, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,

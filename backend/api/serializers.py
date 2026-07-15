@@ -22,7 +22,7 @@ User = get_user_model()
 class SkillSerializer(serializers.ModelSerializer):
     class Meta:
         model = Skill
-        fields = ["id", "name"]
+        fields = ["id", "name", "allowed_in_setup", "allowed_in_guest", "allowed_in_teardown"]
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -259,6 +259,7 @@ class PublicShiftSerializer(serializers.ModelSerializer):
             "criticality",
             "is_critical",
             "is_full",
+            "phase",
         ]
         read_only_fields = fields
 
@@ -318,6 +319,7 @@ class ShiftSerializer(serializers.ModelSerializer):
             "capacity",
             "min_capacity",
             "criticality",
+            "phase",
             "is_critical",
             "is_understaffed",
             "created_by",

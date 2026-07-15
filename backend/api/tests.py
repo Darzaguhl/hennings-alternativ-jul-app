@@ -461,12 +461,16 @@ class ShiftSignupEndpointTests(TestCase):
             criticality=Shift.CRITICALITY_CRITICAL,
             created_by=self.organizer,
         )
+        # Deliberately not overlapping with self.kitchen (18:00-22:00) --
+        # test_can_signup_for_multiple_shifts_same_day_now relies on both
+        # being joinable together, which the overlap check in
+        # ShiftSignupValidationTests below would otherwise correctly reject.
         self.hosting = Shift.objects.create(
             event=self.event,
             title="Vertskap",
             date=datetime.date(2026, 12, 24),
-            start_time=datetime.time(18, 0),
-            end_time=datetime.time(23, 0),
+            start_time=datetime.time(9, 0),
+            end_time=datetime.time(13, 0),
             created_by=self.organizer,
         )
         self.client = APIClient()
@@ -510,6 +514,119 @@ class ShiftSignupEndpointTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(ShiftSignup.objects.filter(shift=self.hosting, user=self.volunteer).exists())
+
+
+class ShiftSignupValidationTests(TestCase):
+    """The three real signup rules from the live site (read during
+    planning): no two vakter with overlapping times, no three
+    numbered-consecutive vakter, and an oppgave's phase must match the
+    vakt's phase. See _overlapping_signup / _would_complete_three_consecutive
+    / _phase_incompatible in views.py."""
+
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="validation-organizer", password="pw")
+        self.volunteer = User.objects.create_user(username="validation-volunteer", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.volunteer)
+
+    def _shift(self, date, start, end, **kwargs):
+        return Shift.objects.create(
+            event=self.event, title="Vakt", date=date, start_time=start, end_time=end,
+            created_by=self.organizer, **kwargs
+        )
+
+    def test_overlapping_shift_is_rejected(self):
+        # Mirrors the real vakt 6 (24 Des 22:00 - 25 Des 09:15) / vakt 7
+        # (25 Des 08:30-16:00) pair: a night vakt crossing midnight,
+        # overlapping the next vakt's start by 45 minutes.
+        night = self._shift(datetime.date(2026, 12, 24), datetime.time(22, 0), datetime.time(9, 15))
+        morning = self._shift(datetime.date(2026, 12, 25), datetime.time(8, 30), datetime.time(16, 0))
+
+        self.client.post(f"/api/shifts/{night.id}/signup/")
+        response = self.client.post(f"/api/shifts/{morning.id}/signup/")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("overlapper", response.data["detail"])
+        self.assertFalse(ShiftSignup.objects.filter(shift=morning, user=self.volunteer).exists())
+
+    def test_touching_but_not_overlapping_shifts_are_allowed(self):
+        # Vakt 4 ends 13:00, vakt 5 starts 13:00 -- back-to-back, not
+        # overlapping. Must stay legal.
+        first = self._shift(datetime.date(2026, 12, 24), datetime.time(9, 0), datetime.time(13, 0))
+        second = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
+
+        self.client.post(f"/api/shifts/{first.id}/signup/")
+        response = self.client.post(f"/api/shifts/{second.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_three_consecutive_shifts_rejected(self):
+        a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+        b = self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
+        c = self._shift(datetime.date(2026, 12, 20), datetime.time(18, 0), datetime.time(22, 0))
+
+        self.client.post(f"/api/shifts/{a.id}/signup/")
+        self.client.post(f"/api/shifts/{b.id}/signup/")
+        response = self.client.post(f"/api/shifts/{c.id}/signup/")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("tre sammenhengende", response.data["detail"])
+        self.assertFalse(ShiftSignup.objects.filter(shift=c, user=self.volunteer).exists())
+
+    def test_two_consecutive_shifts_allowed(self):
+        a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+        b = self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
+
+        self.client.post(f"/api/shifts/{a.id}/signup/")
+        response = self.client.post(f"/api/shifts/{b.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_non_consecutive_shifts_allowed(self):
+        a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+        self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
+        c = self._shift(datetime.date(2026, 12, 20), datetime.time(18, 0), datetime.time(22, 0))
+
+        self.client.post(f"/api/shifts/{a.id}/signup/")
+        response = self.client.post(f"/api/shifts/{c.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_phase_mismatch_is_rejected(self):
+        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
+        self.volunteer.skills.add(skill)
+        setup_shift = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0), phase=Shift.PHASE_SETUP)
+
+        response = self.client.post(f"/api/shifts/{setup_shift.id}/signup/")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(ShiftSignup.objects.filter(shift=setup_shift, user=self.volunteer).exists())
+
+    def test_phase_match_is_allowed(self):
+        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
+        self.volunteer.skills.add(skill)
+        guest_shift = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0), phase=Shift.PHASE_GUEST)
+
+        response = self.client.post(f"/api/shifts/{guest_shift.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_zero_skills_bypasses_phase_check(self):
+        guest_shift = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0), phase=Shift.PHASE_GUEST)
+
+        response = self.client.post(f"/api/shifts/{guest_shift.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_blank_phase_shift_bypasses_phase_check(self):
+        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
+        self.volunteer.skills.add(skill)
+        uncategorized_shift = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+
+        response = self.client.post(f"/api/shifts/{uncategorized_shift.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
 
 
 class UserSkillsTests(TestCase):
