@@ -36,6 +36,7 @@ from .serializers import (
     PublicEventSerializer,
     QRCodeSerializer,
     RegisterSerializer,
+    RequestPasswordSetupSerializer,
     SetPasswordSerializer,
     ShiftSerializer,
     ShiftSignupSerializer,
@@ -206,6 +207,31 @@ def set_password(request):
         setup_token.save(update_fields=["used_at"])
 
     return Response({"detail": "Password set. You can now log in with the app."})
+
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def request_password_setup(request):
+    """Unauthenticated: 'first time / lost the email' request for a fresh
+    password-setup link, entered directly in the app (see the mobile app's
+    set-password screen) instead of only ever being sent automatically at
+    registration.
+
+    Always responds with the same generic message regardless of whether
+    the email is registered, already has a password, or anything else --
+    otherwise this endpoint could be used to check which emails have
+    accounts."""
+
+    serializer = RequestPasswordSetupSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    email = serializer.validated_data["email"]
+
+    user = User.objects.filter(email__iexact=email).first()
+    if user and not user.has_usable_password():
+        setup_token = PasswordSetupToken.objects.create(user=user)
+        send_password_setup_email(setup_token)
+
+    return Response({"detail": "If an account exists for that email, a link has been sent."})
 
 
 def _rank_candidates(signups):

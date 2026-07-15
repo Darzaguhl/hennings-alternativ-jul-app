@@ -60,6 +60,9 @@ export default function LoginScreen() {
           <Text style={styles.buttonText}>Logg inn</Text>
         )}
       </TouchableOpacity>
+      <TouchableOpacity onPress={() => router.push("/set-password")} style={styles.setPasswordLink}>
+        <Text style={styles.setPasswordLinkText}>Første gang, eller mangler du passord? Sett det her</Text>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -93,4 +96,6 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   buttonText: { fontFamily: fonts.bodySemiBold, fontSize: 16, color: theme.primaryDark },
+  setPasswordLink: { marginTop: 20, alignItems: "center" },
+  setPasswordLinkText: { fontFamily: fonts.bodyMedium, fontSize: 14, color: theme.primary, textAlign: "center" },
 });

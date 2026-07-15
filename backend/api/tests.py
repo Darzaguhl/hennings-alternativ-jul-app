@@ -940,6 +940,42 @@ class PasswordSetupTests(TestCase):
         self.assertTrue(token.is_usable)
 
 
+class RequestPasswordSetupTests(TestCase):
+    """The in-app 'first time / lost the email' request for a fresh
+    password-setup link -- always responds the same way so it can't be
+    used to check which emails have accounts."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_request_for_passwordless_user_creates_a_new_token(self):
+        user = User.objects.create_user(username="forgetful@example.com", email="forgetful@example.com", password=None)
+        response = self.client.post("/api/password-setup/request/", {"email": "forgetful@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(PasswordSetupToken.objects.filter(user=user).exists())
+
+    def test_request_for_unknown_email_still_returns_200(self):
+        response = self.client.post("/api/password-setup/request/", {"email": "nobody@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(PasswordSetupToken.objects.exists())
+
+    def test_request_for_user_with_a_password_creates_no_token(self):
+        User.objects.create_user(username="haspw@example.com", email="haspw@example.com", password="correct horse battery staple")
+        response = self.client.post("/api/password-setup/request/", {"email": "haspw@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(PasswordSetupToken.objects.exists())
+
+    def test_request_is_case_insensitive_on_email(self):
+        user = User.objects.create_user(username="mixedcase@example.com", email="MixedCase@Example.com", password=None)
+        response = self.client.post("/api/password-setup/request/", {"email": "mixedcase@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(PasswordSetupToken.objects.filter(user=user).exists())
+
+    def test_request_rejects_invalid_email(self):
+        response = self.client.post("/api/password-setup/request/", {"email": "not-an-email"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+
 class MembershipRolesTests(TestCase):
     def setUp(self):
         self.admin = User.objects.create_user(username="super", password="pw")
