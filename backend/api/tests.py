@@ -17,6 +17,7 @@ from .models import (
     PasswordSetupToken,
     QRCode,
     Shift,
+    ShiftConflict,
     ShiftSignup,
     Skill,
 )
@@ -517,11 +518,16 @@ class ShiftSignupEndpointTests(TestCase):
 
 
 class ShiftSignupValidationTests(TestCase):
-    """The three real signup rules from the live site (read during
-    planning): no two vakter with overlapping times, no three
-    numbered-consecutive vakter, and an oppgave's phase must match the
-    vakt's phase. See _overlapping_signup / _would_complete_three_consecutive
-    / _phase_incompatible in views.py."""
+    """The real signup rules from the live site (read during planning):
+    admin-declared vakt conflict pairs, no three numbered-consecutive
+    vakter, and an oppgave's phase must match the vakt's phase. See
+    _conflicting_signup / _would_complete_three_consecutive /
+    _phase_incompatible in views.py.
+
+    _conflicting_signup used to be a computed time-overlap check instead
+    of ShiftConflict -- test_overlapping_but_undeclared_shifts_are_allowed
+    below is the regression test for why that was wrong (see its
+    docstring and _conflicting_signup's)."""
 
     def setUp(self):
         self.organizer = User.objects.create_user(username="validation-organizer", password="pw")
@@ -536,28 +542,57 @@ class ShiftSignupValidationTests(TestCase):
             created_by=self.organizer, **kwargs
         )
 
-    def test_overlapping_shift_is_rejected(self):
+    def test_declared_conflict_is_rejected(self):
         # Mirrors the real vakt 6 (24 Des 22:00 - 25 Des 09:15) / vakt 7
-        # (25 Des 08:30-16:00) pair: a night vakt crossing midnight,
-        # overlapping the next vakt's start by 45 minutes.
+        # (25 Des 08:30-16:00) pair, which the organizers have explicitly
+        # declared can't be combined.
         night = self._shift(datetime.date(2026, 12, 24), datetime.time(22, 0), datetime.time(9, 15))
         morning = self._shift(datetime.date(2026, 12, 25), datetime.time(8, 30), datetime.time(16, 0))
+        ShiftConflict.objects.create(event=self.event, shift_a=night, shift_b=morning)
 
         self.client.post(f"/api/shifts/{night.id}/signup/")
         response = self.client.post(f"/api/shifts/{morning.id}/signup/")
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("overlapper", response.data["detail"])
+        self.assertIn("kan ikke kombineres", response.data["detail"])
         self.assertFalse(ShiftSignup.objects.filter(shift=morning, user=self.volunteer).exists())
 
-    def test_touching_but_not_overlapping_shifts_are_allowed(self):
-        # Vakt 4 ends 13:00, vakt 5 starts 13:00 -- back-to-back, not
-        # overlapping. Must stay legal.
-        first = self._shift(datetime.date(2026, 12, 24), datetime.time(9, 0), datetime.time(13, 0))
-        second = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
+    def test_declared_conflict_is_rejected_in_either_direction(self):
+        # Signing up for shift_a first, then shift_b, must be blocked too
+        # -- ShiftConflict isn't directional.
+        a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+        b = self._shift(datetime.date(2026, 12, 20), datetime.time(15, 0), datetime.time(19, 0))
+        ShiftConflict.objects.create(event=self.event, shift_a=a, shift_b=b)
 
-        self.client.post(f"/api/shifts/{first.id}/signup/")
-        response = self.client.post(f"/api/shifts/{second.id}/signup/")
+        self.client.post(f"/api/shifts/{b.id}/signup/")
+        response = self.client.post(f"/api/shifts/{a.id}/signup/")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_overlapping_but_undeclared_shifts_are_allowed(self):
+        # Real regression: the schedule has vakt 5 (24 Des 13:00-23:00)
+        # genuinely overlapping vakt 6 (24 Des 22:00 - 25 Des 09:15) by an
+        # hour, but the organizers don't forbid that combination -- only
+        # vakt 6+7 and 9+10 are declared conflicts. A prior version of
+        # this check computed time overlap directly and incorrectly
+        # blocked this too.
+        day = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
+        night = self._shift(datetime.date(2026, 12, 24), datetime.time(22, 0), datetime.time(9, 15))
+
+        self.client.post(f"/api/shifts/{day.id}/signup/")
+        response = self.client.post(f"/api/shifts/{night.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_unrelated_pair_with_no_conflict_row_is_unaffected(self):
+        a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+        b = self._shift(datetime.date(2026, 12, 21), datetime.time(10, 0), datetime.time(14, 0))
+        other_a = self._shift(datetime.date(2026, 12, 24), datetime.time(9, 0), datetime.time(13, 0))
+        other_b = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
+        ShiftConflict.objects.create(event=self.event, shift_a=other_a, shift_b=other_b)
+
+        self.client.post(f"/api/shifts/{a.id}/signup/")
+        response = self.client.post(f"/api/shifts/{b.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
 
@@ -627,6 +662,60 @@ class ShiftSignupValidationTests(TestCase):
         response = self.client.post(f"/api/shifts/{uncategorized_shift.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
+
+
+class ShiftConflictAdminTests(TestCase):
+    """Only an event admin/owner can declare or remove a vakt conflict --
+    same gating pattern as Skill's admin-only writes."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="conflict-admin", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.shift_a = Shift.objects.create(
+            event=self.event, title="Vakt 6", date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(22, 0), end_time=datetime.time(9, 15), created_by=self.admin,
+        )
+        self.shift_b = Shift.objects.create(
+            event=self.event, title="Vakt 7", date=datetime.date(2026, 12, 25),
+            start_time=datetime.time(8, 30), end_time=datetime.time(16, 0), created_by=self.admin,
+        )
+        self.client = APIClient()
+
+    def test_admin_can_create_a_conflict(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            "/api/shift-conflicts/",
+            {"event": self.event.id, "shift_a": self.shift_a.id, "shift_b": self.shift_b.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(ShiftConflict.objects.filter(shift_a=self.shift_a, shift_b=self.shift_b).exists())
+
+    def test_admin_can_delete_a_conflict(self):
+        conflict = ShiftConflict.objects.create(event=self.event, shift_a=self.shift_a, shift_b=self.shift_b)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.delete(f"/api/shift-conflicts/{conflict.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(ShiftConflict.objects.filter(pk=conflict.pk).exists())
+
+    def test_plain_volunteer_cannot_create_a_conflict(self):
+        bystander = User.objects.create_user(username="conflict-bystander", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.post(
+            "/api/shift-conflicts/",
+            {"event": self.event.id, "shift_a": self.shift_a.id, "shift_b": self.shift_b.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(ShiftConflict.objects.filter(shift_a=self.shift_a, shift_b=self.shift_b).exists())
+
+    def test_plain_volunteer_cannot_delete_a_conflict(self):
+        conflict = ShiftConflict.objects.create(event=self.event, shift_a=self.shift_a, shift_b=self.shift_b)
+        bystander = User.objects.create_user(username="conflict-bystander-2", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.delete(f"/api/shift-conflicts/{conflict.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(ShiftConflict.objects.filter(pk=conflict.pk).exists())
 
 
 class UserSkillsTests(TestCase):

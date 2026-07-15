@@ -2,12 +2,12 @@ import datetime
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -23,6 +23,7 @@ from .models import (
     PasswordSetupToken,
     QRCode,
     Shift,
+    ShiftConflict,
     ShiftSignup,
     Skill,
 )
@@ -40,6 +41,7 @@ from .serializers import (
     RegisterSerializer,
     RequestPasswordSetupSerializer,
     SetPasswordSerializer,
+    ShiftConflictSerializer,
     ShiftSerializer,
     ShiftSignupSerializer,
     SkillSerializer,
@@ -62,7 +64,7 @@ def public_event(request):
     than opening up EventViewSet/ShiftViewSet -- those embed full volunteer
     profiles (emails) in participants/leaders, which must stay private."""
 
-    event = Event.objects.filter(is_active=True).prefetch_related("shifts").first()
+    event = Event.objects.filter(is_active=True).prefetch_related("shifts", "shift_conflicts").first()
     if not event:
         return Response({"detail": "No event configured yet."}, status=status.HTTP_404_NOT_FOUND)
     return Response(PublicEventSerializer(event, context={"request": request}).data)
@@ -869,32 +871,34 @@ class EventViewSet(viewsets.ModelViewSet):
         )
 
 
-def _shift_datetime_range(shift):
-    """(start, end) as combined date+time, handling vakter that cross
-    midnight (end_time <= start_time means it ends the following day)."""
+def _conflicting_signup(user, shift):
+    """The user's existing ShiftSignup in this event for a vakt that's been
+    declared (by an admin, via ShiftConflict) to conflict with `shift`, if
+    any. Deliberately not a computed time-overlap check -- an earlier
+    version rejected any two vakter whose times overlapped, on the theory
+    that the real site's "can't combine vakt 6+7 or 9+10" rule was just
+    two instances of that. It wasn't: the real schedule also has vakt 5
+    overlapping vakt 6, and vakt 8 overlapping vakt 9, neither of which
+    the real rule forbids, and there's no overlap-duration threshold that
+    separates the forbidden pairs (45 min) from the allowed ones
+    (44-60 min). Which combinations are actually too demanding is a
+    judgment call about workload, not something derivable from start/end
+    times -- see ShiftConflict."""
 
-    start = datetime.datetime.combine(shift.date, shift.start_time)
-    end_date = shift.date if shift.end_time > shift.start_time else shift.date + datetime.timedelta(days=1)
-    end = datetime.datetime.combine(end_date, shift.end_time)
-    return start, end
-
-
-def _overlapping_signup(user, shift):
-    """The user's existing ShiftSignup in this event whose vakt overlaps
-    `shift`'s time range, if any -- a volunteer can't physically work two
-    vakter at once. This is what makes the real site's explicit "can't
-    combine vakt 6+7 or 9+10" rule fall out for free: those are simply the
-    two vakt pairs whose times actually overlap (a night vakt ending 09:15,
-    the next starting 08:30), so checking real overlap generalizes instead
-    of hardcoding that pair list."""
-
-    candidate_start, candidate_end = _shift_datetime_range(shift)
-    existing = ShiftSignup.objects.filter(event=shift.event, user=user).select_related("shift")
-    for signup in existing:
-        other_start, other_end = _shift_datetime_range(signup.shift)
-        if candidate_start < other_end and other_start < candidate_end:
-            return signup.shift
-    return None
+    conflict_shift_ids = set(
+        ShiftConflict.objects.filter(Q(shift_a=shift) | Q(shift_b=shift), event=shift.event).values_list(
+            "shift_a_id", "shift_b_id"
+        )
+    )
+    other_ids = {shift_id for pair in conflict_shift_ids for shift_id in pair if shift_id != shift.id}
+    if not other_ids:
+        return None
+    signup = (
+        ShiftSignup.objects.filter(event=shift.event, user=user, shift_id__in=other_ids)
+        .select_related("shift")
+        .first()
+    )
+    return signup.shift if signup else None
 
 
 def _would_complete_three_consecutive(user, shift):
@@ -989,10 +993,10 @@ class ShiftViewSet(viewsets.ModelViewSet):
         if ShiftSignup.objects.filter(shift=shift, user=user).exists():
             return Response({"detail": "Already signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
 
-        overlapping = _overlapping_signup(user, shift)
-        if overlapping:
+        conflicting = _conflicting_signup(user, shift)
+        if conflicting:
             return Response(
-                {"detail": f"Denne vakten overlapper med «{overlapping.title}», som du allerede er påmeldt til."},
+                {"detail": f"Denne vakten kan ikke kombineres med «{conflicting.title}», som du allerede er påmeldt til."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1058,6 +1062,39 @@ class ShiftViewSet(viewsets.ModelViewSet):
             shift.assignments.select_related("user", "confirmed_by"), many=True, context={"request": request}
         )
         return Response(serializer.data)
+
+
+class ShiftConflictViewSet(viewsets.ModelViewSet):
+    """Admin-curated pairs of vakter that can't both be signed up for --
+    see ShiftConflict for why this is data rather than a computed rule."""
+
+    queryset = ShiftConflict.objects.select_related("shift_a", "shift_b")
+    serializer_class = ShiftConflictSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        event_id = self.request.query_params.get("event")
+        if event_id:
+            queryset = queryset.filter(event_id=event_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        event = serializer.validated_data["event"]
+        if not event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can declare vakt conflicts.")
+        shift_a = serializer.validated_data["shift_a"]
+        shift_b = serializer.validated_data["shift_b"]
+        if shift_a == shift_b:
+            raise ValidationError("A vakt can't conflict with itself.")
+        if shift_a.event_id != event.id or shift_b.event_id != event.id:
+            raise ValidationError("Both vakter must belong to the same event as the conflict.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not instance.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can remove vakt conflicts.")
+        instance.delete()
 
 
 class QRCodeViewSet(viewsets.ModelViewSet):
