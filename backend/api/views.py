@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -44,6 +44,12 @@ from .serializers import (
     UserAdminNoteSerializer,
     UserSerializer,
 )
+from .throttling import (
+    LoginRateThrottle,
+    PasswordSetupConfirmRateThrottle,
+    PasswordSetupRequestRateThrottle,
+    RegisterRateThrottle,
+)
 
 
 @api_view(["GET"])
@@ -75,6 +81,7 @@ def public_skills(request):
 
 class EmailTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailTokenObtainPairSerializer
+    throttle_classes = [LoginRateThrottle]
 
 User = get_user_model()
 
@@ -146,6 +153,7 @@ class RegisterView(generics.CreateAPIView):
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [RegisterRateThrottle]
     queryset = User.objects.all()
 
     def create(self, request, *args, **kwargs):
@@ -189,6 +197,7 @@ def password_setup_preview(request, token):
 
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
+@throttle_classes([PasswordSetupConfirmRateThrottle])
 def set_password(request):
     """Unauthenticated: redeem a PasswordSetupToken and set a password in
     one step. Doesn't log the user in -- the whole point is they'll log in
@@ -211,6 +220,7 @@ def set_password(request):
 
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
+@throttle_classes([PasswordSetupRequestRateThrottle])
 def request_password_setup(request):
     """Unauthenticated: request a fresh password-setup/reset link, entered
     directly in the app (see the mobile app's set-password screen) instead
