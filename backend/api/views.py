@@ -212,22 +212,23 @@ def set_password(request):
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
 def request_password_setup(request):
-    """Unauthenticated: 'first time / lost the email' request for a fresh
-    password-setup link, entered directly in the app (see the mobile app's
-    set-password screen) instead of only ever being sent automatically at
-    registration.
+    """Unauthenticated: request a fresh password-setup/reset link, entered
+    directly in the app (see the mobile app's set-password screen) instead
+    of only ever being sent automatically at registration. Doubles as
+    "forgot password" -- setting one for the first time and replacing one
+    you've forgotten are the same operation here, so this issues a token
+    regardless of whether the account already has a password.
 
     Always responds with the same generic message regardless of whether
-    the email is registered, already has a password, or anything else --
-    otherwise this endpoint could be used to check which emails have
-    accounts."""
+    the email is registered or anything else about it -- otherwise this
+    endpoint could be used to check which emails have accounts."""
 
     serializer = RequestPasswordSetupSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data["email"]
 
     user = User.objects.filter(email__iexact=email).first()
-    if user and not user.has_usable_password():
+    if user:
         setup_token = PasswordSetupToken.objects.create(user=user)
         send_password_setup_email(setup_token)
 

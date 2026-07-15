@@ -226,13 +226,15 @@ def default_password_setup_expiry():
 
 
 class PasswordSetupToken(models.Model):
-    """Lets a volunteer who registered without a password (the normal path
-    -- see RegisterSerializer, the public website deliberately doesn't
-    collect one) set one afterward so they can log in to the mobile app.
-    Created automatically right after a passwordless registration and
-    emailed to them (see email.send_password_setup_email); single-use like
-    Invite, and long-lived since volunteers often sign up months before the
-    event and may not act on the email right away."""
+    """Lets a volunteer set or reset their password by email -- covers both
+    a volunteer who registered without one (the normal path, see
+    RegisterSerializer: the public website deliberately doesn't collect
+    one) and someone who had one and forgot it. Created automatically
+    right after a passwordless registration, and on demand via
+    views.request_password_setup (the app's "first time / forgot
+    password" flow); single-use like Invite, and long-lived since
+    volunteers often sign up months before the event and may not act on
+    the email right away."""
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="password_setup_tokens"

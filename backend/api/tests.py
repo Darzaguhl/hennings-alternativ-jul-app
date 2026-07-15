@@ -959,11 +959,30 @@ class RequestPasswordSetupTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(PasswordSetupToken.objects.exists())
 
-    def test_request_for_user_with_a_password_creates_no_token(self):
-        User.objects.create_user(username="haspw@example.com", email="haspw@example.com", password="correct horse battery staple")
+    def test_request_for_user_with_a_password_also_creates_a_token(self):
+        """This doubles as 'forgot password' -- someone who already has a
+        password can request a fresh link too, since setting one for the
+        first time and replacing a forgotten one are the same operation."""
+
+        user = User.objects.create_user(username="haspw@example.com", email="haspw@example.com", password="correct horse battery staple")
         response = self.client.post("/api/password-setup/request/", {"email": "haspw@example.com"}, format="json")
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(PasswordSetupToken.objects.exists())
+        self.assertTrue(PasswordSetupToken.objects.filter(user=user).exists())
+
+    def test_reset_token_replaces_the_old_password(self):
+        user = User.objects.create_user(username="forgot@example.com", email="forgot@example.com", password="old horse battery staple")
+        token = PasswordSetupToken.objects.create(user=user)
+
+        response = self.client.post(
+            "/api/password-setup/confirm/", {"token": token.token, "password": "new horse battery staple"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+
+        login_old = self.client.post("/api/token/", {"email": "forgot@example.com", "password": "old horse battery staple"}, format="json")
+        self.assertNotEqual(login_old.status_code, 200)
+
+        login_new = self.client.post("/api/token/", {"email": "forgot@example.com", "password": "new horse battery staple"}, format="json")
+        self.assertEqual(login_new.status_code, 200)
 
     def test_request_is_case_insensitive_on_email(self):
         user = User.objects.create_user(username="mixedcase@example.com", email="MixedCase@Example.com", password=None)

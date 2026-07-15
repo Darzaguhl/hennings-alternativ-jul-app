@@ -5,10 +5,12 @@
 //   deep link from the password-setup email, or navigated to from the
 //   website's "Open in app" button): preview the token, then let the
 //   volunteer pick a password right here.
-// - Opened with no token (from the "Første gang? Sett passord" link on the
-//   login screen): let them request a fresh link by email instead. Always
-//   shows the same generic confirmation, matching the backend's
-//   anti-enumeration stance -- see api.request_password_setup.
+// - Opened with no token (from the "Glemt passord, eller ny bruker?" link
+//   on the login screen): let them request a fresh link by email instead
+//   -- covers both a brand new passwordless volunteer and someone who had
+//   a password and forgot it. Always shows the same generic confirmation,
+//   matching the backend's anti-enumeration stance -- see
+//   api.request_password_setup.
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -182,7 +184,8 @@ export default function SetPasswordScreen() {
     body = (
       <>
         <Text style={styles.message}>
-          Skriv inn e-posten du meldte deg på med, så sender vi deg en lenke for å sette et passord.
+          Skriv inn e-posten du meldte deg på med, så sender vi deg en lenke for å sette (eller nullstille) et
+          passord.
         </Text>
         <TextInput
           style={styles.input}

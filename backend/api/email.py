@@ -58,13 +58,16 @@ def send_invite_email(invite) -> bool:
 
 
 def send_password_setup_email(setup_token) -> bool:
-    """Send a volunteer the link to set a password so they can log in to
-    the mobile app, after registering passwordless via the public website.
+    """Send a volunteer the link to set (or reset) their password so they
+    can log in to the mobile app -- sent automatically right after a
+    passwordless registration, and on demand via the app's "first time /
+    forgot password" request flow (see views.request_password_setup), so
+    the wording here deliberately doesn't assume which one this is.
 
     Same fire-and-forget shape as send_invite_email: returns True if sent
     or skipped (no RESEND_API_KEY, e.g. local dev/tests), False on a
-    Resend error. Never raises -- a failed email shouldn't block
-    registration, since the token row is already valid and the link could
+    Resend error. Never raises -- a failed email shouldn't block whatever
+    triggered it, since the token row is already valid and the link could
     be resent or shared manually."""
 
     set_password_url = f"{settings.WEBSITE_URL}/set-password.html?token={setup_token.token}"
@@ -76,12 +79,13 @@ def send_password_setup_email(setup_token) -> bool:
     payload = {
         "from": settings.RESEND_FROM_EMAIL,
         "to": [setup_token.user.email],
-        "subject": "Sett et passord for å bruke appen",
+        "subject": "Sett passord for Hennings Alternativ Jul-appen",
         "html": (
             f"<p>Hei!</p>"
-            f"<p>Takk for at du meldte deg som frivillig på Hennings Alternativ Jul!</p>"
-            f"<p>For å se oppgavene og vaktene dine og sjekke inn via appen, sett et passord her: "
-            f'<a href="{set_password_url}">Sett passord</a></p>'
+            f"<p>Bruk lenken under for å sette et passord for kontoen din på Hennings Alternativ Jul "
+            f"— så kan du logge inn i appen og se oppgavene og vaktene dine.</p>"
+            f'<p><a href="{set_password_url}">Sett passord</a></p>'
+            f"<p>Har du ikke bedt om dette selv, kan du trygt ignorere denne e-posten.</p>"
         ),
     }
     data = json.dumps(payload).encode("utf-8")

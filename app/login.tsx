@@ -61,7 +61,7 @@ export default function LoginScreen() {
         )}
       </TouchableOpacity>
       <TouchableOpacity onPress={() => router.push("/set-password")} style={styles.setPasswordLink}>
-        <Text style={styles.setPasswordLinkText}>Første gang, eller mangler du passord? Sett det her</Text>
+        <Text style={styles.setPasswordLinkText}>Glemt passord, eller ny bruker? Sett det her</Text>
       </TouchableOpacity>
     </View>
   );
