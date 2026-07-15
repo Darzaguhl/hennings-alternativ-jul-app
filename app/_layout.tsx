@@ -29,6 +29,7 @@ export default function RootLayout() {
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="index" /> {/* Splash */}
           <Stack.Screen name="login" /> {/* Login */}
+          <Stack.Screen name="set-password" /> {/* First-time / lost password setup */}
           <Stack.Screen name="(tabs)" /> {/* Main app (events, groups, etc.) */}
         </Stack>
       </AuthProvider>

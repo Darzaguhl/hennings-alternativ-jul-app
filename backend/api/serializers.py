@@ -184,6 +184,16 @@ class SetPasswordSerializer(serializers.Serializer):
         return value
 
 
+class RequestPasswordSetupSerializer(serializers.Serializer):
+    """Public: 'first time / lost the email' request for a fresh
+    password-setup link, entered directly in the app. Deliberately just an
+    email -- the view always responds the same way regardless of whether
+    an account exists, so this can't be used to check which emails are
+    registered."""
+
+    email = serializers.EmailField()
+
+
 class EventSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
     code = serializers.CharField(read_only=True)
