@@ -198,8 +198,14 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Resend (email) -- used for admin/staff invite emails. RESEND_API_KEY unset
 # means invite emails are skipped (logged instead), so local dev/tests don't
 # need a real key. RESEND_FROM_EMAIL must be on a domain verified in Resend.
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Hennings Alternativ Jul <onboarding@resend.dev>")
+#
+# `or` rather than dict.get(key, default): a platform env var that's been
+# added but left blank (present with value "") still satisfies .get()'s
+# "key exists" check, silently overriding the default with "" instead of
+# falling back to it -- which sent mail with an empty From address and no
+# indication why. `or` treats blank the same as unset.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY") or ""
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL") or "Hennings Alternativ Jul <onboarding@resend.dev>"
 
 # Base URL of the admin dashboard for this environment, used to build the
 # link in invite emails. Differs between preprod/prod, so it's env-driven
