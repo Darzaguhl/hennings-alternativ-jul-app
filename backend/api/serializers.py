@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password as validate_password_strength
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
@@ -28,9 +29,26 @@ class SkillSerializer(serializers.ModelSerializer):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    """The shared, minimal profile shape embedded all over the API --
+    shift participants, leaders, pool entries, assignments -- so every
+    volunteer on a shift can already see this much about every other
+    volunteer on it. Contact details (phone/address/birthdate) must never
+    be added here; see MeSerializer for where those belong."""
+
     class Meta:
         model = User
         fields = ["id", "username", "email", "first_name", "last_name", "experience_notes"]
+
+
+class MeSerializer(UserSerializer):
+    """UserSerializer plus contact details a volunteer submitted at signup
+    -- fine for them to see about themselves, and for an admin/staff/leader
+    to see on the roster (UserViewSet.list/retrieve is already gated to
+    self-or-roster-viewer, see _can_view_roster), but never appropriate in
+    the broadly-shared contexts plain UserSerializer is embedded in."""
+
+    class Meta(UserSerializer.Meta):
+        fields = UserSerializer.Meta.fields + ["phone", "address", "birthdate"]
 
 
 class UserAdminNoteSerializer(serializers.ModelSerializer):
@@ -47,10 +65,12 @@ class UserAdminNoteSerializer(serializers.ModelSerializer):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    """Public self-registration: email, optionally a password. `username` is
-    set equal to the email internally so the rest of the codebase (which
-    still refers to User.username in places) keeps working without change;
-    login itself goes through EmailBackend, not username.
+    """Public self-registration: email plus the contact details the org
+    needs on file for a volunteer (name, phone, address, birthdate),
+    optionally a password. `username` is set equal to the email internally
+    so the rest of the codebase (which still refers to User.username in
+    places) keeps working without change; login itself goes through
+    EmailBackend, not username.
 
     Volunteers don't need a password -- they get a JWT session immediately
     on registration and that's enough to use the app/site they signed up
@@ -64,10 +84,19 @@ class RegisterSerializer(serializers.ModelSerializer):
     once the account exists, see PublicEventSerializer."""
 
     password = serializers.CharField(write_only=True, required=False, allow_blank=True, default="")
+    # first_name/last_name/phone/address are blank=True on the model (an
+    # invited admin/staff account has no need for them), so the model
+    # field alone wouldn't require them here -- explicit required=True
+    # enforces it specifically for public self-registration.
+    first_name = serializers.CharField(required=True)
+    last_name = serializers.CharField(required=True)
+    phone = serializers.CharField(required=True)
+    address = serializers.CharField(required=True)
+    birthdate = serializers.DateField(required=True)
 
     class Meta:
         model = User
-        fields = ["id", "email", "password"]
+        fields = ["id", "email", "password", "first_name", "last_name", "phone", "address", "birthdate"]
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
@@ -82,12 +111,22 @@ class RegisterSerializer(serializers.ModelSerializer):
         validate_password_strength(value)
         return value
 
+    def validate_birthdate(self, value):
+        if value > timezone.localdate():
+            raise serializers.ValidationError("Birthdate can't be in the future.")
+        return value
+
     def create(self, validated_data):
         password = validated_data.get("password") or None
         user = User.objects.create_user(
             username=validated_data["email"],
             email=validated_data["email"],
             password=password,
+            first_name=validated_data["first_name"],
+            last_name=validated_data["last_name"],
+            phone=validated_data["phone"],
+            address=validated_data["address"],
+            birthdate=validated_data["birthdate"],
         )
         return user
 

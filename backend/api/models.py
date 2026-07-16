@@ -24,6 +24,8 @@ class Skill(models.Model):
 
 class User(AbstractUser):
     phone = models.CharField(max_length=20, blank=True, null=True)
+    address = models.CharField(max_length=255, blank=True)
+    birthdate = models.DateField(null=True, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True, null=True)
     skills = models.ManyToManyField(Skill, blank=True, related_name="users")
     experience_notes = models.TextField(
