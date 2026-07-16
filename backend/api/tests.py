@@ -26,6 +26,25 @@ from .models import (
 User = get_user_model()
 
 
+def valid_registration_payload(**overrides):
+    """A complete, valid /api/register/ body -- the contact fields
+    (name/phone/address/birthdate) are required by RegisterSerializer, so
+    any test exercising a successful registration needs all of them
+    present, not just email/password."""
+
+    payload = {
+        "email": "new.volunteer@example.com",
+        "password": "correct horse battery staple",
+        "first_name": "Kari",
+        "last_name": "Nordmann",
+        "phone": "12345678",
+        "address": "Testveien 1, 0123 Oslo",
+        "birthdate": "1990-05-15",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def make_slot(shift, skill_name="Oppgave", **kwargs):
     """Create (or reuse) an OppgaveSlot for a shift -- the unit a
     volunteer signs up for/gets assigned to, mirroring how make_event
@@ -1134,17 +1153,46 @@ class RegistrationAndEmailLoginTests(TestCase):
         self.client = APIClient()
         make_event(title="Hennings Alternativ Jul")
 
+    def _valid_payload(self, **overrides):
+        return valid_registration_payload(**overrides)
+
     def test_register_creates_user_and_returns_tokens(self):
-        response = self.client.post(
-            "/api/register/",
-            {"email": "new.volunteer@example.com", "password": "correct horse battery staple"},
-            format="json",
-        )
+        response = self.client.post("/api/register/", self._valid_payload(), format="json")
         self.assertEqual(response.status_code, 201)
         self.assertIn("access", response.data)
         self.assertIn("refresh", response.data)
         self.assertEqual(response.data["user"]["email"], "new.volunteer@example.com")
         self.assertTrue(User.objects.filter(email="new.volunteer@example.com").exists())
+
+    def test_register_stores_and_returns_contact_details(self):
+        response = self.client.post("/api/register/", self._valid_payload(), format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["user"]["first_name"], "Kari")
+        self.assertEqual(response.data["user"]["last_name"], "Nordmann")
+        self.assertEqual(response.data["user"]["phone"], "12345678")
+        self.assertEqual(response.data["user"]["address"], "Testveien 1, 0123 Oslo")
+        self.assertEqual(response.data["user"]["birthdate"], "1990-05-15")
+
+        user = User.objects.get(email="new.volunteer@example.com")
+        self.assertEqual(user.first_name, "Kari")
+        self.assertEqual(user.phone, "12345678")
+        self.assertEqual(user.address, "Testveien 1, 0123 Oslo")
+        self.assertEqual(str(user.birthdate), "1990-05-15")
+
+    def test_register_rejects_missing_contact_fields(self):
+        for field in ["first_name", "last_name", "phone", "address", "birthdate"]:
+            payload = self._valid_payload(email=f"missing-{field}@example.com")
+            del payload[field]
+            response = self.client.post("/api/register/", payload, format="json")
+            self.assertEqual(response.status_code, 400, f"expected {field} to be required")
+            self.assertFalse(User.objects.filter(email=f"missing-{field}@example.com").exists())
+
+    def test_register_rejects_future_birthdate(self):
+        response = self.client.post(
+            "/api/register/", self._valid_payload(birthdate="2099-01-01"), format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(User.objects.filter(email="new.volunteer@example.com").exists())
 
     def test_register_without_password_still_works_and_returns_tokens(self):
         """Volunteers don't need a password -- they get a usable JWT session
@@ -1152,7 +1200,7 @@ class RegistrationAndEmailLoginTests(TestCase):
 
         response = self.client.post(
             "/api/register/",
-            {"email": "passwordless.volunteer@example.com"},
+            self._valid_payload(email="passwordless.volunteer@example.com", password=""),
             format="json",
         )
         self.assertEqual(response.status_code, 201)
@@ -1164,7 +1212,11 @@ class RegistrationAndEmailLoginTests(TestCase):
         """An unusable password means nobody -- including an attacker
         guessing a password -- can log in via /api/token/."""
 
-        self.client.post("/api/register/", {"email": "passwordless2@example.com"}, format="json")
+        self.client.post(
+            "/api/register/",
+            self._valid_payload(email="passwordless2@example.com", password=""),
+            format="json",
+        )
         response = self.client.post(
             "/api/token/", {"email": "passwordless2@example.com", "password": "some guessed password"}, format="json"
         )
@@ -1175,9 +1227,7 @@ class RegistrationAndEmailLoginTests(TestCase):
         # Oppgave interest is no longer collected at registration -- see
         # UserSkillsTests for why skills is no longer on the serializer.
         response = self.client.post(
-            "/api/register/",
-            {"email": "chef.volunteer@example.com", "password": "correct horse battery staple"},
-            format="json",
+            "/api/register/", self._valid_payload(email="chef.volunteer@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 201)
         self.assertNotIn("skills", response.data["user"])
@@ -1185,9 +1235,7 @@ class RegistrationAndEmailLoginTests(TestCase):
     def test_register_rejects_duplicate_email(self):
         User.objects.create_user(username="existing", email="taken@example.com", password="pw12345678")
         response = self.client.post(
-            "/api/register/",
-            {"email": "taken@example.com", "password": "correct horse battery staple"},
-            format="json",
+            "/api/register/", self._valid_payload(email="taken@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(User.objects.filter(email="taken@example.com").count(), 1)
@@ -1195,7 +1243,7 @@ class RegistrationAndEmailLoginTests(TestCase):
     def test_register_rejects_weak_password(self):
         response = self.client.post(
             "/api/register/",
-            {"email": "weak@example.com", "password": "1234"},
+            self._valid_payload(email="weak@example.com", password="1234"),
             format="json",
         )
         self.assertEqual(response.status_code, 400)
@@ -1237,7 +1285,7 @@ class SignupWindowTests(TestCase):
     def test_registration_succeeds_when_no_window_is_set(self):
         make_event(title="Hennings Alternativ Jul")
         response = self.client.post(
-            "/api/register/", {"email": "open.window@example.com", "password": "correct horse battery staple"}, format="json"
+            "/api/register/", valid_registration_payload(email="open.window@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 201)
 
@@ -1264,7 +1312,7 @@ class SignupWindowTests(TestCase):
             signup_closes_at=timezone.now() + datetime.timedelta(days=1),
         )
         response = self.client.post(
-            "/api/register/", {"email": "inside.window@example.com", "password": "correct horse battery staple"}, format="json"
+            "/api/register/", valid_registration_payload(email="inside.window@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 201)
 
@@ -1298,14 +1346,16 @@ class PasswordSetupTests(TestCase):
         make_event(title="Hennings Alternativ Jul")
 
     def test_passwordless_registration_creates_a_setup_token(self):
-        response = self.client.post("/api/register/", {"email": "passwordless@example.com"}, format="json")
+        response = self.client.post(
+            "/api/register/", valid_registration_payload(email="passwordless@example.com", password=""), format="json"
+        )
         self.assertEqual(response.status_code, 201)
         user = User.objects.get(email="passwordless@example.com")
         self.assertTrue(PasswordSetupToken.objects.filter(user=user).exists())
 
     def test_registration_with_a_password_does_not_create_a_setup_token(self):
         response = self.client.post(
-            "/api/register/", {"email": "haspassword@example.com", "password": "correct horse battery staple"}, format="json"
+            "/api/register/", valid_registration_payload(email="haspassword@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 201)
         user = User.objects.get(email="haspassword@example.com")
@@ -1456,14 +1506,12 @@ class ThrottlingTests(TestCase):
     def test_register_endpoint_is_throttled(self):
         for i in range(10):
             response = self.client.post(
-                "/api/register/",
-                {"email": f"throttle{i}@example.com", "password": "correct horse battery staple"},
-                format="json",
+                "/api/register/", valid_registration_payload(email=f"throttle{i}@example.com"), format="json"
             )
             self.assertEqual(response.status_code, 201)
 
         response = self.client.post(
-            "/api/register/", {"email": "one.too.many@example.com", "password": "correct horse battery staple"}, format="json"
+            "/api/register/", valid_registration_payload(email="one.too.many@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 429)
 
@@ -1503,7 +1551,7 @@ class ThrottlingTests(TestCase):
         # password_setup_request's quota is now exhausted, but register --
         # a different scope -- should be completely unaffected.
         response = self.client.post(
-            "/api/register/", {"email": "still.works@example.com", "password": "correct horse battery staple"}, format="json"
+            "/api/register/", valid_registration_payload(email="still.works@example.com"), format="json"
         )
         self.assertEqual(response.status_code, 201)
 

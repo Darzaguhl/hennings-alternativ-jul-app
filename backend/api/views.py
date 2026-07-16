@@ -35,6 +35,7 @@ from .serializers import (
     EventSerializer,
     InvitePreviewSerializer,
     InviteSerializer,
+    MeSerializer,
     MembershipSerializer,
     OppgaveSlotSerializer,
     PasswordSetupPreviewSerializer,
@@ -184,7 +185,7 @@ class RegisterView(generics.CreateAPIView):
         refresh = RefreshToken.for_user(user)
         return Response(
             {
-                "user": UserSerializer(user, context={"request": request}).data,
+                "user": MeSerializer(user, context={"request": request}).data,
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
             },
@@ -481,6 +482,16 @@ class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        # list/retrieve is already restricted (see get_queryset) to either
+        # your own record or a roster-viewing admin/staff/leader -- either
+        # way, contact details are appropriate here. Other actions (update,
+        # nested UserSerializer usages elsewhere for shift participants/
+        # pool/assignments) stay on the plain minimal serializer.
+        if self.action in ("list", "retrieve", "me"):
+            return MeSerializer
+        return UserSerializer
 
     def get_queryset(self):
         # list/retrieve used to be readable by anyone authenticated --
