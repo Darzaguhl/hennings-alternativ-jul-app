@@ -12,6 +12,7 @@ from .models import (
     PasswordSetupToken,
     QRCode,
     Shift,
+    ShiftConflict,
     ShiftSignup,
     Skill,
 )
@@ -264,6 +265,17 @@ class PublicShiftSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class PublicShiftConflictSerializer(serializers.ModelSerializer):
+    """Just the shift ids -- the website already has the full shift objects
+    from PublicShiftSerializer, it only needs to know which pairs it can't
+    let a visitor combine. See ShiftConflict."""
+
+    class Meta:
+        model = ShiftConflict
+        fields = ["shift_a", "shift_b"]
+        read_only_fields = fields
+
+
 class PublicEventSerializer(serializers.ModelSerializer):
     """Safe subset for the public website signup page -- no created_by
     (would embed the admin's email/profile), just enough to render a
@@ -272,11 +284,22 @@ class PublicEventSerializer(serializers.ModelSerializer):
     closed/not-yet-open message."""
 
     shifts = PublicShiftSerializer(many=True, read_only=True)
+    conflicts = PublicShiftConflictSerializer(many=True, read_only=True, source="shift_conflicts")
     signups_open = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Event
-        fields = ["id", "title", "description", "date", "shifts", "signup_opens_at", "signup_closes_at", "signups_open"]
+        fields = [
+            "id",
+            "title",
+            "description",
+            "date",
+            "shifts",
+            "conflicts",
+            "signup_opens_at",
+            "signup_closes_at",
+            "signups_open",
+        ]
         read_only_fields = fields
 
 
@@ -339,6 +362,17 @@ class ShiftSerializer(serializers.ModelSerializer):
         if not user or not user.is_authenticated:
             return False
         return obj.is_led_by(user)
+
+
+class ShiftConflictSerializer(serializers.ModelSerializer):
+    # Titles alongside the ids so the admin dashboard can render "«Vakt 6» ↔
+    # «Vakt 7»" without a second lookup against the shift list it already has.
+    shift_a_title = serializers.CharField(source="shift_a.title", read_only=True)
+    shift_b_title = serializers.CharField(source="shift_b.title", read_only=True)
+
+    class Meta:
+        model = ShiftConflict
+        fields = ["id", "event", "shift_a", "shift_b", "shift_a_title", "shift_b_title"]
 
 
 class ShiftSignupSerializer(serializers.ModelSerializer):

@@ -3,7 +3,8 @@ from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (EmailTokenObtainPairView, EventViewSet, QRCodeViewSet,
-                    RegisterView, ShiftViewSet, SkillViewSet, UserViewSet,
+                    RegisterView, ShiftConflictViewSet, ShiftViewSet,
+                    SkillViewSet, UserViewSet,
                     accept_invite, invite_preview, oppgave_history,
                     password_setup_preview, public_event, public_skills,
                     request_password_setup, set_password)
@@ -12,6 +13,7 @@ router = routers.DefaultRouter()
 router.register(r'users', UserViewSet)
 router.register(r'events', EventViewSet)
 router.register(r'shifts', ShiftViewSet)
+router.register(r'shift-conflicts', ShiftConflictViewSet)
 router.register(r'skills', SkillViewSet)
 router.register(r'qrcodes', QRCodeViewSet)
 

@@ -434,6 +434,31 @@ class ShiftSignup(models.Model):
         return f"{self.user} → {self.shift}"
 
 
+class ShiftConflict(models.Model):
+    """An admin-declared pair of vakter that can't both be signed up for.
+
+    Not a computable rule -- an earlier version of this validation
+    rejected any two vakter whose times overlapped, which turned out
+    wrong: the real event schedule has several overlapping pairs (e.g.
+    a day vakt ending as the night vakt starts) that are fine to combine,
+    and no overlap-duration threshold separates those from the pairs
+    that genuinely aren't fine (e.g. an all-night vakt immediately
+    followed by a full day vakt, with zero rest between). That's a
+    judgment call about workload, not geometry, so it's data the
+    organizers curate per event rather than logic computed from
+    start/end times -- see ShiftViewSet.signup."""
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="shift_conflicts")
+    shift_a = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="conflicts_as_a")
+    shift_b = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="conflicts_as_b")
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return f"{self.shift_a} ↔ {self.shift_b}"
+
+
 class EventCheckIn(models.Model):
     """Marks that a user has physically arrived at the event today.
 
