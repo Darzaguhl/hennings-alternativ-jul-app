@@ -21,6 +21,7 @@ from .models import (
     ShiftConflict,
     ShiftSignup,
     Skill,
+    X1Signup,
 )
 
 User = get_user_model()
@@ -801,6 +802,124 @@ class OppgaveSlotAdminTests(TestCase):
         self.assertFalse(slot.is_full)
 
 
+class X1SignupTests(TestCase):
+    """Vaktleder (X1) opt-in: 'Kombinasjon med påmelding på minst tre
+    andre vakter, og derav minst to av vaktene fra 5-10.' Not a real
+    time-bound vakt -- see X1Signup's docstring."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="x1-admin", password="pw")
+        self.volunteer = User.objects.create_user(username="x1-volunteer", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.volunteer)
+
+    def _shift(self, title, vakt_number=None):
+        return Shift.objects.create(
+            event=self.event, title=title, date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(10, 0), end_time=datetime.time(14, 0),
+            created_by=self.admin, vakt_number=vakt_number,
+        )
+
+    def _sign_up_for(self, shift):
+        slot = make_slot(shift)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.volunteer)
+
+    def test_rejected_with_fewer_than_three_vakt_signups(self):
+        self._sign_up_for(self._shift("Vakt 5", vakt_number=5))
+        self._sign_up_for(self._shift("Vakt 6", vakt_number=6))
+
+        response = self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(X1Signup.objects.filter(event=self.event, user=self.volunteer).exists())
+
+    def test_rejected_with_three_vakter_but_only_one_from_5_to_10(self):
+        self._sign_up_for(self._shift("Vakt 5", vakt_number=5))
+        self._sign_up_for(self._shift("Vakt 1.A", vakt_number=None))
+        self._sign_up_for(self._shift("Vakt 12", vakt_number=12))
+
+        response = self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(X1Signup.objects.filter(event=self.event, user=self.volunteer).exists())
+
+    def test_accepted_with_three_vakter_and_two_from_5_to_10(self):
+        self._sign_up_for(self._shift("Vakt 5", vakt_number=5))
+        self._sign_up_for(self._shift("Vakt 6", vakt_number=6))
+        self._sign_up_for(self._shift("Vakt 1.A", vakt_number=None))
+
+        response = self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(X1Signup.objects.filter(event=self.event, user=self.volunteer).exists())
+
+    def test_rejected_when_already_signed_up(self):
+        self._sign_up_for(self._shift("Vakt 5", vakt_number=5))
+        self._sign_up_for(self._shift("Vakt 6", vakt_number=6))
+        self._sign_up_for(self._shift("Vakt 7", vakt_number=7))
+        X1Signup.objects.create(event=self.event, user=self.volunteer)
+
+        response = self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(X1Signup.objects.filter(event=self.event, user=self.volunteer).count(), 1)
+
+    def test_only_counts_the_requesting_users_own_signups(self):
+        other = User.objects.create_user(username="x1-other", password="pw")
+        shift_a, shift_b, shift_c = self._shift("Vakt 5", 5), self._shift("Vakt 6", 6), self._shift("Vakt 7", 7)
+        for shift in (shift_a, shift_b, shift_c):
+            slot = make_slot(shift)
+            ShiftSignup.objects.create(oppgave_slot=slot, user=other)
+        # self.volunteer (the requester) has none of these -- other's
+        # signups must not count toward the requester's own eligibility.
+
+        response = self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_plain_volunteer_only_sees_their_own_x1_signups(self):
+        other = User.objects.create_user(username="x1-other-2", password="pw")
+        X1Signup.objects.create(event=self.event, user=other)
+        X1Signup.objects.create(event=self.event, user=self.volunteer)
+
+        response = self.client.get("/api/x1-signups/", {"event": self.event.id})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["user"], self.volunteer.id)
+
+    def test_admin_sees_everyones_x1_signups(self):
+        other = User.objects.create_user(username="x1-other-3", password="pw")
+        X1Signup.objects.create(event=self.event, user=other)
+        X1Signup.objects.create(event=self.event, user=self.volunteer)
+
+        admin_client = APIClient()
+        admin_client.force_authenticate(user=self.admin)
+        response = admin_client.get("/api/x1-signups/", {"event": self.event.id})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+
+    def test_can_withdraw_own_x1_signup(self):
+        signup = X1Signup.objects.create(event=self.event, user=self.volunteer)
+        response = self.client.delete(f"/api/x1-signups/{signup.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(X1Signup.objects.filter(pk=signup.pk).exists())
+
+    def test_cannot_withdraw_someone_elses_x1_signup(self):
+        # get_queryset already scopes a non-admin to their own X1Signups
+        # (same as test_plain_volunteer_only_sees_their_own_x1_signups), so
+        # someone else's row 404s rather than reaching perform_destroy's
+        # ownership check -- also means it never leaks whether the row
+        # exists.
+        other = User.objects.create_user(username="x1-other-4", password="pw")
+        signup = X1Signup.objects.create(event=self.event, user=other)
+        response = self.client.delete(f"/api/x1-signups/{signup.id}/")
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(X1Signup.objects.filter(pk=signup.pk).exists())
+
+
 class ShiftConflictAdminTests(TestCase):
     """Only an event admin/owner can declare or remove a vakt conflict --
     same gating pattern as Skill's admin-only writes."""
@@ -884,6 +1003,73 @@ class UserSkillsTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["experience_notes"], "Security guard for 3 years")
         self.assertNotIn("skills", response.data)
+
+
+class MeParticipationYearsTests(TestCase):
+    """MeSerializer.participation_years is derived from real Assignment
+    history (checked in AND placed in an oppgave -- see _resolve_checkin),
+    not self-reported -- this is what lets the signup page's
+    returning-volunteer login show real prior-year participation."""
+
+    def test_participation_years_derived_from_assignment_history(self):
+        organizer = User.objects.create_user(username="organizer", password="pw")
+        volunteer = User.objects.create_user(username="volunteer", password="pw")
+
+        event_2024 = make_event(
+            title="Alternativ Jul 2024", created_by=organizer,
+            date=datetime.datetime(2024, 12, 20, tzinfo=datetime.timezone.utc),
+        )
+        event_2025 = make_event(
+            title="Alternativ Jul 2025", created_by=organizer, is_active=False,
+            date=datetime.datetime(2025, 12, 20, tzinfo=datetime.timezone.utc),
+        )
+        shift_2024 = Shift.objects.create(
+            event=event_2024, title="Vakt 5", date=datetime.date(2024, 12, 24),
+            start_time=datetime.time(13, 0), end_time=datetime.time(23, 0), created_by=organizer,
+        )
+        shift_2025 = Shift.objects.create(
+            event=event_2025, title="Vakt 5", date=datetime.date(2025, 12, 24),
+            start_time=datetime.time(13, 0), end_time=datetime.time(23, 0), created_by=organizer,
+        )
+        Assignment.objects.create(oppgave_slot=make_slot(shift_2024), user=volunteer, confirmed_by=organizer)
+        Assignment.objects.create(oppgave_slot=make_slot(shift_2025), user=volunteer, confirmed_by=organizer)
+
+        client = APIClient()
+        client.force_authenticate(user=volunteer)
+        response = client.get("/api/users/me/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["participation_years"], ["2024", "2025"])
+
+    def test_participation_years_empty_with_no_assignment_history(self):
+        volunteer = User.objects.create_user(username="no-history", password="pw")
+        client = APIClient()
+        client.force_authenticate(user=volunteer)
+        response = client.get("/api/users/me/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["participation_years"], [])
+
+    def test_signup_alone_does_not_count_as_participation(self):
+        # A no-show (signed up, never checked in/assigned) must not show
+        # up as "you were here" -- only a real Assignment counts.
+        organizer = User.objects.create_user(username="organizer2", password="pw")
+        volunteer = User.objects.create_user(username="no-show", password="pw")
+        event = make_event(
+            title="Alternativ Jul 2026", created_by=organizer,
+            date=datetime.datetime(2026, 12, 20, tzinfo=datetime.timezone.utc),
+        )
+        shift = Shift.objects.create(
+            event=event, title="Vakt 5", date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(13, 0), end_time=datetime.time(23, 0), created_by=organizer,
+        )
+        ShiftSignup.objects.create(oppgave_slot=make_slot(shift), user=volunteer)
+
+        client = APIClient()
+        client.force_authenticate(user=volunteer)
+        response = client.get("/api/users/me/")
+
+        self.assertEqual(response.data["participation_years"], [])
 
 
 class AdminNoteTests(TestCase):
@@ -1001,6 +1187,40 @@ class UserOwnershipTests(TestCase):
         self.alice.refresh_from_db()
         self.assertEqual(self.alice.first_name, "Alice")
         self.assertEqual(self.alice.last_name, "Nordmann")
+
+    def test_can_update_own_contact_and_bio_fields(self):
+        # MeSerializer (phone/address/birthdate/about) is now used for
+        # update/partial_update too, not just list/retrieve/me -- this is
+        # what lets the signup page's returning-volunteer login PATCH
+        # these fields after prefilling.
+        response = self.client.patch(
+            f"/api/users/{self.alice.id}/",
+            {
+                "phone": "99999999",
+                "address": "Nyveien 2, 0200 Oslo",
+                "birthdate": "1992-03-04",
+                "about": "Glad i julestemning.",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["phone"], "99999999")
+        self.assertEqual(response.data["about"], "Glad i julestemning.")
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.phone, "99999999")
+        self.assertEqual(self.alice.address, "Nyveien 2, 0200 Oslo")
+        self.assertEqual(str(self.alice.birthdate), "1992-03-04")
+        self.assertEqual(self.alice.about, "Glad i julestemning.")
+
+    def test_cannot_update_another_users_contact_fields(self):
+        response = self.client.patch(
+            f"/api/users/{self.bob.id}/",
+            {"phone": "00000000"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.bob.refresh_from_db()
+        self.assertNotEqual(self.bob.phone, "00000000")
 
 
 class UserDeletionByAdminTests(TestCase):
@@ -1178,6 +1398,33 @@ class RegistrationAndEmailLoginTests(TestCase):
         self.assertEqual(user.phone, "12345678")
         self.assertEqual(user.address, "Testveien 1, 0123 Oslo")
         self.assertEqual(str(user.birthdate), "1990-05-15")
+
+    def test_register_accepts_optional_qualifications_and_about(self):
+        response = self.client.post(
+            "/api/register/",
+            self._valid_payload(
+                experience_notes="Førstehjelpskurs 2023",
+                about="Glad i å lage mat til mange.",
+            ),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["user"]["experience_notes"], "Førstehjelpskurs 2023")
+        self.assertEqual(response.data["user"]["about"], "Glad i å lage mat til mange.")
+
+        user = User.objects.get(email="new.volunteer@example.com")
+        self.assertEqual(user.experience_notes, "Førstehjelpskurs 2023")
+        self.assertEqual(user.about, "Glad i å lage mat til mange.")
+
+    def test_register_succeeds_without_qualifications_or_about(self):
+        # Unlike the contact fields, these are optional -- omitting them
+        # entirely must not block registration.
+        payload = self._valid_payload()
+        response = self.client.post("/api/register/", payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="new.volunteer@example.com")
+        self.assertEqual(user.experience_notes, "")
+        self.assertEqual(user.about, "")
 
     def test_register_rejects_missing_contact_fields(self):
         for field in ["first_name", "last_name", "phone", "address", "birthdate"]:
