@@ -6,6 +6,7 @@ from .models import (
     EventCheckIn,
     Invite,
     Membership,
+    OppgaveSlot,
     PasswordSetupToken,
     Shift,
     ShiftSignup,
@@ -15,6 +16,7 @@ from .models import (
 admin.site.register(Event)
 admin.site.register(Membership)
 admin.site.register(Shift)
+admin.site.register(OppgaveSlot)
 admin.site.register(ShiftSignup)
 admin.site.register(EventCheckIn)
 admin.site.register(Assignment)

@@ -14,6 +14,7 @@ from .models import (
     EventCheckIn,
     Invite,
     Membership,
+    OppgaveSlot,
     PasswordSetupToken,
     QRCode,
     Shift,
@@ -23,6 +24,16 @@ from .models import (
 )
 
 User = get_user_model()
+
+
+def make_slot(shift, skill_name="Oppgave", **kwargs):
+    """Create (or reuse) an OppgaveSlot for a shift -- the unit a
+    volunteer signs up for/gets assigned to, mirroring how make_event
+    mirrors real event creation. Distinct shifts can share the same skill
+    name freely -- uniqueness is per (shift, skill), not global."""
+
+    skill, _ = Skill.objects.get_or_create(name=skill_name)
+    return OppgaveSlot.objects.create(shift=shift, skill=skill, **kwargs)
 
 
 def make_event(**kwargs):
@@ -71,29 +82,38 @@ class ShiftSignupTests(TestCase):
             end_time=datetime.time(23, 0),
             created_by=self.organizer,
         )
+        self.kitchen_slot = make_slot(self.kitchen)
+        self.hosting_slot = make_slot(self.hosting)
 
     def test_signup_for_one_shift_succeeds(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
         self.assertEqual(self.kitchen.signup_count, 1)
 
     def test_can_shortlist_multiple_shifts_same_day(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
         self.assertEqual(ShiftSignup.objects.filter(user=self.volunteer).count(), 2)
 
-    def test_cannot_signup_twice_for_same_shift(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+    def test_cannot_signup_twice_for_same_oppgave_slot(self):
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
-                ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+                ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
 
-    def test_signup_denormalizes_event_and_date_from_shift(self):
-        signup = ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+    def test_can_shortlist_multiple_oppgaver_on_the_same_shift(self):
+        other_slot_same_shift = make_slot(self.kitchen, skill_name="Kaldkjøkken")
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=other_slot_same_shift, user=self.volunteer)
+        self.assertEqual(ShiftSignup.objects.filter(user=self.volunteer).count(), 2)
+
+    def test_signup_denormalizes_shift_event_and_date_from_oppgave_slot(self):
+        signup = ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
+        self.assertEqual(signup.shift_id, self.kitchen.id)
         self.assertEqual(signup.event_id, self.event.id)
         self.assertEqual(signup.date, self.kitchen.date)
 
     def test_experience_fields_default_to_unset(self):
-        signup = ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        signup = ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
         self.assertIsNone(signup.has_relevant_experience)
         self.assertEqual(signup.experience_notes, "")
 
@@ -129,20 +149,24 @@ class AssignmentConstraintTests(TestCase):
             end_time=datetime.time(6, 0),
             created_by=self.organizer,
         )
+        self.kitchen_slot = make_slot(self.kitchen)
+        self.hosting_slot = make_slot(self.hosting)
+        self.next_day_slot = make_slot(self.next_day)
 
     def test_second_assignment_same_day_is_rejected_at_db_level(self):
-        Assignment.objects.create(shift=self.kitchen, user=self.volunteer, confirmed_by=self.organizer)
+        Assignment.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer, confirmed_by=self.organizer)
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
-                Assignment.objects.create(shift=self.hosting, user=self.volunteer, confirmed_by=self.organizer)
+                Assignment.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer, confirmed_by=self.organizer)
 
     def test_assignments_on_different_days_both_succeed(self):
-        Assignment.objects.create(shift=self.kitchen, user=self.volunteer, confirmed_by=self.organizer)
-        Assignment.objects.create(shift=self.next_day, user=self.volunteer, confirmed_by=self.organizer)
+        Assignment.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer, confirmed_by=self.organizer)
+        Assignment.objects.create(oppgave_slot=self.next_day_slot, user=self.volunteer, confirmed_by=self.organizer)
         self.assertEqual(Assignment.objects.filter(user=self.volunteer).count(), 2)
 
-    def test_assignment_denormalizes_event_and_date_from_shift(self):
-        assignment = Assignment.objects.create(shift=self.kitchen, user=self.volunteer, confirmed_by=self.organizer)
+    def test_assignment_denormalizes_shift_event_and_date_from_oppgave_slot(self):
+        assignment = Assignment.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer, confirmed_by=self.organizer)
+        self.assertEqual(assignment.shift_id, self.kitchen.id)
         self.assertEqual(assignment.event_id, self.event.id)
         self.assertEqual(assignment.date, self.kitchen.date)
 
@@ -180,6 +204,8 @@ class EventCheckinResolutionTests(TestCase):
             end_time=datetime.time(23, 0),
             created_by=self.organizer,
         )
+        self.kitchen_slot = make_slot(self.kitchen)
+        self.hosting_slot = make_slot(self.hosting)
         self.client = APIClient()
         self.client.force_authenticate(user=self.organizer)
 
@@ -198,7 +224,7 @@ class EventCheckinResolutionTests(TestCase):
         self.assertFalse(Assignment.objects.filter(user=self.volunteer).exists())
 
     def test_single_noncritical_candidate_auto_assigns(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
 
         response = self._checkin()
 
@@ -208,7 +234,7 @@ class EventCheckinResolutionTests(TestCase):
         self.assertTrue(Assignment.objects.filter(shift=self.hosting, user=self.volunteer).exists())
 
     def test_single_critical_candidate_goes_to_pool_not_auto_assigned(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer, has_relevant_experience=True)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer, has_relevant_experience=True)
 
         response = self._checkin()
 
@@ -217,8 +243,8 @@ class EventCheckinResolutionTests(TestCase):
         self.assertFalse(Assignment.objects.exists())
 
     def test_multiple_candidates_goes_to_pool(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
 
         response = self._checkin()
 
@@ -227,7 +253,7 @@ class EventCheckinResolutionTests(TestCase):
         self.assertEqual(len(response.data["candidates"]), 2)
 
     def test_scanning_again_after_assignment_reports_already_assigned(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
         self._checkin()
 
         response = self._checkin()
@@ -261,7 +287,7 @@ class EventCheckinResolutionTests(TestCase):
         """Check-in staff picking someone from a list (no QR scan) --
         e.g. the admin dashboard's manual check-in flow."""
 
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
         response = self.client.post(
             f"/api/events/{self.event.id}/checkin/",
             {"user_id": self.volunteer.id},
@@ -320,11 +346,12 @@ class SelfCheckinTests(TestCase):
             end_time=datetime.time(23, 0),
             created_by=self.organizer,
         )
+        self.hosting_slot = make_slot(self.hosting)
         self.client = APIClient()
         self.client.force_authenticate(user=self.volunteer)
 
     def test_volunteer_can_self_checkin(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
 
         response = self.client.post(f"/api/events/{self.event.id}/self-checkin/")
 
@@ -370,6 +397,8 @@ class PoolAndAssignTests(TestCase):
             end_time=datetime.time(23, 0),
             created_by=self.organizer,
         )
+        self.kitchen_slot = make_slot(self.kitchen, capacity=2)
+        self.hosting_slot = make_slot(self.hosting)
         self.admin_client = APIClient()
         self.admin_client.force_authenticate(user=self.organizer)
 
@@ -379,8 +408,8 @@ class PoolAndAssignTests(TestCase):
         return client.post(f"/api/events/{self.event.id}/self-checkin/")
 
     def test_pool_lists_checked_in_unassigned_users_with_suggestion(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.cook, has_relevant_experience=True)
-        ShiftSignup.objects.create(shift=self.hosting, user=self.cook)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.cook, has_relevant_experience=True)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.cook)
         self._self_checkin_as(self.cook)
 
         response = self.admin_client.get(f"/api/events/{self.event.id}/pool/")
@@ -391,10 +420,10 @@ class PoolAndAssignTests(TestCase):
         self.assertEqual(entry["user"]["username"], "cook")
         self.assertEqual(len(entry["candidates"]), 2)
         # experienced + critical should be suggested ahead of the plain hosting slot
-        self.assertEqual(entry["suggested_shift"]["id"], self.kitchen.id)
+        self.assertEqual(entry["suggested_oppgave_slot"]["id"], self.kitchen_slot.id)
 
     def test_assigned_users_disappear_from_pool(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.newbie)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.newbie)
         self._self_checkin_as(self.newbie)  # auto-assigns, single non-critical candidate
 
         response = self.admin_client.get(f"/api/events/{self.event.id}/pool/")
@@ -402,33 +431,60 @@ class PoolAndAssignTests(TestCase):
         self.assertEqual(response.data, [])
 
     def test_admin_can_assign_from_pool(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.cook, has_relevant_experience=True)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.cook, has_relevant_experience=True)
         self._self_checkin_as(self.cook)
 
         response = self.admin_client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.cook.id, "shift_id": self.kitchen.id},
+            {"user_id": self.cook.id, "oppgave_slot_id": self.kitchen_slot.id},
             format="json",
         )
 
         self.assertEqual(response.status_code, 201)
-        self.assertTrue(Assignment.objects.filter(shift=self.kitchen, user=self.cook).exists())
+        self.assertTrue(Assignment.objects.filter(oppgave_slot=self.kitchen_slot, user=self.cook).exists())
 
     def test_cannot_assign_someone_who_has_not_checked_in(self):
         response = self.admin_client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.newbie.id, "shift_id": self.hosting.id},
+            {"user_id": self.newbie.id, "oppgave_slot_id": self.hosting_slot.id},
             format="json",
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_cannot_assign_beyond_slot_capacity(self):
+        first = User.objects.create_user(username="first-assignee", password="pw")
+        second = User.objects.create_user(username="second-assignee", password="pw")
+        third = User.objects.create_user(username="third-assignee", password="pw")
+        for user in (first, second, third):
+            EventCheckIn.objects.create(event=self.event, user=user, date=self.today)
+
+        self.admin_client.post(
+            f"/api/events/{self.event.id}/assign/",
+            {"user_id": first.id, "oppgave_slot_id": self.kitchen_slot.id},
+            format="json",
+        )
+        self.admin_client.post(
+            f"/api/events/{self.event.id}/assign/",
+            {"user_id": second.id, "oppgave_slot_id": self.kitchen_slot.id},
+            format="json",
+        )
+        # kitchen_slot has capacity=2 -- a third assignment must be rejected.
+        response = self.admin_client.post(
+            f"/api/events/{self.event.id}/assign/",
+            {"user_id": third.id, "oppgave_slot_id": self.kitchen_slot.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Assignment.objects.filter(oppgave_slot=self.kitchen_slot).count(), 2)
+
     def test_cannot_double_assign_same_day(self):
-        ShiftSignup.objects.create(shift=self.hosting, user=self.newbie)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.newbie)
         self._self_checkin_as(self.newbie)  # auto-assigned to hosting already
 
         response = self.admin_client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.newbie.id, "shift_id": self.kitchen.id},
+            {"user_id": self.newbie.id, "oppgave_slot_id": self.kitchen_slot.id},
             format="json",
         )
         self.assertEqual(response.status_code, 400)
@@ -440,7 +496,7 @@ class PoolAndAssignTests(TestCase):
         pool_response = other_client.get(f"/api/events/{self.event.id}/pool/")
         assign_response = other_client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.newbie.id, "shift_id": self.hosting.id},
+            {"user_id": self.newbie.id, "oppgave_slot_id": self.hosting_slot.id},
             format="json",
         )
 
@@ -448,7 +504,7 @@ class PoolAndAssignTests(TestCase):
         self.assertEqual(assign_response.status_code, 403)
 
 
-class ShiftSignupEndpointTests(TestCase):
+class OppgaveSlotSignupEndpointTests(TestCase):
     def setUp(self):
         self.organizer = User.objects.create_user(username="organizer", password="pw")
         self.volunteer = User.objects.create_user(username="volunteer", password="pw")
@@ -465,7 +521,8 @@ class ShiftSignupEndpointTests(TestCase):
         # Deliberately not overlapping with self.kitchen (18:00-22:00) --
         # test_can_signup_for_multiple_shifts_same_day_now relies on both
         # being joinable together, which the overlap check in
-        # ShiftSignupValidationTests below would otherwise correctly reject.
+        # OppgaveSlotSignupValidationTests below would otherwise correctly
+        # reject.
         self.hosting = Shift.objects.create(
             event=self.event,
             title="Vertskap",
@@ -474,55 +531,70 @@ class ShiftSignupEndpointTests(TestCase):
             end_time=datetime.time(13, 0),
             created_by=self.organizer,
         )
+        self.kitchen_slot = make_slot(self.kitchen, skill_name="Kokk")
+        self.hosting_slot = make_slot(self.hosting, skill_name="Vertskap")
         self.client = APIClient()
         self.client.force_authenticate(user=self.volunteer)
 
     def test_signup_succeeds(self):
-        response = self.client.post(f"/api/shifts/{self.hosting.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{self.hosting_slot.id}/signup/")
         self.assertEqual(response.status_code, 201)
-        self.assertTrue(ShiftSignup.objects.filter(shift=self.hosting, user=self.volunteer).exists())
+        self.assertTrue(ShiftSignup.objects.filter(oppgave_slot=self.hosting_slot, user=self.volunteer).exists())
 
     def test_signup_for_critical_shift_captures_experience_answer(self):
         response = self.client.post(
-            f"/api/shifts/{self.kitchen.id}/signup/",
+            f"/api/oppgave-slots/{self.kitchen_slot.id}/signup/",
             {"has_relevant_experience": True, "experience_notes": "5 years as a chef"},
             format="json",
         )
         self.assertEqual(response.status_code, 201)
-        signup = ShiftSignup.objects.get(shift=self.kitchen, user=self.volunteer)
+        signup = ShiftSignup.objects.get(oppgave_slot=self.kitchen_slot, user=self.volunteer)
         self.assertTrue(signup.has_relevant_experience)
         self.assertEqual(signup.experience_notes, "5 years as a chef")
 
     def test_can_signup_for_multiple_shifts_same_day_now(self):
-        self.client.post(f"/api/shifts/{self.kitchen.id}/signup/", {"has_relevant_experience": False}, format="json")
-        response = self.client.post(f"/api/shifts/{self.hosting.id}/signup/")
+        self.client.post(
+            f"/api/oppgave-slots/{self.kitchen_slot.id}/signup/", {"has_relevant_experience": False}, format="json"
+        )
+        response = self.client.post(f"/api/oppgave-slots/{self.hosting_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(ShiftSignup.objects.filter(user=self.volunteer).count(), 2)
 
-    def test_signup_full_shift_is_rejected(self):
-        self.kitchen.capacity = 0
-        self.kitchen.save()
+    def test_signup_for_multiple_oppgaver_on_the_same_shift_is_allowed(self):
+        # A volunteer may be a candidate for more than one oppgave on the
+        # same vakt -- exactly one is resolved into an Assignment later.
+        other_slot_same_shift = make_slot(self.kitchen, skill_name="Kaldkjøkken")
 
-        response = self.client.post(f"/api/shifts/{self.kitchen.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{self.kitchen_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{other_slot_same_shift.id}/signup/")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(ShiftSignup.objects.filter(user=self.volunteer, shift=self.kitchen).count(), 2)
+
+    def test_signup_full_oppgave_slot_is_rejected(self):
+        self.kitchen_slot.capacity = 0
+        self.kitchen_slot.save()
+
+        response = self.client.post(f"/api/oppgave-slots/{self.kitchen_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 400)
 
     def test_withdraw_removes_signup(self):
-        self.client.post(f"/api/shifts/{self.hosting.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{self.hosting_slot.id}/signup/")
 
-        response = self.client.post(f"/api/shifts/{self.hosting.id}/withdraw/")
+        response = self.client.post(f"/api/oppgave-slots/{self.hosting_slot.id}/withdraw/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(ShiftSignup.objects.filter(shift=self.hosting, user=self.volunteer).exists())
+        self.assertFalse(ShiftSignup.objects.filter(oppgave_slot=self.hosting_slot, user=self.volunteer).exists())
 
 
-class ShiftSignupValidationTests(TestCase):
+class OppgaveSlotSignupValidationTests(TestCase):
     """The real signup rules from the live site (read during planning):
-    admin-declared vakt conflict pairs, no three numbered-consecutive
-    vakter, and an oppgave's phase must match the vakt's phase. See
-    _conflicting_signup / _would_complete_three_consecutive /
-    _phase_incompatible in views.py.
+    admin-declared vakt conflict pairs and no three numbered-consecutive
+    vakter -- both still enforced at the vakt level regardless of which
+    oppgave is picked. See _conflicting_signup /
+    _would_complete_three_consecutive in views.py.
 
     _conflicting_signup used to be a computed time-overlap check instead
     of ShiftConflict -- test_overlapping_but_undeclared_shifts_are_allowed
@@ -542,6 +614,9 @@ class ShiftSignupValidationTests(TestCase):
             created_by=self.organizer, **kwargs
         )
 
+    def _slot(self, shift):
+        return make_slot(shift)
+
     def test_declared_conflict_is_rejected(self):
         # Mirrors the real vakt 6 (24 Des 22:00 - 25 Des 09:15) / vakt 7
         # (25 Des 08:30-16:00) pair, which the organizers have explicitly
@@ -549,13 +624,14 @@ class ShiftSignupValidationTests(TestCase):
         night = self._shift(datetime.date(2026, 12, 24), datetime.time(22, 0), datetime.time(9, 15))
         morning = self._shift(datetime.date(2026, 12, 25), datetime.time(8, 30), datetime.time(16, 0))
         ShiftConflict.objects.create(event=self.event, shift_a=night, shift_b=morning)
+        night_slot, morning_slot = self._slot(night), self._slot(morning)
 
-        self.client.post(f"/api/shifts/{night.id}/signup/")
-        response = self.client.post(f"/api/shifts/{morning.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{night_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{morning_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("kan ikke kombineres", response.data["detail"])
-        self.assertFalse(ShiftSignup.objects.filter(shift=morning, user=self.volunteer).exists())
+        self.assertFalse(ShiftSignup.objects.filter(oppgave_slot=morning_slot, user=self.volunteer).exists())
 
     def test_declared_conflict_is_rejected_in_either_direction(self):
         # Signing up for shift_a first, then shift_b, must be blocked too
@@ -563,9 +639,10 @@ class ShiftSignupValidationTests(TestCase):
         a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
         b = self._shift(datetime.date(2026, 12, 20), datetime.time(15, 0), datetime.time(19, 0))
         ShiftConflict.objects.create(event=self.event, shift_a=a, shift_b=b)
+        a_slot, b_slot = self._slot(a), self._slot(b)
 
-        self.client.post(f"/api/shifts/{b.id}/signup/")
-        response = self.client.post(f"/api/shifts/{a.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{b_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{a_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 400)
 
@@ -578,9 +655,10 @@ class ShiftSignupValidationTests(TestCase):
         # blocked this too.
         day = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
         night = self._shift(datetime.date(2026, 12, 24), datetime.time(22, 0), datetime.time(9, 15))
+        day_slot, night_slot = self._slot(day), self._slot(night)
 
-        self.client.post(f"/api/shifts/{day.id}/signup/")
-        response = self.client.post(f"/api/shifts/{night.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{day_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{night_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
 
@@ -590,9 +668,10 @@ class ShiftSignupValidationTests(TestCase):
         other_a = self._shift(datetime.date(2026, 12, 24), datetime.time(9, 0), datetime.time(13, 0))
         other_b = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0))
         ShiftConflict.objects.create(event=self.event, shift_a=other_a, shift_b=other_b)
+        a_slot, b_slot = self._slot(a), self._slot(b)
 
-        self.client.post(f"/api/shifts/{a.id}/signup/")
-        response = self.client.post(f"/api/shifts/{b.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{a_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{b_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
 
@@ -600,68 +679,107 @@ class ShiftSignupValidationTests(TestCase):
         a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
         b = self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
         c = self._shift(datetime.date(2026, 12, 20), datetime.time(18, 0), datetime.time(22, 0))
+        a_slot, b_slot, c_slot = self._slot(a), self._slot(b), self._slot(c)
 
-        self.client.post(f"/api/shifts/{a.id}/signup/")
-        self.client.post(f"/api/shifts/{b.id}/signup/")
-        response = self.client.post(f"/api/shifts/{c.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{a_slot.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{b_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{c_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("tre sammenhengende", response.data["detail"])
-        self.assertFalse(ShiftSignup.objects.filter(shift=c, user=self.volunteer).exists())
+        self.assertFalse(ShiftSignup.objects.filter(oppgave_slot=c_slot, user=self.volunteer).exists())
 
     def test_two_consecutive_shifts_allowed(self):
         a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
         b = self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
+        a_slot, b_slot = self._slot(a), self._slot(b)
 
-        self.client.post(f"/api/shifts/{a.id}/signup/")
-        response = self.client.post(f"/api/shifts/{b.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{a_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{b_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
 
     def test_non_consecutive_shifts_allowed(self):
         a = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
-        self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
+        b = self._shift(datetime.date(2026, 12, 20), datetime.time(14, 0), datetime.time(18, 0))
         c = self._shift(datetime.date(2026, 12, 20), datetime.time(18, 0), datetime.time(22, 0))
+        a_slot, c_slot = self._slot(a), self._slot(c)
+        self._slot(b)
 
-        self.client.post(f"/api/shifts/{a.id}/signup/")
-        response = self.client.post(f"/api/shifts/{c.id}/signup/")
-
-        self.assertEqual(response.status_code, 201)
-
-    def test_phase_mismatch_is_rejected(self):
-        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
-        self.volunteer.skills.add(skill)
-        setup_shift = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0), phase=Shift.PHASE_SETUP)
-
-        response = self.client.post(f"/api/shifts/{setup_shift.id}/signup/")
-
-        self.assertEqual(response.status_code, 400)
-        self.assertFalse(ShiftSignup.objects.filter(shift=setup_shift, user=self.volunteer).exists())
-
-    def test_phase_match_is_allowed(self):
-        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
-        self.volunteer.skills.add(skill)
-        guest_shift = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0), phase=Shift.PHASE_GUEST)
-
-        response = self.client.post(f"/api/shifts/{guest_shift.id}/signup/")
+        self.client.post(f"/api/oppgave-slots/{a_slot.id}/signup/")
+        response = self.client.post(f"/api/oppgave-slots/{c_slot.id}/signup/")
 
         self.assertEqual(response.status_code, 201)
 
-    def test_zero_skills_bypasses_phase_check(self):
-        guest_shift = self._shift(datetime.date(2026, 12, 24), datetime.time(13, 0), datetime.time(23, 0), phase=Shift.PHASE_GUEST)
 
-        response = self.client.post(f"/api/shifts/{guest_shift.id}/signup/")
+class OppgaveSlotAdminTests(TestCase):
+    """Only an event admin/owner can declare or remove an oppgave slot --
+    same gating pattern as ShiftConflict's admin-only writes."""
 
+    def setUp(self):
+        self.admin = User.objects.create_user(username="slot-admin", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.shift = Shift.objects.create(
+            event=self.event, title="Vakt 5", date=datetime.date(2026, 12, 24),
+            start_time=datetime.time(13, 0), end_time=datetime.time(23, 0), created_by=self.admin,
+        )
+        self.skill = Skill.objects.create(name="Kokk")
+        self.client = APIClient()
+
+    def test_admin_can_create_a_slot(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            "/api/oppgave-slots/",
+            {"shift": self.shift.id, "skill": self.skill.id, "capacity": 4},
+            format="json",
+        )
         self.assertEqual(response.status_code, 201)
+        self.assertTrue(OppgaveSlot.objects.filter(shift=self.shift, skill=self.skill).exists())
 
-    def test_blank_phase_shift_bypasses_phase_check(self):
-        skill = Skill.objects.create(name="Vertskap", allowed_in_setup=False, allowed_in_guest=True, allowed_in_teardown=False)
-        self.volunteer.skills.add(skill)
-        uncategorized_shift = self._shift(datetime.date(2026, 12, 20), datetime.time(10, 0), datetime.time(14, 0))
+    def test_admin_can_delete_a_slot(self):
+        slot = make_slot(self.shift, skill_name=self.skill.name)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.delete(f"/api/oppgave-slots/{slot.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(OppgaveSlot.objects.filter(pk=slot.pk).exists())
 
-        response = self.client.post(f"/api/shifts/{uncategorized_shift.id}/signup/")
+    def test_plain_volunteer_cannot_create_a_slot(self):
+        bystander = User.objects.create_user(username="slot-bystander", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.post(
+            "/api/oppgave-slots/",
+            {"shift": self.shift.id, "skill": self.skill.id, "capacity": 4},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(OppgaveSlot.objects.filter(shift=self.shift, skill=self.skill).exists())
 
-        self.assertEqual(response.status_code, 201)
+    def test_plain_volunteer_cannot_delete_a_slot(self):
+        slot = make_slot(self.shift, skill_name=self.skill.name)
+        bystander = User.objects.create_user(username="slot-bystander-2", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.delete(f"/api/oppgave-slots/{slot.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(OppgaveSlot.objects.filter(pk=slot.pk).exists())
+
+    def test_slot_is_full_once_signup_capacity_reached(self):
+        slot = make_slot(self.shift, skill_name=self.skill.name, capacity=1)
+        volunteer = User.objects.create_user(username="slot-volunteer", password="pw")
+        self.assertFalse(slot.is_full)
+
+        ShiftSignup.objects.create(oppgave_slot=slot, user=volunteer)
+
+        slot.refresh_from_db()
+        self.assertTrue(slot.is_full)
+
+    def test_slot_with_no_capacity_is_never_full(self):
+        slot = make_slot(self.shift, skill_name=self.skill.name, capacity=None)
+        for i in range(5):
+            volunteer = User.objects.create_user(username=f"slot-volunteer-{i}", password="pw")
+            ShiftSignup.objects.create(oppgave_slot=slot, user=volunteer)
+
+        slot.refresh_from_db()
+        self.assertFalse(slot.is_full)
 
 
 class ShiftConflictAdminTests(TestCase):
@@ -719,6 +837,10 @@ class ShiftConflictAdminTests(TestCase):
 
 
 class UserSkillsTests(TestCase):
+    """User.skills is kept on the model but no longer exposed or written
+    via the API -- oppgave interest is now expressed per (vakt, oppgave)
+    via OppgaveSlotViewSet.signup, not a blanket tag on the user."""
+
     def test_user_can_have_skills_and_experience_notes(self):
         user = User.objects.create_user(username="volunteer", password="pw")
         cooking = Skill.objects.create(name="Kokk")
@@ -729,7 +851,7 @@ class UserSkillsTests(TestCase):
 
         self.assertEqual(set(user.skills.values_list("name", flat=True)), {"Kokk", "Førstehjelp"})
 
-    def test_me_endpoint_returns_skills_and_experience(self):
+    def test_me_endpoint_returns_experience_notes_but_not_skills(self):
         user = User.objects.create_user(username="volunteer", password="pw")
         skill = Skill.objects.create(name="Vekter")
         user.skills.add(skill)
@@ -742,7 +864,7 @@ class UserSkillsTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["experience_notes"], "Security guard for 3 years")
-        self.assertEqual([s["name"] for s in response.data["skills"]], ["Vekter"])
+        self.assertNotIn("skills", response.data)
 
 
 class AdminNoteTests(TestCase):
@@ -1049,22 +1171,16 @@ class RegistrationAndEmailLoginTests(TestCase):
         self.assertNotEqual(response.status_code, 200)
         self.assertNotIn("access", response.data)
 
-    def test_register_accepts_skill_ids_and_sets_them_on_the_user(self):
-        kokk = Skill.objects.create(name="Kokk")
-        vertskap = Skill.objects.create(name="Vertskap")
+    def test_register_response_does_not_expose_skills(self):
+        # Oppgave interest is no longer collected at registration -- see
+        # UserSkillsTests for why skills is no longer on the serializer.
         response = self.client.post(
             "/api/register/",
-            {
-                "email": "chef.volunteer@example.com",
-                "password": "correct horse battery staple",
-                "skill_ids": [kokk.id, vertskap.id],
-            },
+            {"email": "chef.volunteer@example.com", "password": "correct horse battery staple"},
             format="json",
         )
         self.assertEqual(response.status_code, 201)
-        user = User.objects.get(email="chef.volunteer@example.com")
-        self.assertEqual(set(user.skills.values_list("name", flat=True)), {"Kokk", "Vertskap"})
-        self.assertEqual({s["name"] for s in response.data["user"]["skills"]}, {"Kokk", "Vertskap"})
+        self.assertNotIn("skills", response.data["user"])
 
     def test_register_rejects_duplicate_email(self):
         User.objects.create_user(username="existing", email="taken@example.com", password="pw12345678")
@@ -1422,6 +1538,8 @@ class MembershipRolesTests(TestCase):
             end_time=datetime.time(23, 0),
             created_by=self.admin,
         )
+        self.kitchen_slot = make_slot(self.kitchen)
+        self.hosting_slot = make_slot(self.hosting)
 
     def test_creator_is_auto_admin(self):
         self.assertTrue(self.event.is_admin(self.admin))
@@ -1453,8 +1571,8 @@ class MembershipRolesTests(TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_leader_can_assign_their_own_shift_but_not_others(self):
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
-        ShiftSignup.objects.create(shift=self.hosting, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
+        ShiftSignup.objects.create(oppgave_slot=self.hosting_slot, user=self.volunteer)
         EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
 
         client = APIClient()
@@ -1462,14 +1580,14 @@ class MembershipRolesTests(TestCase):
 
         denied = client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.volunteer.id, "shift_id": self.hosting.id},
+            {"user_id": self.volunteer.id, "oppgave_slot_id": self.hosting_slot.id},
             format="json",
         )
         self.assertEqual(denied.status_code, 403)
 
         allowed = client.post(
             f"/api/events/{self.event.id}/assign/",
-            {"user_id": self.volunteer.id, "shift_id": self.kitchen.id},
+            {"user_id": self.volunteer.id, "oppgave_slot_id": self.kitchen_slot.id},
             format="json",
         )
         self.assertEqual(allowed.status_code, 201)
@@ -2003,7 +2121,8 @@ class MetricsTests(TestCase):
             min_capacity=2,
             created_by=self.organizer,
         )
-        ShiftSignup.objects.create(shift=self.kitchen, user=self.volunteer)
+        self.kitchen_slot = make_slot(self.kitchen)
+        ShiftSignup.objects.create(oppgave_slot=self.kitchen_slot, user=self.volunteer)
         EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
 
     def test_metrics_reports_headcounts_and_shift_utilization(self):
@@ -2024,9 +2143,12 @@ class MetricsTests(TestCase):
 
 class OppgaveHistoryTests(TestCase):
     """Cross-event no-show/fill-rate tracking -- signups vs. actual
-    Assignments, grouped by shift title across every event regardless of
-    which one is active, so an admin can see how much they need to
-    oversubscribe a given oppgave to reliably end up with it filled."""
+    Assignments, grouped by oppgave (Skill) via OppgaveSlot across every
+    event regardless of which one is active, so an admin can see how much
+    they need to oversubscribe a given oppgave to reliably end up with it
+    filled. Grouped by the Skill itself, not by which numbered vakt hosted
+    it a given year -- see oppgave_history's docstring for why grouping by
+    shift title used to be wrong."""
 
     def setUp(self):
         self.organizer = User.objects.create_user(username="history-organizer", password="pw")
@@ -2047,33 +2169,39 @@ class OppgaveHistoryTests(TestCase):
             date=datetime.datetime(2027, 12, 20, tzinfo=datetime.timezone.utc),
         )
 
+        # Deliberately different vakt numbers/titles across years -- the
+        # oppgave (Skill) is what history groups on, not the vakt title.
         kitchen_2026 = Shift.objects.create(
-            event=self.event_2026, title="Kjøkken", date=datetime.date(2026, 12, 24),
+            event=self.event_2026, title="Vakt 5", date=datetime.date(2026, 12, 24),
             start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
         )
         kitchen_2027 = Shift.objects.create(
-            event=self.event_2027, title=" kjøkken ", date=datetime.date(2027, 12, 24),
+            event=self.event_2027, title="Vakt 7", date=datetime.date(2027, 12, 24),
             start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
         )
         hosting_2027 = Shift.objects.create(
-            event=self.event_2027, title="Vertskap", date=datetime.date(2027, 12, 24),
+            event=self.event_2027, title="Vakt 6", date=datetime.date(2027, 12, 24),
             start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
         )
 
+        kitchen_2026_slot = make_slot(kitchen_2026, skill_name="Kjøkken")
+        kitchen_2027_slot = make_slot(kitchen_2027, skill_name="Kjøkken")
+        hosting_2027_slot = make_slot(hosting_2027, skill_name="Vertskap")
+
         volunteers_2026 = [User.objects.create_user(username=f"v2026-{i}", password="pw") for i in range(4)]
         for v in volunteers_2026:
-            ShiftSignup.objects.create(shift=kitchen_2026, user=v)
+            ShiftSignup.objects.create(oppgave_slot=kitchen_2026_slot, user=v)
         for v in volunteers_2026[:2]:
-            Assignment.objects.create(shift=kitchen_2026, user=v, confirmed_by=self.organizer)
+            Assignment.objects.create(oppgave_slot=kitchen_2026_slot, user=v, confirmed_by=self.organizer)
 
         volunteers_2027 = [User.objects.create_user(username=f"v2027-{i}", password="pw") for i in range(2)]
         for v in volunteers_2027:
-            ShiftSignup.objects.create(shift=kitchen_2027, user=v)
-            Assignment.objects.create(shift=kitchen_2027, user=v, confirmed_by=self.organizer)
+            ShiftSignup.objects.create(oppgave_slot=kitchen_2027_slot, user=v)
+            Assignment.objects.create(oppgave_slot=kitchen_2027_slot, user=v, confirmed_by=self.organizer)
 
         hosting_volunteers = [User.objects.create_user(username=f"h2027-{i}", password="pw") for i in range(3)]
         for v in hosting_volunteers:
-            ShiftSignup.objects.create(shift=hosting_2027, user=v)
+            ShiftSignup.objects.create(oppgave_slot=hosting_2027_slot, user=v)
 
         self.client = APIClient()
 
@@ -2089,16 +2217,16 @@ class OppgaveHistoryTests(TestCase):
         response = self._get(self.admin)
         self.assertEqual(response.status_code, 200)
 
-    def test_shifts_with_the_same_title_merge_across_years_case_insensitively(self):
+    def test_same_oppgave_merges_across_years_regardless_of_vakt_title(self):
         response = self._get(self.organizer)
-        kjokken = next(r for r in response.data if r["title"].lower() == "kjøkken")
+        kjokken = next(r for r in response.data if r["title"] == "Kjøkken")
         self.assertEqual(kjokken["total_signups"], 6)
         self.assertEqual(kjokken["total_assigned"], 4)
         self.assertEqual({y["year"] for y in kjokken["years"]}, {"2026", "2027"})
 
     def test_fill_rate_and_oversubscription_factor(self):
         response = self._get(self.organizer)
-        kjokken = next(r for r in response.data if r["title"].lower() == "kjøkken")
+        kjokken = next(r for r in response.data if r["title"] == "Kjøkken")
         self.assertAlmostEqual(kjokken["fill_rate"], 4 / 6, places=3)
         self.assertAlmostEqual(kjokken["oversubscription_factor"], 6 / 4, places=2)
 
@@ -2124,12 +2252,13 @@ class ShiftCapacityTests(TestCase):
             min_capacity=2,
             created_by=organizer,
         )
+        slot = make_slot(shift)
         self.assertTrue(shift.is_understaffed)
 
         volunteer = User.objects.create_user(username="volunteer", password="pw")
-        Assignment.objects.create(shift=shift, user=volunteer, confirmed_by=organizer)
+        Assignment.objects.create(oppgave_slot=slot, user=volunteer, confirmed_by=organizer)
         another = User.objects.create_user(username="volunteer2", password="pw")
-        Assignment.objects.create(shift=shift, user=another, confirmed_by=organizer)
+        Assignment.objects.create(oppgave_slot=slot, user=another, confirmed_by=organizer)
 
         shift.refresh_from_db()
         self.assertFalse(shift.is_understaffed)
@@ -2148,14 +2277,15 @@ class CancelAssignmentTests(TestCase):
             end_time=datetime.time(22, 0),
             created_by=organizer,
         )
-        Assignment.objects.create(shift=shift, user=volunteer, confirmed_by=organizer)
+        slot = make_slot(shift)
+        Assignment.objects.create(oppgave_slot=slot, user=volunteer, confirmed_by=organizer)
 
         client = APIClient()
         client.force_authenticate(user=volunteer)
-        response = client.post(f"/api/shifts/{shift.id}/cancel-assignment/")
+        response = client.post(f"/api/oppgave-slots/{slot.id}/cancel-assignment/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(Assignment.objects.filter(shift=shift, user=volunteer).exists())
+        self.assertFalse(Assignment.objects.filter(oppgave_slot=slot, user=volunteer).exists())
 
 
 class PublicEventEndpointTests(TestCase):
@@ -2183,7 +2313,8 @@ class PublicEventEndpointTests(TestCase):
 
     def test_public_event_never_exposes_volunteer_or_admin_profiles(self):
         volunteer = User.objects.create_user(username="volunteer", email="volunteer@example.com", password="pw")
-        ShiftSignup.objects.create(shift=self.kitchen, user=volunteer)
+        slot = make_slot(self.kitchen)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=volunteer)
 
         response = self.client.get("/api/public/event/")
 
@@ -2193,6 +2324,19 @@ class PublicEventEndpointTests(TestCase):
         self.assertNotIn("created_by", response.data)
         self.assertNotIn("participants", response.data["shifts"][0])
         self.assertNotIn("leaders", response.data["shifts"][0])
+
+    def test_public_event_exposes_oppgave_slots(self):
+        slot = make_slot(self.kitchen, skill_name="Kokk", capacity=3)
+
+        response = self.client.get("/api/public/event/")
+
+        self.assertEqual(len(response.data["oppgave_slots"]), 1)
+        slot_payload = response.data["oppgave_slots"][0]
+        self.assertEqual(slot_payload["id"], slot.id)
+        self.assertEqual(slot_payload["skill_name"], "Kokk")
+        self.assertEqual(slot_payload["capacity"], 3)
+        self.assertEqual(slot_payload["signup_count"], 0)
+        self.assertFalse(slot_payload["is_full"])
 
     def test_public_event_returns_404_when_none_exists(self):
         self.event.delete()

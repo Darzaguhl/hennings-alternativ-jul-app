@@ -8,16 +8,12 @@ from django.utils import timezone
 
 
 class Skill(models.Model):
-    name = models.CharField(max_length=100, unique=True)
+    """The oppgave catalogue -- role names like "Kokk" or "Vertskap". Which
+    vakter a given oppgave actually applies to is no longer decided by a
+    coarse phase tag here; it's simply whichever OppgaveSlot rows an admin
+    has created for that (shift, skill) pair."""
 
-    # Which of Shift.phase this oppgave is valid for -- e.g. "Vertskap" is
-    # guest-facing only, "Hva som helst på ryddevakt" is teardown only.
-    # Default True on all three: until an admin actually curates these, an
-    # oppgave is treated as unrestricted rather than silently blocking every
-    # signup that uses it. See ShiftViewSet.signup for how this is enforced.
-    allowed_in_setup = models.BooleanField(default=True)
-    allowed_in_guest = models.BooleanField(default=True)
-    allowed_in_teardown = models.BooleanField(default=True)
+    name = models.CharField(max_length=100, unique=True)
 
     class Meta:
         ordering = ["name"]
@@ -316,23 +312,13 @@ class Shift(models.Model):
     """A vakt: a numbered time slot within an Event (e.g. "Vakt 5", 24 Dec
     13:00-23:00). Distinct from Skill ("oppgave") -- a single vakt has many
     volunteers doing many different oppgaver at once; a vakt is when, an
-    oppgave is what. See `phase`, and Skill.allowed_in_* for how the two
-    are related."""
+    oppgave is what. See OppgaveSlot for how the two combine."""
 
     CRITICALITY_NORMAL = "normal"
     CRITICALITY_CRITICAL = "critical"
     CRITICALITY_CHOICES = (
         (CRITICALITY_NORMAL, "Normal"),
         (CRITICALITY_CRITICAL, "Critical — requires relevant experience"),
-    )
-
-    PHASE_SETUP = "setup"
-    PHASE_GUEST = "guest"
-    PHASE_TEARDOWN = "teardown"
-    PHASE_CHOICES = (
-        (PHASE_SETUP, "Forberedelse"),
-        (PHASE_GUEST, "Gjester til stede"),
-        (PHASE_TEARDOWN, "Rydding"),
     )
 
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="shifts")
@@ -349,10 +335,6 @@ class Shift(models.Model):
         choices=CRITICALITY_CHOICES,
         default=CRITICALITY_NORMAL,
     )
-    # Blank = uncategorized, treated as compatible with every oppgave (see
-    # ShiftViewSet.signup) so shifts created before this field existed don't
-    # retroactively start rejecting signups.
-    phase = models.CharField(max_length=10, choices=PHASE_CHOICES, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -401,19 +383,70 @@ class Shift(models.Model):
         return user.is_authenticated and self.leaders.filter(pk=user.pk).exists()
 
 
+class OppgaveSlot(models.Model):
+    """A specific oppgave (Skill) needed during a specific vakt (Shift),
+    with its own capacity -- the actual unit a volunteer signs up for and
+    an admin assigns them to.
+
+    Replaces the old two-independent-things model: a global Skill interest
+    tag on the user with no shift reference, and a Shift signup with no
+    skill reference. Also replaces the old Shift.phase / Skill.allowed_in_*
+    compatibility mechanism -- compatibility is now just "does a slot exist
+    for this (shift, skill) pair", curated by an admin (see
+    OppgaveSlotViewSet) rather than a coarse phase match."""
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="oppgave_slots")
+    shift = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="oppgave_slots")
+    skill = models.ForeignKey(Skill, on_delete=models.CASCADE, related_name="oppgave_slots")
+    capacity = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Maximum volunteers for this oppgave on this vakt. Blank = no limit."
+    )
+
+    class Meta:
+        unique_together = ("shift", "skill")
+        ordering = ["shift__date", "shift__start_time", "skill__name"]
+
+    def save(self, *args, **kwargs):
+        self.event = self.shift.event
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.skill} — {self.shift}"
+
+    @property
+    def signup_count(self) -> int:
+        return self.signups.count()
+
+    @property
+    def assigned_count(self) -> int:
+        return self.assignments.count()
+
+    @property
+    def is_full(self) -> bool:
+        # Mirrors Shift.is_full's existing semantics -- checks interest
+        # (signups), not confirmed placements -- so it closes further
+        # signups once enough interest exists. The separate over-capacity
+        # check in EventViewSet.assign is what actually stops over-placing
+        # people once assignment happens.
+        return self.capacity is not None and self.signup_count >= self.capacity
+
+
 class ShiftSignup(models.Model):
     """A user's expressed interest in doing a given oppgave on its day.
 
-    A user may shortlist several oppgaver for the same day — this is a
-    candidate list, not a commitment. Exactly one gets turned into an
-    Assignment, at check-in time. event/date are denormalized from shift
-    purely to make querying "this user's candidates for today" cheap.
+    A user may shortlist several oppgaver for the same day (including more
+    than one for the same vakt, e.g. willing to do either Kjøkken or
+    Vertskap on Vakt 5) — this is a candidate list, not a commitment.
+    Exactly one gets turned into an Assignment, at check-in time. shift/
+    event/date are denormalized from oppgave_slot purely to make querying
+    "this user's candidates for today" cheap.
 
     has_relevant_experience / experience_notes are only meaningful when the
     shift is critical (see Shift.is_critical) — the signup flow should ask
     for them in that case.
     """
 
+    oppgave_slot = models.ForeignKey(OppgaveSlot, on_delete=models.CASCADE, related_name="signups")
     shift = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="signups")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="shift_signups")
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="shift_signups")
@@ -423,15 +456,16 @@ class ShiftSignup(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = ("shift", "user")
+        unique_together = ("oppgave_slot", "user")
 
     def save(self, *args, **kwargs):
+        self.shift = self.oppgave_slot.shift
         self.event = self.shift.event
         self.date = self.shift.date
         super().save(*args, **kwargs)
 
     def __str__(self) -> str:
-        return f"{self.user} → {self.shift}"
+        return f"{self.user} → {self.oppgave_slot}"
 
 
 class ShiftConflict(models.Model):
@@ -481,14 +515,16 @@ class EventCheckIn(models.Model):
 
 
 class Assignment(models.Model):
-    """The final, admin-confirmed placement of a user onto one oppgave for
-    the day — as opposed to ShiftSignup, which is just a candidate.
+    """The final, admin-confirmed placement of a user onto one oppgave slot
+    for the day — as opposed to ShiftSignup, which is just a candidate.
 
-    event/date are denormalized from shift so the DB enforces at most one
-    confirmed placement per user per event per day, even though a user may
-    have shortlisted (ShiftSignup'd) several oppgaver that day.
+    event/date are denormalized from oppgave_slot's shift so the DB
+    enforces at most one confirmed placement per user per event per day,
+    even though a user may have shortlisted (ShiftSignup'd) several
+    oppgaver that day.
     """
 
+    oppgave_slot = models.ForeignKey(OppgaveSlot, on_delete=models.CASCADE, related_name="assignments")
     shift = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="assignments")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="assignments")
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="assignments")
@@ -506,9 +542,10 @@ class Assignment(models.Model):
         ordering = ["-confirmed_at"]
 
     def save(self, *args, **kwargs):
+        self.shift = self.oppgave_slot.shift
         self.event = self.shift.event
         self.date = self.shift.date
         super().save(*args, **kwargs)
 
     def __str__(self) -> str:
-        return f"{self.user} assigned to {self.shift}"
+        return f"{self.user} assigned to {self.oppgave_slot}"

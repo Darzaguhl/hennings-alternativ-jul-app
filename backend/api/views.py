@@ -20,6 +20,7 @@ from .models import (
     EventCheckIn,
     Invite,
     Membership,
+    OppgaveSlot,
     PasswordSetupToken,
     QRCode,
     Shift,
@@ -35,6 +36,7 @@ from .serializers import (
     InvitePreviewSerializer,
     InviteSerializer,
     MembershipSerializer,
+    OppgaveSlotSerializer,
     PasswordSetupPreviewSerializer,
     PublicEventSerializer,
     QRCodeSerializer,
@@ -64,7 +66,11 @@ def public_event(request):
     than opening up EventViewSet/ShiftViewSet -- those embed full volunteer
     profiles (emails) in participants/leaders, which must stay private."""
 
-    event = Event.objects.filter(is_active=True).prefetch_related("shifts", "shift_conflicts").first()
+    event = (
+        Event.objects.filter(is_active=True)
+        .prefetch_related("shifts", "shift_conflicts", "oppgave_slots", "oppgave_slots__skill")
+        .first()
+    )
     if not event:
         return Response({"detail": "No event configured yet."}, status=status.HTTP_404_NOT_FOUND)
     return Response(PublicEventSerializer(event, context={"request": request}).data)
@@ -253,14 +259,15 @@ def _rank_candidates(signups):
     """Order a user's candidate ShiftSignups for a day, best suggestion first.
 
     Critical shifts with a confirmed "yes" on relevant experience sort ahead
-    of ones with an unconfirmed/"no" answer. Ties break on which shift is
-    most understaffed relative to its capacity, since that's the one most
-    worth filling. This is intentionally a simple, explainable v1 — the
-    admin always has final say via EventViewSet.assign.
+    of ones with an unconfirmed/"no" answer. Ties break on which oppgave
+    slot is most understaffed relative to its own capacity, since that's
+    the one most worth filling. This is intentionally a simple, explainable
+    v1 — the admin always has final say via EventViewSet.assign.
     """
 
     def sort_key(signup):
         shift = signup.shift
+        oppgave_slot = signup.oppgave_slot
         if shift.is_critical:
             if signup.has_relevant_experience is True:
                 experience_score = 0
@@ -271,8 +278,8 @@ def _rank_candidates(signups):
         else:
             experience_score = 0
 
-        if shift.capacity is not None:
-            urgency = shift.capacity - shift.assigned_count
+        if oppgave_slot.capacity is not None:
+            urgency = oppgave_slot.capacity - oppgave_slot.assigned_count
         else:
             urgency = float("inf")
 
@@ -353,15 +360,24 @@ def _resolve_checkin(event, user, performed_by):
     if existing:
         return {"status": "already_assigned", "shift": existing.shift}
 
-    candidates = list(Shift.objects.filter(event=event, date=today, signups__user=user).distinct())
+    candidates = list(
+        ShiftSignup.objects.filter(event=event, date=today, user=user).select_related(
+            "shift", "oppgave_slot", "oppgave_slot__skill"
+        )
+    )
 
     if not candidates:
         return {"status": "pending_pool", "reason": "no_candidates", "candidates": []}
 
-    if len(candidates) == 1 and not candidates[0].is_critical:
-        shift = candidates[0]
-        Assignment.objects.create(shift=shift, user=user, confirmed_by=performed_by)
-        return {"status": "assigned", "shift": shift}
+    # Auto-resolve only when there's exactly one candidate signup today --
+    # same vakt AND same oppgave, unambiguous. A person interested in two
+    # different oppgaver on the same vakt is just as ambiguous as two
+    # different vakter now that a vakt alone no longer says which oppgave
+    # they'd be doing -- both go to the pool for admin review.
+    if len(candidates) == 1 and not candidates[0].shift.is_critical:
+        oppgave_slot = candidates[0].oppgave_slot
+        Assignment.objects.create(oppgave_slot=oppgave_slot, user=user, confirmed_by=performed_by)
+        return {"status": "assigned", "shift": oppgave_slot.shift}
 
     return {"status": "pending_pool", "reason": "needs_admin_review", "candidates": candidates}
 
@@ -379,7 +395,7 @@ def _checkin_response(attendee, result, request):
         payload["message"] = f"Checked in and assigned to {result['shift'].title}."
         status_code = status.HTTP_201_CREATED
     else:  # pending_pool
-        payload["candidates"] = ShiftSerializer(result["candidates"], many=True, context={"request": request}).data
+        payload["candidates"] = ShiftSignupSerializer(result["candidates"], many=True, context={"request": request}).data
         if result["reason"] == "no_candidates":
             payload["message"] = "Checked in. Not signed up for any vakt today — added to the pool for manual assignment."
         else:
@@ -401,12 +417,17 @@ def _event_year_label(event) -> str:
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated])
 def oppgave_history(request):
-    """Cross-event history: for each distinct vakt/oppgave (grouped by
-    shift title, case-insensitively, across every event regardless of
-    which one is active), how many people signed up vs. how many actually
-    ended up assigned (i.e. showed up and were placed).
+    """Cross-event history: for each distinct oppgave (Skill), across every
+    event regardless of which one is active, how many people signed up vs.
+    how many actually ended up assigned (i.e. showed up and were placed) --
+    summed across every vakt that oppgave was offered on that year.
 
-    The gap between those two numbers is no-shows -- signing up doesn't
+    Grouped by skill via OppgaveSlot, not by shift title -- shift titles
+    are per-vakt ("Vakt 5"), not per-oppgave, so grouping by them used to
+    conflate every oppgave offered on same-numbered vakter across different
+    years instead of tracking the oppgave itself.
+
+    The gap between signups and assigned is no-shows -- signing up doesn't
     mean showing up, and Assignment only happens at check-in time (see
     _resolve_checkin). fill_rate is assigned/signups; oversubscription_
     factor is its inverse, i.e. roughly how many signups to accept per
@@ -417,25 +438,23 @@ def oppgave_history(request):
     if not _is_any_event_admin(request.user):
         return Response({"detail": "Only an admin can view this."}, status=status.HTTP_403_FORBIDDEN)
 
-    shifts = Shift.objects.select_related("event").annotate(
+    slots = OppgaveSlot.objects.select_related("event", "skill").annotate(
         signup_total=Count("signups", distinct=True),
         assigned_total=Count("assignments", distinct=True),
     )
 
     groups: dict = {}
-    for shift in shifts:
-        key = shift.title.strip().lower()
-        if not key:
-            continue
-        year = _event_year_label(shift.event)
+    for slot in slots:
+        key = slot.skill_id
+        year = _event_year_label(slot.event)
         entry = groups.setdefault(
-            key, {"title": shift.title.strip(), "years": {}, "total_signups": 0, "total_assigned": 0}
+            key, {"title": slot.skill.name, "years": {}, "total_signups": 0, "total_assigned": 0}
         )
         yearly = entry["years"].setdefault(year, {"signups": 0, "assigned": 0})
-        yearly["signups"] += shift.signup_total
-        yearly["assigned"] += shift.assigned_total
-        entry["total_signups"] += shift.signup_total
-        entry["total_assigned"] += shift.assigned_total
+        yearly["signups"] += slot.signup_total
+        yearly["assigned"] += slot.assigned_total
+        entry["total_signups"] += slot.signup_total
+        entry["total_assigned"] += slot.assigned_total
 
     results = []
     for entry in groups.values():
@@ -640,7 +659,6 @@ class EventViewSet(viewsets.ModelViewSet):
             EventCheckIn.objects.filter(event=event, date=target_date)
             .exclude(user_id__in=assigned_user_ids)
             .select_related("user")
-            .prefetch_related("user__skills")
             .order_by("checked_in_at")
         )
 
@@ -648,7 +666,7 @@ class EventViewSet(viewsets.ModelViewSet):
         for arrival in arrivals:
             candidates = list(
                 ShiftSignup.objects.filter(event=event, date=target_date, user=arrival.user).select_related(
-                    "shift", "shift__event"
+                    "shift", "shift__event", "oppgave_slot", "oppgave_slot__skill"
                 )
             )
             ranked = _rank_candidates(candidates)
@@ -657,8 +675,10 @@ class EventViewSet(viewsets.ModelViewSet):
                     "user": UserSerializer(arrival.user, context={"request": request}).data,
                     "checked_in_at": arrival.checked_in_at,
                     "candidates": ShiftSignupSerializer(ranked, many=True, context={"request": request}).data,
-                    "suggested_shift": (
-                        ShiftSerializer(ranked[0].shift, context={"request": request}).data if ranked else None
+                    "suggested_oppgave_slot": (
+                        OppgaveSlotSerializer(ranked[0].oppgave_slot, context={"request": request}).data
+                        if ranked
+                        else None
                     ),
                 }
             )
@@ -668,18 +688,19 @@ class EventViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
         """Admin or the target oppgave's leader confirms a specific
-        oppgave for a checked-in, unassigned volunteer — the final step out
-        of the pool."""
+        oppgave slot for a checked-in, unassigned volunteer — the final
+        step out of the pool."""
 
         event = self.get_object()
 
         user_id = request.data.get("user_id")
-        shift_id = request.data.get("shift_id")
-        if not user_id or not shift_id:
-            return Response({"detail": "user_id and shift_id are required"}, status=status.HTTP_400_BAD_REQUEST)
+        oppgave_slot_id = request.data.get("oppgave_slot_id")
+        if not user_id or not oppgave_slot_id:
+            return Response({"detail": "user_id and oppgave_slot_id are required"}, status=status.HTTP_400_BAD_REQUEST)
 
         attendee = get_object_or_404(User, pk=user_id)
-        shift = get_object_or_404(Shift, pk=shift_id, event=event)
+        oppgave_slot = get_object_or_404(OppgaveSlot, pk=oppgave_slot_id, event=event)
+        shift = oppgave_slot.shift
 
         if not (event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
@@ -690,9 +711,15 @@ class EventViewSet(viewsets.ModelViewSet):
         if not EventCheckIn.objects.filter(event=event, user=attendee, date=shift.date).exists():
             return Response({"detail": "This person has not checked in today."}, status=status.HTTP_400_BAD_REQUEST)
 
+        if oppgave_slot.assigned_count >= (oppgave_slot.capacity or float("inf")):
+            return Response(
+                {"detail": "Denne oppgaven er full på denne vakten."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             with transaction.atomic():
-                assignment = Assignment.objects.create(shift=shift, user=attendee, confirmed_by=request.user)
+                assignment = Assignment.objects.create(oppgave_slot=oppgave_slot, user=attendee, confirmed_by=request.user)
         except IntegrityError:
             return Response(
                 {"detail": "This person already has a confirmed vakt today."},
@@ -928,22 +955,6 @@ def _would_complete_three_consecutive(user, shift):
     return False
 
 
-def _phase_incompatible(user, shift):
-    """True if the shift has a categorized phase, the user has picked at
-    least one oppgave (Skill), and none of them are allowed in that phase.
-    Blank shift.phase (uncategorized) and a user with zero skills both
-    bypass this check -- see Skill.allowed_in_* and Shift.phase docstrings
-    for why those default to permissive."""
-
-    if not shift.phase:
-        return False
-    skills = list(user.skills.all())
-    if not skills:
-        return False
-    phase_field = f"allowed_in_{shift.phase}"
-    return not any(getattr(skill, phase_field) for skill in skills)
-
-
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.select_related("event", "created_by").prefetch_related("participants", "leaders")
     serializer_class = ShiftSerializer
@@ -976,22 +987,71 @@ class ShiftViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Only an admin can delete this vakt.")
         instance.delete()
 
+    @action(detail=True, methods=["get"], url_path="assignments")
+    def assignments(self, request, pk=None):
+        shift = self.get_object()
+        if not (shift.event.is_admin(request.user) or shift.is_led_by(request.user)):
+            return Response(
+                {"detail": "Only an admin or this vakt's leader can view assignments."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        serializer = AssignmentSerializer(
+            shift.assignments.select_related("user", "confirmed_by"), many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
+
+class OppgaveSlotViewSet(viewsets.ModelViewSet):
+    """Admin-curated (vakt, oppgave) combinations -- see OppgaveSlot.
+    Signup/withdraw/cancel-assignment live here now (moved from
+    ShiftViewSet) since a volunteer expresses interest in a specific
+    oppgave on a vakt, not just the vakt itself."""
+
+    queryset = OppgaveSlot.objects.select_related("event", "shift", "skill")
+    serializer_class = OppgaveSlotSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        event_id = self.request.query_params.get("event")
+        if event_id:
+            queryset = queryset.filter(event_id=event_id)
+        shift_id = self.request.query_params.get("shift")
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        shift = serializer.validated_data["shift"]
+        if not shift.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can add oppgave slots.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not instance.shift.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can remove oppgave slots.")
+        instance.delete()
+
     @action(detail=True, methods=["post"], url_path="signup")
     def signup(self, request, pk=None):
-        """Express interest in this oppgave for its day. A user may hold
-        several candidate signups for the same day — the actual placement
-        is resolved later, at check-in (see EventViewSet._resolve_checkin
-        and .assign). If the oppgave is critical, the caller should ask
-        for has_relevant_experience/experience_notes before submitting."""
+        """Express interest in this oppgave on this vakt. A user may hold
+        several candidate signups for the same day, including more than
+        one oppgave on the same vakt — the actual placement is resolved
+        later, at check-in (see EventViewSet._resolve_checkin and .assign).
+        If the oppgave is critical, the caller should ask for
+        has_relevant_experience/experience_notes before submitting."""
 
-        shift = self.get_object()
+        oppgave_slot = self.get_object()
+        shift = oppgave_slot.shift
         user = request.user
 
-        if shift.is_full:
-            return Response({"detail": "This vakt is full."}, status=status.HTTP_400_BAD_REQUEST)
+        if oppgave_slot.is_full:
+            return Response({"detail": "Denne oppgaven er full på denne vakten."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if ShiftSignup.objects.filter(shift=shift, user=user).exists():
-            return Response({"detail": "Already signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
+        if ShiftSignup.objects.filter(oppgave_slot=oppgave_slot, user=user).exists():
+            return Response(
+                {"detail": "Allerede påmeldt denne oppgaven på denne vakten."}, status=status.HTTP_400_BAD_REQUEST
+            )
 
         conflicting = _conflicting_signup(user, shift)
         if conflicting:
@@ -1006,12 +1066,6 @@ class ShiftViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if _phase_incompatible(user, shift):
-            return Response(
-                {"detail": "Ingen av oppgavene du har krysset av for gjelder denne vakten."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         has_experience = request.data.get("has_relevant_experience")
         if isinstance(has_experience, str):
             has_experience = has_experience.lower() in {"1", "true", "yes", "on"}
@@ -1021,47 +1075,38 @@ class ShiftViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 signup = ShiftSignup.objects.create(
-                    shift=shift,
+                    oppgave_slot=oppgave_slot,
                     user=user,
                     has_relevant_experience=has_experience,
                     experience_notes=request.data.get("experience_notes", ""),
                 )
         except IntegrityError:
-            return Response({"detail": "Already signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Allerede påmeldt denne oppgaven på denne vakten."}, status=status.HTTP_400_BAD_REQUEST
+            )
 
         return Response(ShiftSignupSerializer(signup, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="withdraw")
     def withdraw(self, request, pk=None):
-        shift = self.get_object()
-        deleted, _ = ShiftSignup.objects.filter(shift=shift, user=request.user).delete()
+        oppgave_slot = self.get_object()
+        deleted, _ = ShiftSignup.objects.filter(oppgave_slot=oppgave_slot, user=request.user).delete()
         if not deleted:
-            return Response({"detail": "Not signed up for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(ShiftSerializer(shift, context={"request": request}).data)
+            return Response({"detail": "Not signed up for this oppgave."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(OppgaveSlotSerializer(oppgave_slot, context={"request": request}).data)
 
     @action(detail=True, methods=["post"], url_path="cancel-assignment")
     def cancel_assignment(self, request, pk=None):
         """Let a volunteer cancel their own confirmed assignment to this
         oppgave (plans changed after being placed)."""
 
-        shift = self.get_object()
-        deleted, _ = Assignment.objects.filter(shift=shift, user=request.user).delete()
+        oppgave_slot = self.get_object()
+        deleted, _ = Assignment.objects.filter(oppgave_slot=oppgave_slot, user=request.user).delete()
         if not deleted:
-            return Response({"detail": "You don't have a confirmed assignment for this vakt."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(ShiftSerializer(shift, context={"request": request}).data)
-
-    @action(detail=True, methods=["get"], url_path="assignments")
-    def assignments(self, request, pk=None):
-        shift = self.get_object()
-        if not (shift.event.is_admin(request.user) or shift.is_led_by(request.user)):
             return Response(
-                {"detail": "Only an admin or this vakt's leader can view assignments."},
-                status=status.HTTP_403_FORBIDDEN,
+                {"detail": "You don't have a confirmed assignment for this oppgave."}, status=status.HTTP_400_BAD_REQUEST
             )
-        serializer = AssignmentSerializer(
-            shift.assignments.select_related("user", "confirmed_by"), many=True, context={"request": request}
-        )
-        return Response(serializer.data)
+        return Response(OppgaveSlotSerializer(oppgave_slot, context={"request": request}).data)
 
 
 class ShiftConflictViewSet(viewsets.ModelViewSet):

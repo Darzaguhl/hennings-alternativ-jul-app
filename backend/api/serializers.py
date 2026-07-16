@@ -9,6 +9,7 @@ from .models import (
     EventCheckIn,
     Invite,
     Membership,
+    OppgaveSlot,
     PasswordSetupToken,
     QRCode,
     Shift,
@@ -23,22 +24,13 @@ User = get_user_model()
 class SkillSerializer(serializers.ModelSerializer):
     class Meta:
         model = Skill
-        fields = ["id", "name", "allowed_in_setup", "allowed_in_guest", "allowed_in_teardown"]
+        fields = ["id", "name"]
 
 
 class UserSerializer(serializers.ModelSerializer):
-    skills = SkillSerializer(many=True, read_only=True)
-    skill_ids = serializers.PrimaryKeyRelatedField(
-        source="skills",
-        queryset=Skill.objects.all(),
-        many=True,
-        write_only=True,
-        required=False,
-    )
-
     class Meta:
         model = User
-        fields = ["id", "username", "email", "first_name", "last_name", "skills", "skill_ids", "experience_notes"]
+        fields = ["id", "username", "email", "first_name", "last_name", "experience_notes"]
 
 
 class UserAdminNoteSerializer(serializers.ModelSerializer):
@@ -65,20 +57,17 @@ class RegisterSerializer(serializers.ModelSerializer):
     from. Admins/staff who need to log in to the admin dashboard from
     scratch should supply a password so they can do a real email+password
     login later; omitting it leaves the account with Django's standard
-    unusable-password marker (set_password(None)), not a guessable default."""
+    unusable-password marker (set_password(None)), not a guessable default.
+
+    Oppgave interest is no longer collected here as a blanket skill
+    tag -- it's expressed per (vakt, oppgave) via OppgaveSlotViewSet.signup
+    once the account exists, see PublicEventSerializer."""
 
     password = serializers.CharField(write_only=True, required=False, allow_blank=True, default="")
-    skill_ids = serializers.PrimaryKeyRelatedField(
-        source="skills",
-        queryset=Skill.objects.all(),
-        many=True,
-        write_only=True,
-        required=False,
-    )
 
     class Meta:
         model = User
-        fields = ["id", "email", "password", "skill_ids"]
+        fields = ["id", "email", "password"]
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
@@ -94,15 +83,12 @@ class RegisterSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        skills = validated_data.pop("skills", [])
         password = validated_data.get("password") or None
         user = User.objects.create_user(
             username=validated_data["email"],
             email=validated_data["email"],
             password=password,
         )
-        if skills:
-            user.skills.set(skills)
         return user
 
 
@@ -260,7 +246,6 @@ class PublicShiftSerializer(serializers.ModelSerializer):
             "criticality",
             "is_critical",
             "is_full",
-            "phase",
         ]
         read_only_fields = fields
 
@@ -276,6 +261,21 @@ class PublicShiftConflictSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class PublicOppgaveSlotSerializer(serializers.ModelSerializer):
+    """Safe subset for the public website: which oppgave is offered on
+    which vakt, with how much room is left -- what lets the signup form
+    render "for Vakt 5, here are the oppgaver you can pick"."""
+
+    skill_name = serializers.CharField(source="skill.name", read_only=True)
+    signup_count = serializers.IntegerField(read_only=True)
+    is_full = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = OppgaveSlot
+        fields = ["id", "shift", "skill", "skill_name", "capacity", "signup_count", "is_full"]
+        read_only_fields = fields
+
+
 class PublicEventSerializer(serializers.ModelSerializer):
     """Safe subset for the public website signup page -- no created_by
     (would embed the admin's email/profile), just enough to render a
@@ -285,6 +285,7 @@ class PublicEventSerializer(serializers.ModelSerializer):
 
     shifts = PublicShiftSerializer(many=True, read_only=True)
     conflicts = PublicShiftConflictSerializer(many=True, read_only=True, source="shift_conflicts")
+    oppgave_slots = PublicOppgaveSlotSerializer(many=True, read_only=True)
     signups_open = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -296,6 +297,7 @@ class PublicEventSerializer(serializers.ModelSerializer):
             "date",
             "shifts",
             "conflicts",
+            "oppgave_slots",
             "signup_opens_at",
             "signup_closes_at",
             "signups_open",
@@ -342,7 +344,6 @@ class ShiftSerializer(serializers.ModelSerializer):
             "capacity",
             "min_capacity",
             "criticality",
-            "phase",
             "is_critical",
             "is_understaffed",
             "created_by",
@@ -375,8 +376,38 @@ class ShiftConflictSerializer(serializers.ModelSerializer):
         fields = ["id", "event", "shift_a", "shift_b", "shift_a_title", "shift_b_title"]
 
 
+class OppgaveSlotSerializer(serializers.ModelSerializer):
+    """Admin-facing CRUD for the (vakt, oppgave) combinations an admin
+    curates -- see OppgaveSlot and OppgaveSlotViewSet. skill_name alongside
+    the id, same reasoning as ShiftConflictSerializer's shift_a_title/
+    shift_b_title -- avoids a second lookup in the admin dashboard."""
+
+    skill_name = serializers.CharField(source="skill.name", read_only=True)
+    shift_title = serializers.CharField(source="shift.title", read_only=True)
+    signup_count = serializers.IntegerField(read_only=True)
+    assigned_count = serializers.IntegerField(read_only=True)
+    is_full = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = OppgaveSlot
+        fields = [
+            "id",
+            "event",
+            "shift",
+            "shift_title",
+            "skill",
+            "skill_name",
+            "capacity",
+            "signup_count",
+            "assigned_count",
+            "is_full",
+        ]
+        read_only_fields = ["event"]
+
+
 class ShiftSignupSerializer(serializers.ModelSerializer):
     shift = ShiftSerializer(read_only=True)
+    oppgave_slot = OppgaveSlotSerializer(read_only=True)
     user = UserSerializer(read_only=True)
 
     class Meta:
@@ -384,6 +415,7 @@ class ShiftSignupSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "shift",
+            "oppgave_slot",
             "user",
             "has_relevant_experience",
             "experience_notes",
@@ -403,10 +435,11 @@ class EventCheckInSerializer(serializers.ModelSerializer):
 
 class AssignmentSerializer(serializers.ModelSerializer):
     shift = ShiftSerializer(read_only=True)
+    oppgave_slot = OppgaveSlotSerializer(read_only=True)
     user = UserSerializer(read_only=True)
     confirmed_by = UserSerializer(read_only=True)
 
     class Meta:
         model = Assignment
-        fields = ["id", "shift", "user", "confirmed_by", "confirmed_at"]
+        fields = ["id", "shift", "oppgave_slot", "user", "confirmed_by", "confirmed_at"]
         read_only_fields = fields
