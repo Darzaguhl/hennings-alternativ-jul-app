@@ -27,6 +27,7 @@ from .models import (
     ShiftConflict,
     ShiftSignup,
     Skill,
+    X1Signup,
 )
 from .serializers import (
     AcceptInviteSerializer,
@@ -50,6 +51,7 @@ from .serializers import (
     SkillSerializer,
     UserAdminNoteSerializer,
     UserSerializer,
+    X1SignupSerializer,
 )
 from .throttling import (
     LoginRateThrottle,
@@ -406,15 +408,6 @@ def _checkin_response(attendee, result, request):
     return Response(payload, status=status_code)
 
 
-def _event_year_label(event) -> str:
-    """A stable per-event label for grouping oppgave history by year --
-    falls back to the event's title when it has no date set."""
-
-    if event.date:
-        return str(event.date.year)
-    return event.title
-
-
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated])
 def oppgave_history(request):
@@ -447,7 +440,7 @@ def oppgave_history(request):
     groups: dict = {}
     for slot in slots:
         key = slot.skill_id
-        year = _event_year_label(slot.event)
+        year = slot.event.year_label
         entry = groups.setdefault(
             key, {"title": slot.skill.name, "years": {}, "total_signups": 0, "total_assigned": 0}
         )
@@ -486,10 +479,14 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         # list/retrieve is already restricted (see get_queryset) to either
         # your own record or a roster-viewing admin/staff/leader -- either
-        # way, contact details are appropriate here. Other actions (update,
-        # nested UserSerializer usages elsewhere for shift participants/
-        # pool/assignments) stay on the plain minimal serializer.
-        if self.action in ("list", "retrieve", "me"):
+        # way, contact details are appropriate here. update/partial_update
+        # is included too -- perform_update already restricts writes to
+        # "your own profile only," so this just lets a volunteer actually
+        # edit their own contact fields (the returning-login-then-resubmit
+        # flow on the signup page PATCHes here). Nested UserSerializer
+        # usages elsewhere (shift participants/pool/assignments) stay on
+        # the plain minimal serializer regardless.
+        if self.action in ("list", "retrieve", "me", "update", "partial_update"):
             return MeSerializer
         return UserSerializer
 
@@ -1150,6 +1147,50 @@ class ShiftConflictViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         if not instance.event.is_admin(self.request.user):
             raise PermissionDenied("Only an admin can remove vakt conflicts.")
+        instance.delete()
+
+
+class X1SignupViewSet(viewsets.ModelViewSet):
+    """A volunteer's own opt-in to serve as vaktleder (X1) for an event --
+    see X1Signup's docstring for why this isn't a real time-bound vakt.
+    Eligibility ("minst tre andre vakter, hvorav minst to fra vakt 5-10")
+    is checked once, here, at creation time -- not re-validated later if
+    the volunteer withdraws an underlying vakt signup."""
+
+    queryset = X1Signup.objects.select_related("event", "user")
+    serializer_class = X1SignupSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["get", "post", "delete"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        event_id = self.request.query_params.get("event")
+        if event_id:
+            queryset = queryset.filter(event_id=event_id)
+        if not _is_any_event_admin(self.request.user):
+            queryset = queryset.filter(user=self.request.user)
+        return queryset
+
+    def perform_create(self, serializer):
+        event = serializer.validated_data["event"]
+        user = self.request.user
+        if X1Signup.objects.filter(event=event, user=user).exists():
+            raise ValidationError("Allerede meldt på som vaktleder (X1) for dette arrangementet.")
+        shift_ids = set(
+            ShiftSignup.objects.filter(event=event, user=user).values_list("shift_id", flat=True)
+        )
+        if len(shift_ids) < 3:
+            raise ValidationError("Krever påmelding på minst tre andre vakter.")
+        main_block_count = Shift.objects.filter(
+            id__in=shift_ids, vakt_number__gte=5, vakt_number__lte=10
+        ).count()
+        if main_block_count < 2:
+            raise ValidationError("Krever minst to av vaktene fra vakt 5–10.")
+        serializer.save(user=user)
+
+    def perform_destroy(self, instance):
+        if instance.user != self.request.user and not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("You can only withdraw your own X1 signup.")
         instance.delete()
 
 

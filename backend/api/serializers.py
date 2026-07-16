@@ -17,6 +17,7 @@ from .models import (
     ShiftConflict,
     ShiftSignup,
     Skill,
+    X1Signup,
 )
 
 User = get_user_model()
@@ -45,10 +46,23 @@ class MeSerializer(UserSerializer):
     -- fine for them to see about themselves, and for an admin/staff/leader
     to see on the roster (UserViewSet.list/retrieve is already gated to
     self-or-roster-viewer, see _can_view_roster), but never appropriate in
-    the broadly-shared contexts plain UserSerializer is embedded in."""
+    the broadly-shared contexts plain UserSerializer is embedded in.
+
+    participation_years is derived, not stored -- an Assignment only ever
+    exists once a volunteer both checked in and was placed in an oppgave
+    (see _resolve_checkin), so its mere existence across past events *is*
+    "participated that year." Lets the signup page's returning-volunteer
+    login show real history instead of a self-reported (and easily wrong)
+    field."""
+
+    participation_years = serializers.SerializerMethodField()
 
     class Meta(UserSerializer.Meta):
-        fields = UserSerializer.Meta.fields + ["phone", "address", "birthdate"]
+        fields = UserSerializer.Meta.fields + ["phone", "address", "birthdate", "about", "participation_years"]
+
+    def get_participation_years(self, obj):
+        years = {a.event.year_label for a in obj.assignments.select_related("event")}
+        return sorted(years)
 
 
 class UserAdminNoteSerializer(serializers.ModelSerializer):
@@ -93,10 +107,25 @@ class RegisterSerializer(serializers.ModelSerializer):
     phone = serializers.CharField(required=True)
     address = serializers.CharField(required=True)
     birthdate = serializers.DateField(required=True)
+    # Kvalifikasjoner / "fortell om deg selv" -- unlike the contact fields
+    # above, these are optional: open-ended bio fields, not core identity.
+    experience_notes = serializers.CharField(required=False, allow_blank=True)
+    about = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = User
-        fields = ["id", "email", "password", "first_name", "last_name", "phone", "address", "birthdate"]
+        fields = [
+            "id",
+            "email",
+            "password",
+            "first_name",
+            "last_name",
+            "phone",
+            "address",
+            "birthdate",
+            "experience_notes",
+            "about",
+        ]
 
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
@@ -127,6 +156,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             phone=validated_data["phone"],
             address=validated_data["address"],
             birthdate=validated_data["birthdate"],
+            experience_notes=validated_data.get("experience_notes", ""),
+            about=validated_data.get("about", ""),
         )
         return user
 
@@ -285,6 +316,7 @@ class PublicShiftSerializer(serializers.ModelSerializer):
             "criticality",
             "is_critical",
             "is_full",
+            "vakt_number",
         ]
         read_only_fields = fields
 
@@ -383,6 +415,7 @@ class ShiftSerializer(serializers.ModelSerializer):
             "capacity",
             "min_capacity",
             "criticality",
+            "vakt_number",
             "is_critical",
             "is_understaffed",
             "created_by",
@@ -413,6 +446,17 @@ class ShiftConflictSerializer(serializers.ModelSerializer):
     class Meta:
         model = ShiftConflict
         fields = ["id", "event", "shift_a", "shift_b", "shift_a_title", "shift_b_title"]
+
+
+class X1SignupSerializer(serializers.ModelSerializer):
+    """A volunteer's own opt-in to serve as vaktleder (X1) -- eligibility
+    is checked once at creation time, see X1SignupViewSet.perform_create
+    and X1Signup's docstring."""
+
+    class Meta:
+        model = X1Signup
+        fields = ["id", "event", "user", "created_at"]
+        read_only_fields = ["user", "created_at"]
 
 
 class OppgaveSlotSerializer(serializers.ModelSerializer):

@@ -32,6 +32,7 @@ class User(AbstractUser):
         blank=True,
         help_text="Freeform background: previous experience, education, certifications.",
     )
+    about = models.TextField(blank=True, help_text="Freeform 'tell us about yourself' from signup.")
     admin_notes = models.TextField(
         blank=True,
         help_text="Private notes for admins only, e.g. behavior from previous years. "
@@ -146,6 +147,17 @@ class Event(models.Model):
         if self.signup_closes_at and now > self.signup_closes_at:
             return False
         return True
+
+    @property
+    def year_label(self) -> str:
+        """A stable per-event label for grouping oppgave history/volunteer
+        participation by year -- falls back to the event's title when it
+        has no date set. Shared by oppgave_history and MeSerializer's
+        participation_years, so both group the same way."""
+
+        if self.date:
+            return str(self.date.year)
+        return self.title
 
     def is_owner(self, user) -> bool:
         """Ownership is purely a Membership role -- no permanent fallback
@@ -337,6 +349,13 @@ class Shift(models.Model):
         choices=CRITICALITY_CHOICES,
         default=CRITICALITY_NORMAL,
     )
+    vakt_number = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="The vakt's number, if it's one of the main numbered vakter (e.g. 5 for "
+        "'Vakt 5') -- used for the X1 vaktleder eligibility rule (>=2 of vakt 5-10). "
+        "Blank for non-numbered vakter (lettered prep/teardown ones, etc.).",
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -493,6 +512,28 @@ class ShiftConflict(models.Model):
 
     def __str__(self) -> str:
         return f"{self.shift_a} ↔ {self.shift_b}"
+
+
+class X1Signup(models.Model):
+    """A volunteer's opt-in to serve as vaktleder (X1) for an event -- not
+    a real time-bound vakt (no single date/time of its own; see
+    OppgaveSlot for those), but a leadership role layered on top of a
+    volunteer's other signups for the same event.
+
+    Eligibility ("Kombinasjon med påmelding på minst tre andre vakter, og
+    derav minst to av vaktene fra 5-10") is validated once, at creation
+    time, in X1SignupViewSet.perform_create -- not re-checked afterward if
+    the volunteer later withdraws an underlying vakt signup."""
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="x1_signups")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="x1_signups")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("event", "user")
+
+    def __str__(self) -> str:
+        return f"{self.user} — X1 @ {self.event}"
 
 
 class EventCheckIn(models.Model):

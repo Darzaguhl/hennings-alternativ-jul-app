@@ -4,7 +4,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (EmailTokenObtainPairView, EventViewSet, OppgaveSlotViewSet,
                     QRCodeViewSet, RegisterView, ShiftConflictViewSet,
-                    ShiftViewSet, SkillViewSet, UserViewSet,
+                    ShiftViewSet, SkillViewSet, UserViewSet, X1SignupViewSet,
                     accept_invite, invite_preview, oppgave_history,
                     password_setup_preview, public_event, public_skills,
                     request_password_setup, set_password)
@@ -15,6 +15,7 @@ router.register(r'events', EventViewSet)
 router.register(r'shifts', ShiftViewSet)
 router.register(r'shift-conflicts', ShiftConflictViewSet)
 router.register(r'oppgave-slots', OppgaveSlotViewSet)
+router.register(r'x1-signups', X1SignupViewSet)
 router.register(r'skills', SkillViewSet)
 router.register(r'qrcodes', QRCodeViewSet)
 
