@@ -782,6 +782,26 @@ class OppgaveSlotAdminTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertTrue(OppgaveSlot.objects.filter(pk=slot.pk).exists())
 
+    def test_admin_can_update_a_slots_capacity(self):
+        slot = make_slot(self.shift, skill_name=self.skill.name, capacity=2)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.patch(f"/api/oppgave-slots/{slot.id}/", {"capacity": 5}, format="json")
+        self.assertEqual(response.status_code, 200)
+        slot.refresh_from_db()
+        self.assertEqual(slot.capacity, 5)
+
+    def test_plain_volunteer_cannot_update_a_slot(self):
+        # Regression test: perform_update previously had no override, so
+        # ModelViewSet's default (IsAuthenticated only) let any signed-in
+        # volunteer PATCH another event's oppgave slot.
+        slot = make_slot(self.shift, skill_name=self.skill.name, capacity=2)
+        bystander = User.objects.create_user(username="slot-bystander-3", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.patch(f"/api/oppgave-slots/{slot.id}/", {"capacity": 99}, format="json")
+        self.assertEqual(response.status_code, 403)
+        slot.refresh_from_db()
+        self.assertEqual(slot.capacity, 2)
+
     def test_slot_is_full_once_signup_capacity_reached(self):
         slot = make_slot(self.shift, skill_name=self.skill.name, capacity=1)
         volunteer = User.objects.create_user(username="slot-volunteer", password="pw")

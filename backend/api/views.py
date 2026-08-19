@@ -1035,6 +1035,16 @@ class OppgaveSlotViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Only an admin can add oppgave slots.")
         serializer.save()
 
+    def perform_update(self, serializer):
+        # Was previously unguarded -- ModelViewSet's default perform_update
+        # only requires IsAuthenticated, so any signed-in volunteer (not
+        # just an event admin) could PATCH another event's oppgave slot's
+        # capacity, or even repoint its shift/skill. Same admin-only gate
+        # as perform_create/perform_destroy.
+        if not serializer.instance.shift.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can edit oppgave slots.")
+        serializer.save()
+
     def perform_destroy(self, instance):
         if not instance.shift.event.is_admin(self.request.user):
             raise PermissionDenied("Only an admin can remove oppgave slots.")
