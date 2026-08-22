@@ -212,6 +212,15 @@ if AWS_STORAGE_BUCKET_NAME:
     AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME") or "auto"
     AWS_DEFAULT_ACL = None
     AWS_QUERYSTRING_AUTH = False
+    # AWS_S3_ENDPOINT_URL (e.g. R2's *.r2.cloudflarestorage.com) is the
+    # signed S3 API used for uploads -- it rejects unsigned/anonymous GETs
+    # outright, regardless of any "public bucket" toggle, so it can never
+    # be the URL handed to browsers for displaying a photo. AWS_S3_CUSTOM_DOMAIN
+    # is the actual public-read hostname (R2's "Public Development URL", a
+    # pub-<id>.r2.dev host, or a custom domain attached to the bucket) --
+    # when set, django-storages builds file .url()s from this host instead
+    # of the endpoint. Uploads are unaffected either way.
+    AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_S3_CUSTOM_DOMAIN") or None
 else:
     MEDIA_URL = "media/"
     MEDIA_ROOT = BASE_DIR / "media"
