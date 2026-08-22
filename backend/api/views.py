@@ -631,6 +631,36 @@ class EventViewSet(viewsets.ModelViewSet):
         result = _resolve_checkin(event, attendee, performed_by=request.user)
         return _checkin_response(attendee, result, request)
 
+    @action(detail=True, methods=["post"], url_path="checkin/remove")
+    def remove_checkin(self, request, pk=None):
+        """Undo a check-in -- a mis-scan, or someone leaving before being
+        assigned to anything. Only removes today's (or a given date's)
+        arrival record; never touches ShiftSignup/Assignment history, so
+        the person can be checked back in later without losing their
+        candidate signups."""
+
+        event = self.get_object()
+        if not event.is_checkin_staff(request.user):
+            return Response({"detail": "Only check-in staff can remove a check-in."}, status=status.HTTP_403_FORBIDDEN)
+
+        user_id = request.data.get("user_id")
+        if not user_id:
+            return Response({"detail": "user_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        date_param = request.data.get("date")
+        if date_param:
+            try:
+                target_date = datetime.date.fromisoformat(date_param)
+            except ValueError:
+                return Response({"detail": "date must be YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            target_date = timezone.localdate()
+
+        deleted, _ = EventCheckIn.objects.filter(event=event, user_id=user_id, date=target_date).delete()
+        if not deleted:
+            return Response({"detail": "No check-in found for that user on that date."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=["post"], url_path="self-checkin")
     def self_checkin(self, request, pk=None):
         """Event-QR check-in: the volunteer scans one shared code themselves.
