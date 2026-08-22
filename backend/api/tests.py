@@ -2,6 +2,7 @@ import datetime
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
@@ -13,6 +14,8 @@ from .models import (
     Event,
     EventCheckIn,
     Invite,
+    InventoryCategory,
+    InventoryItem,
     Membership,
     OppgaveSlot,
     PasswordSetupToken,
@@ -938,6 +941,167 @@ class X1SignupTests(TestCase):
         response = self.client.delete(f"/api/x1-signups/{signup.id}/")
         self.assertEqual(response.status_code, 404)
         self.assertTrue(X1Signup.objects.filter(pk=signup.pk).exists())
+
+
+class InventoryCategoryAdminTests(TestCase):
+    """The gift/donation catalogue -- same admin-only-writes gating as
+    Skill (see SkillViewSet's docstring on why this matters: it used to
+    be open to any authenticated user)."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="inv-cat-admin", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.client = APIClient()
+
+    def test_admin_can_create_a_category(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post("/api/inventory-categories/", {"name": "Vinterjakker"}, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(InventoryCategory.objects.filter(name="Vinterjakker").exists())
+
+    def test_plain_volunteer_cannot_create_a_category(self):
+        bystander = User.objects.create_user(username="inv-cat-bystander", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.post("/api/inventory-categories/", {"name": "Leker"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(InventoryCategory.objects.filter(name="Leker").exists())
+
+    def test_admin_cannot_delete_a_category_still_in_use(self):
+        # Regression test: category.on_delete=PROTECT (see InventoryItem's
+        # docstring) used to surface as an unhandled 500 -- perform_destroy
+        # must turn Django's ProtectedError into a clean 400.
+        category = InventoryCategory.objects.create(name="Vinterjakker")
+        InventoryItem.objects.create(event=self.event, category=category, quantity=1)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.delete(f"/api/inventory-categories/{category.id}/")
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(InventoryCategory.objects.filter(pk=category.pk).exists())
+
+    def test_any_authenticated_user_can_list_categories(self):
+        InventoryCategory.objects.create(name="Bøker")
+        bystander = User.objects.create_user(username="inv-cat-bystander-2", password="pw")
+        self.client.force_authenticate(user=bystander)
+        response = self.client.get("/api/inventory-categories/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+
+class InventoryItemTests(TestCase):
+    """Logging intake (direction="in") is open to any authenticated
+    volunteer -- deliberately, since many different teams do this, not
+    just staff. Logging a distribution (direction="out") and
+    editing/deleting any entry are admin-only."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="inv-item-admin", password="pw")
+        self.volunteer = User.objects.create_user(username="inv-item-volunteer", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.category = InventoryCategory.objects.create(name="Vinterjakker")
+        self.client = APIClient()
+
+    def test_any_volunteer_can_log_an_intake_item(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.post(
+            "/api/inventory-items/",
+            {"event": self.event.id, "category": self.category.id, "quantity": 3, "description": "Blå, str M"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        item = InventoryItem.objects.get(pk=response.json()["id"])
+        self.assertEqual(item.direction, InventoryItem.DIRECTION_IN)
+        self.assertEqual(item.quantity, 3)
+        # logged_by is set server-side from the request, not client-supplied
+        self.assertEqual(item.logged_by, self.volunteer)
+
+    def test_plain_volunteer_cannot_log_a_distribution(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.post(
+            "/api/inventory-items/",
+            {"event": self.event.id, "category": self.category.id, "quantity": 1, "direction": "out"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(InventoryItem.objects.filter(event=self.event, direction="out").exists())
+
+    def test_admin_can_log_a_distribution(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post(
+            "/api/inventory-items/",
+            {"event": self.event.id, "category": self.category.id, "quantity": 2, "direction": "out"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_plain_volunteer_cannot_edit_any_entry(self):
+        item = InventoryItem.objects.create(
+            event=self.event, category=self.category, quantity=5, logged_by=self.volunteer
+        )
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.patch(f"/api/inventory-items/{item.id}/", {"quantity": 99}, format="json")
+        self.assertEqual(response.status_code, 403)
+        item.refresh_from_db()
+        self.assertEqual(item.quantity, 5)
+
+    def test_admin_can_edit_and_delete_any_entry(self):
+        item = InventoryItem.objects.create(
+            event=self.event, category=self.category, quantity=5, logged_by=self.volunteer
+        )
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.patch(f"/api/inventory-items/{item.id}/", {"quantity": 7}, format="json")
+        self.assertEqual(response.status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual(item.quantity, 7)
+
+        response = self.client.delete(f"/api/inventory-items/{item.id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(InventoryItem.objects.filter(pk=item.pk).exists())
+
+    def test_summary_nets_in_and_out_per_category(self):
+        other_category = InventoryCategory.objects.create(name="Leker")
+        InventoryItem.objects.create(event=self.event, category=self.category, quantity=10, direction="in")
+        InventoryItem.objects.create(event=self.event, category=self.category, quantity=3, direction="out")
+        InventoryItem.objects.create(event=self.event, category=other_category, quantity=4, direction="in")
+
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.get("/api/inventory-items/summary/", {"event": self.event.id})
+        self.assertEqual(response.status_code, 200)
+        by_category = {row["category_name"]: row for row in response.json()}
+        self.assertEqual(by_category["Vinterjakker"]["in_total"], 10)
+        self.assertEqual(by_category["Vinterjakker"]["out_total"], 3)
+        self.assertEqual(by_category["Vinterjakker"]["net"], 7)
+        self.assertEqual(by_category["Leker"]["net"], 4)
+
+    def test_summary_requires_event_param(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.get("/api/inventory-items/summary/")
+        self.assertEqual(response.status_code, 400)
+
+
+class InventoryIdentifyTests(TestCase):
+    """With ANTHROPIC_API_KEY unset (the test default -- see settings.py),
+    api.vision.identify_item degrades gracefully rather than requiring a
+    real key to pass CI, same contract as the Resend-backed email tests."""
+
+    def setUp(self):
+        self.volunteer = User.objects.create_user(username="inv-identify-volunteer", password="pw")
+        self.client = APIClient()
+
+    def test_identify_without_api_key_returns_empty_suggestion(self):
+        self.client.force_authenticate(user=self.volunteer)
+        photo = SimpleUploadedFile("item.jpg", b"not-a-real-image", content_type="image/jpeg")
+        response = self.client.post("/api/inventory/identify/", {"photo": photo}, format="multipart")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {})
+
+    def test_identify_requires_authentication(self):
+        photo = SimpleUploadedFile("item.jpg", b"not-a-real-image", content_type="image/jpeg")
+        response = self.client.post("/api/inventory/identify/", {"photo": photo}, format="multipart")
+        self.assertEqual(response.status_code, 401)
+
+    def test_identify_requires_a_photo(self):
+        self.client.force_authenticate(user=self.volunteer)
+        response = self.client.post("/api/inventory/identify/", {}, format="multipart")
+        self.assertEqual(response.status_code, 400)
 
 
 class ShiftConflictAdminTests(TestCase):

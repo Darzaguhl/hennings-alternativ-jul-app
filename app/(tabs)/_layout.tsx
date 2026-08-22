@@ -34,6 +34,7 @@ export default function TabsLayout() {
 
   const menuItems = [
     { icon: "id-card-outline", route: "/qrcode" },
+    { icon: "cube-outline", route: "/lager" },
     { icon: "person-outline", route: "/profile" },
   ];
 
@@ -75,7 +76,7 @@ export default function TabsLayout() {
         />
 
         {/* hidden pages */}
-        {["qrcode", "profile"].map((s) => (
+        {["qrcode", "lager", "profile"].map((s) => (
           <Tabs.Screen key={s} name={s} options={{ href: null }} />
         ))}
       </Tabs>
