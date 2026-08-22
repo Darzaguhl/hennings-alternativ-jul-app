@@ -348,6 +348,97 @@ class EventCheckinResolutionTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
 
+class RemoveCheckinTests(TestCase):
+    """Undoing a check-in (a mis-scan, or someone leaving before being
+    assigned) -- the admin dashboard's Pool & tildeling tab needs a way to
+    drop someone off the pool list without touching their signups."""
+
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
+        self.today = datetime.date.today()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.organizer)
+
+    def _checkin(self):
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.today)
+
+    def test_admin_can_remove_a_checkin(self):
+        self._checkin()
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/remove/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(EventCheckIn.objects.filter(event=self.event, user=self.volunteer, date=self.today).exists())
+
+    def test_remove_does_not_touch_signups(self):
+        shift = Shift.objects.create(
+            event=self.event,
+            title="Vertskap",
+            date=self.today,
+            start_time=datetime.time(18, 0),
+            end_time=datetime.time(23, 0),
+            created_by=self.organizer,
+        )
+        slot = make_slot(shift)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.volunteer)
+        self._checkin()
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/remove/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(ShiftSignup.objects.filter(oppgave_slot=slot, user=self.volunteer).exists())
+
+    def test_plain_volunteer_cannot_remove_a_checkin(self):
+        self._checkin()
+        self.client.force_authenticate(user=self.volunteer)
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/remove/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(EventCheckIn.objects.filter(event=self.event, user=self.volunteer, date=self.today).exists())
+
+    def test_removing_a_nonexistent_checkin_returns_404(self):
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/remove/",
+            {"user_id": self.volunteer.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_missing_user_id_is_rejected(self):
+        response = self.client.post(f"/api/events/{self.event.id}/checkin/remove/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_removes_only_the_given_date(self):
+        yesterday = self.today - datetime.timedelta(days=1)
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=yesterday)
+        self._checkin()
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/checkin/remove/",
+            {"user_id": self.volunteer.id, "date": str(self.today)},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(EventCheckIn.objects.filter(event=self.event, user=self.volunteer, date=self.today).exists())
+        self.assertTrue(EventCheckIn.objects.filter(event=self.event, user=self.volunteer, date=yesterday).exists())
+
+
 class SelfCheckinTests(TestCase):
     """Event-QR self check-in: the volunteer scans one shared code, no
     admin scanning involved. Same resolution logic as personal-QR."""
