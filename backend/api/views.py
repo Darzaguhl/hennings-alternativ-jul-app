@@ -2,7 +2,8 @@ import datetime
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
+from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions, status, viewsets
@@ -19,6 +20,8 @@ from .models import (
     Event,
     EventCheckIn,
     Invite,
+    InventoryCategory,
+    InventoryItem,
     Membership,
     OppgaveSlot,
     PasswordSetupToken,
@@ -34,6 +37,8 @@ from .serializers import (
     AssignmentSerializer,
     EmailTokenObtainPairSerializer,
     EventSerializer,
+    InventoryCategorySerializer,
+    InventoryItemSerializer,
     InvitePreviewSerializer,
     InviteSerializer,
     MeSerializer,
@@ -54,11 +59,13 @@ from .serializers import (
     X1SignupSerializer,
 )
 from .throttling import (
+    InventoryIdentifyRateThrottle,
     LoginRateThrottle,
     PasswordSetupConfirmRateThrottle,
     PasswordSetupRequestRateThrottle,
     RegisterRateThrottle,
 )
+from .vision import identify_item
 
 
 @api_view(["GET"])
@@ -1202,6 +1209,134 @@ class X1SignupViewSet(viewsets.ModelViewSet):
         if instance.user != self.request.user and not _is_any_event_admin(self.request.user):
             raise PermissionDenied("You can only withdraw your own X1 signup.")
         instance.delete()
+
+
+class InventoryCategoryViewSet(viewsets.ModelViewSet):
+    """The gift/donation catalogue -- not scoped to a single event, same
+    shape and reasoning as SkillViewSet: list/retrieve stays open to any
+    authenticated volunteer (they need to pick a category when logging an
+    item), writes are admin-only."""
+
+    queryset = InventoryCategory.objects.all()
+    serializer_class = InventoryCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can add inventory categories.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can edit inventory categories.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not _is_any_event_admin(self.request.user):
+            raise PermissionDenied("Only an admin can delete inventory categories.")
+        # InventoryItem.category is on_delete=PROTECT (see its docstring --
+        # deleting a category should never silently take a whole history
+        # of logged items with it), which raises a raw ProtectedError that
+        # would otherwise surface as an unhandled 500. Turn it into a
+        # normal 400 with a message the admin dashboard can show as-is.
+        try:
+            instance.delete()
+        except ProtectedError:
+            raise ValidationError(
+                "Kan ikke slette en kategori som har registrerte gjenstander. Slett eller flytt loggføringene først."
+            )
+
+
+class InventoryItemViewSet(viewsets.ModelViewSet):
+    """A single logged gift/donation movement -- see InventoryItem's
+    docstring. Deliberately more open than most admin-curated data here:
+    logging an *intake* (direction="in") is meant for the many different
+    teams doing inventory, not just staff, mirroring how any signed-up
+    volunteer can act on OppgaveSlotViewSet.signup. Logging a *distribution*
+    (direction="out") and editing/deleting any entry (corrections) are
+    admin-only, same event.is_admin(...) gate OppgaveSlotViewSet uses."""
+
+    queryset = InventoryItem.objects.select_related("category", "logged_by", "event")
+    serializer_class = InventoryItemSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        event_id = self.request.query_params.get("event")
+        if event_id:
+            queryset = queryset.filter(event_id=event_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        event = serializer.validated_data["event"]
+        direction = serializer.validated_data.get("direction", InventoryItem.DIRECTION_IN)
+        if direction == InventoryItem.DIRECTION_OUT and not event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can log inventory given out.")
+        serializer.save(logged_by=self.request.user)
+
+    def perform_update(self, serializer):
+        if not serializer.instance.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can edit inventory entries.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not instance.event.is_admin(self.request.user):
+            raise PermissionDenied("Only an admin can delete inventory entries.")
+        instance.delete()
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """Net stock per category (in-total minus out-total) for an event
+        -- computed on read via aggregation, not a running counter, so a
+        later-corrected or deleted entry can never leave the total out of
+        sync. Requires ?event=; mirrors the query-param filtering already
+        used everywhere else on this viewset rather than being its own
+        nested route."""
+
+        event_id = request.query_params.get("event")
+        if not event_id:
+            return Response({"detail": "event is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        rows = (
+            self.get_queryset()
+            .filter(event_id=event_id)
+            .values("category_id", "category__name")
+            .annotate(
+                in_total=Sum("quantity", filter=Q(direction=InventoryItem.DIRECTION_IN), default=0),
+                out_total=Sum("quantity", filter=Q(direction=InventoryItem.DIRECTION_OUT), default=0),
+            )
+            .order_by("category__name")
+        )
+        return Response(
+            [
+                {
+                    "category": row["category_id"],
+                    "category_name": row["category__name"],
+                    "in_total": row["in_total"],
+                    "out_total": row["out_total"],
+                    "net": row["in_total"] - row["out_total"],
+                }
+                for row in rows
+            ]
+        )
+
+
+@api_view(["POST"])
+@permission_classes([permissions.IsAuthenticated])
+@throttle_classes([InventoryIdentifyRateThrottle])
+def identify_inventory_photo(request):
+    """Best-effort AI suggestion for a photo of a donated item -- see
+    api.vision.identify_item. Deliberately does not touch InventoryItem at
+    all: this is a preview step, not a save. The photo is uploaded again
+    as part of the actual POST /api/inventory-items/ call, which is what
+    persists it (see the mobile app's Lager screen)."""
+
+    photo = request.FILES.get("photo")
+    if not photo:
+        return Response({"detail": "photo is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    suggestion = identify_item(photo.read(), media_type=photo.content_type or "image/jpeg")
+    return Response(suggestion)
 
 
 class QRCodeViewSet(viewsets.ModelViewSet):

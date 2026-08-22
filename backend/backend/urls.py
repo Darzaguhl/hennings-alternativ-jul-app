@@ -14,6 +14,8 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.db import connection
 from django.db.utils import OperationalError
@@ -43,3 +45,11 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include("api.urls")),
 ]
+
+# Only relevant when AWS_STORAGE_BUCKET_NAME is unset (local dev/tests,
+# see settings.py) -- with S3-compatible storage configured, uploaded
+# files are served directly from the bucket, not through Django at all.
+# Django's runserver doesn't serve MEDIA_URL on its own, unlike
+# STATIC_URL/staticfiles (handled separately by whitenoise).
+if settings.DEBUG and not settings.AWS_STORAGE_BUCKET_NAME:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

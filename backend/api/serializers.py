@@ -9,6 +9,8 @@ from .models import (
     Event,
     EventCheckIn,
     Invite,
+    InventoryCategory,
+    InventoryItem,
     Membership,
     OppgaveSlot,
     PasswordSetupToken,
@@ -457,6 +459,41 @@ class X1SignupSerializer(serializers.ModelSerializer):
         model = X1Signup
         fields = ["id", "event", "user", "created_at"]
         read_only_fields = ["user", "created_at"]
+
+
+class InventoryCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InventoryCategory
+        fields = ["id", "name"]
+
+
+class InventoryItemSerializer(serializers.ModelSerializer):
+    """A single logged gift/donation movement -- see InventoryItem's
+    docstring for the in/out and quantity-is-always-human-confirmed
+    reasoning. category_name/logged_by_email alongside the ids, same
+    reasoning as OppgaveSlotSerializer's skill_name -- avoids a second
+    lookup in the admin dashboard and the app."""
+
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    logged_by_email = serializers.CharField(source="logged_by.email", read_only=True, default=None)
+
+    class Meta:
+        model = InventoryItem
+        fields = [
+            "id",
+            "event",
+            "category",
+            "category_name",
+            "description",
+            "quantity",
+            "direction",
+            "photo",
+            "logged_by",
+            "logged_by_email",
+            "note",
+            "created_at",
+        ]
+        read_only_fields = ["logged_by", "created_at"]
 
 
 class OppgaveSlotSerializer(serializers.ModelSerializer):

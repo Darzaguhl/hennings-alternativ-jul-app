@@ -536,6 +536,74 @@ class X1Signup(models.Model):
         return f"{self.user} — X1 @ {self.event}"
 
 
+class InventoryCategory(models.Model):
+    """The gift/donation catalogue -- category names like "Vinterjakker" or
+    "Leker". Same shape and role as Skill (the oppgave catalogue): a
+    small, admin-curated list, not scoped to a single event, so it doesn't
+    need re-creating year to year."""
+
+    name = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "Inventory categories"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class InventoryItem(models.Model):
+    """One logged gift/donation movement -- either DIRECTION_IN (a team
+    inventorying what's arrived) or DIRECTION_OUT (something given away
+    during the night, e.g. via a rally/game). Net stock per category is
+    in-total minus out-total, computed on read (see
+    InventoryItemViewSet.summary) rather than tracked as a running counter,
+    so a corrected/deleted entry can never leave the total out of sync.
+
+    quantity is always human-confirmed -- even when an AI suggestion seeds
+    the form (see api.vision.identify_item), counting an irregular pile of
+    donated goods from one photo is not reliable, so nothing here is ever
+    saved from that suggestion without a person having seen and could-edit
+    the number first.
+
+    photo is the volunteer's actual photo of the item(s), kept (not just
+    used transiently for identification) so an admin reviewing the log can
+    see what was actually logged -- see Gotchas in CLAUDE.md for why this
+    needs real object storage configured, not Render's own disk."""
+
+    DIRECTION_IN = "in"
+    DIRECTION_OUT = "out"
+    DIRECTION_CHOICES = (
+        (DIRECTION_IN, "Inn (mottatt)"),
+        (DIRECTION_OUT, "Ut (gitt bort)"),
+    )
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="inventory_items")
+    # PROTECT, not CASCADE (unlike Skill -> OppgaveSlot): this is a ledger
+    # of real donations received/given away, so deleting a category should
+    # never silently take a whole history of logged items with it.
+    category = models.ForeignKey(InventoryCategory, on_delete=models.PROTECT, related_name="items")
+    description = models.CharField(max_length=255, blank=True)
+    quantity = models.PositiveIntegerField(default=1)
+    direction = models.CharField(max_length=3, choices=DIRECTION_CHOICES, default=DIRECTION_IN)
+    photo = models.ImageField(upload_to="inventory/%Y/%m/", blank=True, null=True)
+    # SET_NULL, not CASCADE: losing a volunteer's account shouldn't delete
+    # the inventory records they logged -- same reasoning as other
+    # "who did this" fields elsewhere (e.g. Shift.created_by).
+    logged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="inventory_items_logged"
+    )
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        sign = "+" if self.direction == self.DIRECTION_IN else "-"
+        return f"{sign}{self.quantity} {self.category} @ {self.event}"
+
+
 class EventCheckIn(models.Model):
     """Marks that a user has physically arrived at the event today.
 

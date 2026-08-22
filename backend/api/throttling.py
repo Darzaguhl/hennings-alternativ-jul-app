@@ -1,4 +1,4 @@
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 
 class RegisterRateThrottle(AnonRateThrottle):
@@ -30,3 +30,12 @@ class PasswordSetupConfirmRateThrottle(AnonRateThrottle):
     rather than brute-forcing it."""
 
     scope = "password_setup_confirm"
+
+
+class InventoryIdentifyRateThrottle(UserRateThrottle):
+    """Each call spends a real Anthropic API request. Unlike the throttles
+    above, this endpoint is already behind IsAuthenticated, so it's keyed
+    per-user (UserRateThrottle) rather than per-IP -- several volunteers on
+    the same venue wifi shouldn't share one limit."""
+
+    scope = "inventory_identify"

@@ -2,12 +2,13 @@ from django.urls import include, path
 from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from .views import (EmailTokenObtainPairView, EventViewSet, OppgaveSlotViewSet,
+from .views import (EmailTokenObtainPairView, EventViewSet, InventoryCategoryViewSet,
+                    InventoryItemViewSet, OppgaveSlotViewSet,
                     QRCodeViewSet, RegisterView, ShiftConflictViewSet,
                     ShiftViewSet, SkillViewSet, UserViewSet, X1SignupViewSet,
-                    accept_invite, invite_preview, oppgave_history,
-                    password_setup_preview, public_event, public_skills,
-                    request_password_setup, set_password)
+                    accept_invite, identify_inventory_photo, invite_preview,
+                    oppgave_history, password_setup_preview, public_event,
+                    public_skills, request_password_setup, set_password)
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet)
@@ -17,6 +18,8 @@ router.register(r'shift-conflicts', ShiftConflictViewSet)
 router.register(r'oppgave-slots', OppgaveSlotViewSet)
 router.register(r'x1-signups', X1SignupViewSet)
 router.register(r'skills', SkillViewSet)
+router.register(r'inventory-categories', InventoryCategoryViewSet)
+router.register(r'inventory-items', InventoryItemViewSet)
 router.register(r'qrcodes', QRCodeViewSet)
 
 urlpatterns = [
@@ -46,6 +49,11 @@ urlpatterns = [
     # Admin: cross-event history (signups vs. actual fill, for gauging
     # how much to oversubscribe per oppgave to cover no-shows)
     path('metrics/oppgave-history/', oppgave_history, name='oppgave-history'),
+
+    # Best-effort AI suggestion for a donated-item photo -- see
+    # api.vision.identify_item. Doesn't save anything; the actual record
+    # is created via POST inventory-items/ below.
+    path('inventory/identify/', identify_inventory_photo, name='inventory-identify'),
 
     # DRF router endpoints
     path('', include(router.urls)),  # this exposes /users/, /events/, /shifts/, /skills/, /qrcodes/

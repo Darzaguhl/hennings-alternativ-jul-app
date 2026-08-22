@@ -75,6 +75,7 @@ REST_FRAMEWORK = {
         "login": "20/hour",
         "password_setup_request": "5/hour",
         "password_setup_confirm": "20/hour",
+        "inventory_identify": "30/hour",
     },
 }
 
@@ -184,11 +185,36 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+# Media (user-uploaded files, e.g. InventoryItem.photo) -- S3-compatible
+# object storage when configured (works with Cloudflare R2, AWS S3, or any
+# other S3-compatible provider via AWS_S3_ENDPOINT_URL), since Render's own
+# disk is not persistent across deploys and would silently lose uploads.
+# Falls back to local disk when AWS_STORAGE_BUCKET_NAME is unset -- fine
+# for local dev/tests, NOT fine for production (a deploy would drop
+# whatever was uploaded). See AWS_* settings below.
+AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME") or ""
+
 STORAGES = {
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
+    "default": (
+        {"BACKEND": "storages.backends.s3.S3Storage"}
+        if AWS_STORAGE_BUCKET_NAME
+        else {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    ),
 }
+
+if AWS_STORAGE_BUCKET_NAME:
+    AWS_S3_ENDPOINT_URL = os.environ.get("AWS_S3_ENDPOINT_URL") or None
+    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") or ""
+    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") or ""
+    AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME") or "auto"
+    AWS_DEFAULT_ACL = None
+    AWS_QUERYSTRING_AUTH = False
+else:
+    MEDIA_URL = "media/"
+    MEDIA_ROOT = BASE_DIR / "media"
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -206,6 +232,13 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # indication why. `or` treats blank the same as unset.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY") or ""
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL") or "Hennings Alternativ Jul <onboarding@resend.dev>"
+
+# Anthropic (AI item identification for inventory photos) -- same
+# unset-means-skip contract as RESEND_API_KEY: api.vision.identify_item
+# returns an empty suggestion rather than raising when this is blank, so
+# local dev/tests never need a real key, and the feature degrades to
+# manual-only entry rather than breaking.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or ""
 
 # Base URL of the admin dashboard for this environment, used to build the
 # link in invite emails. Differs between preprod/prod, so it's env-driven
