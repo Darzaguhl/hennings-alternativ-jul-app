@@ -1,0 +1,28 @@
+name: Keep database warm
+
+# Supabase's free tier pauses a project after 7 days with no API activity.
+# /health/ runs a real `SELECT 1` against the database (see
+# backend/backend/urls.py), so pinging it periodically counts as genuine
+# activity and keeps the project from pausing. Add prod's URL to the list
+# below once it's available -- no other changes needed.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        url:
+          - https://hennings-alternativ-jul-api-preprod.onrender.com/health/
+    steps:
+      - name: Ping health endpoint
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "${{ matrix.url }}")
+          echo "GET ${{ matrix.url }} -> $status"
+          if [ "$status" -ge 500 ]; then
+            echo "::error::Health check failed with status $status"
+            exit 1
+          fi
