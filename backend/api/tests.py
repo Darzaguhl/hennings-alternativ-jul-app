@@ -21,6 +21,7 @@ from .models import (
     OppgaveSlot,
     PasswordSetupToken,
     QRCode,
+    Rating,
     Shift,
     ShiftConflict,
     ShiftSignup,
@@ -3160,3 +3161,258 @@ class CommendationTests(TestCase):
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.get("/api/commendations/").status_code, 401)
 
+
+class RatingTests(TestCase):
+    """Post-event ratings: per person, per vakt, per leader. Strictly
+    internal -- the rated volunteer (or anyone who isn't an admin, the
+    rater, or -- when the event allows it -- a fellow leader of that vakt)
+    must never be able to read one."""
+
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        self.co_leader = User.objects.create_user(username="co_leader", password="pw")
+        self.other_leader = User.objects.create_user(username="other_leader", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw", first_name="Kari", last_name="Nordmann")
+        self.bystander = User.objects.create_user(username="bystander", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
+        today = datetime.date.today()
+        self.shift = Shift.objects.create(
+            event=self.event, title="Kjøkken", date=today,
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        self.second_shift = Shift.objects.create(
+            event=self.event, title="Vertskap", date=today + datetime.timedelta(days=1),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        self.shift.leaders.add(self.leader, self.co_leader)
+        self.second_shift.leaders.add(self.other_leader)
+        self.slot = make_slot(self.shift, skill_name="Kokk")
+        self.second_slot = make_slot(self.second_shift, skill_name="Vert")
+        Assignment.objects.create(oppgave_slot=self.slot, user=self.volunteer, confirmed_by=self.organizer)
+        Assignment.objects.create(oppgave_slot=self.second_slot, user=self.volunteer, confirmed_by=self.organizer)
+        self.client = APIClient()
+
+    def _rate(self, as_user, shift=None, user=None, **extra):
+        self.client.force_authenticate(user=as_user)
+        body = {"shift": (shift or self.shift).id, "user": (user or self.volunteer).id, "level": "god", **extra}
+        return self.client.post("/api/ratings/", body, format="json")
+
+    def _list(self, as_user, query=""):
+        self.client.force_authenticate(user=as_user)
+        response = self.client.get(f"/api/ratings/{query}")
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def test_leader_can_rate_someone_assigned_on_their_vakt(self):
+        response = self._rate(self.leader, level="utmerket", note="Ledet kjøkkenet")
+
+        self.assertEqual(response.status_code, 201)
+        rating = Rating.objects.get()
+        self.assertEqual(rating.user, self.volunteer)
+        self.assertEqual(rating.rated_by, self.leader)
+        self.assertEqual(rating.event, self.event)
+        self.assertEqual(rating.oppgave_slot, self.slot)
+        self.assertEqual(rating.level, "utmerket")
+        self.assertEqual(response.data["user_name"], "Kari Nordmann")
+        self.assertEqual(response.data["skill_name"], "Kokk")
+
+    def test_admin_can_rate_on_any_vakt(self):
+        self.assertEqual(self._rate(self.organizer, shift=self.second_shift).status_code, 201)
+
+    def test_client_cannot_set_rated_by_or_event(self):
+        response = self._rate(self.leader, rated_by=self.organizer.id, event=999)
+
+        self.assertEqual(response.status_code, 201)
+        rating = Rating.objects.get()
+        self.assertEqual(rating.rated_by, self.leader)
+        self.assertEqual(rating.event, self.event)
+
+    def test_leader_cannot_rate_on_a_vakt_they_do_not_lead(self):
+        response = self._rate(self.other_leader, shift=self.shift)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Rating.objects.exists())
+
+    def test_plain_volunteer_cannot_rate(self):
+        self.assertEqual(self._rate(self.bystander).status_code, 403)
+
+    def test_cannot_rate_someone_not_assigned_to_the_vakt(self):
+        response = self._rate(self.leader, user=self.bystander)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Rating.objects.exists())
+
+    def test_cannot_rate_yourself(self):
+        Assignment.objects.create(
+            oppgave_slot=make_slot(self.shift, skill_name="Oppvask"), user=self.leader, confirmed_by=self.organizer
+        )
+        self.assertEqual(self._rate(self.leader, user=self.leader).status_code, 400)
+
+    def test_invalid_level_rejected(self):
+        self.assertEqual(self._rate(self.leader, level="fantastisk").status_code, 400)
+
+    def test_level_is_required(self):
+        self.client.force_authenticate(user=self.leader)
+        response = self.client.post(
+            "/api/ratings/", {"shift": self.shift.id, "user": self.volunteer.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_bekymring_requires_a_note(self):
+        self.assertEqual(self._rate(self.leader, level="bekymring").status_code, 400)
+        self.assertEqual(self._rate(self.leader, level="bekymring", note="   ").status_code, 400)
+        self.assertFalse(Rating.objects.exists())
+
+        response = self._rate(self.leader, level="bekymring", note="Dukket ikke opp til oppvasken")
+        self.assertEqual(response.status_code, 201)
+
+    def test_other_levels_do_not_require_a_note(self):
+        for level in ("utmerket", "god", "ok"):
+            Rating.objects.all().delete()
+            self.assertEqual(self._rate(self.leader, level=level).status_code, 201, level)
+
+    def test_one_rating_per_leader_per_vakt(self):
+        self.assertEqual(self._rate(self.leader).status_code, 201)
+
+        self.assertEqual(self._rate(self.leader, level="ok").status_code, 400)
+        self.assertEqual(Rating.objects.count(), 1)
+
+    def test_two_leaders_of_same_vakt_can_each_rate(self):
+        self.assertEqual(self._rate(self.leader).status_code, 201)
+        self.assertEqual(self._rate(self.co_leader, level="ok").status_code, 201)
+
+        self.assertEqual(Rating.objects.count(), 2)
+
+    def test_same_person_can_be_rated_on_two_vakter_by_different_leaders(self):
+        self.assertEqual(self._rate(self.leader).status_code, 201)
+        self.assertEqual(self._rate(self.other_leader, shift=self.second_shift, level="utmerket").status_code, 201)
+
+        self.assertEqual(Rating.objects.filter(user=self.volunteer).count(), 2)
+
+    def test_rated_volunteer_cannot_see_their_own_rating(self):
+        self._rate(self.leader)
+
+        self.assertEqual(self._list(self.volunteer), [])
+        self.client.force_authenticate(user=self.volunteer)
+        rating = Rating.objects.get()
+        self.assertEqual(self.client.get(f"/api/ratings/{rating.id}/").status_code, 404)
+
+    def test_bystander_sees_nothing(self):
+        self._rate(self.leader)
+        self.assertEqual(self._list(self.bystander), [])
+
+    def test_admin_sees_all_ratings(self):
+        self._rate(self.leader)
+        self._rate(self.other_leader, shift=self.second_shift)
+
+        self.assertEqual(len(self._list(self.organizer)), 2)
+
+    def test_leader_sees_only_own_by_default(self):
+        self._rate(self.leader)
+        self._rate(self.co_leader, level="ok")
+        self._rate(self.other_leader, shift=self.second_shift)
+
+        rows = self._list(self.leader)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rated_by_email"], self.leader.email)
+
+    def test_team_visibility_shows_fellow_leaders_ratings_on_own_vakt_only(self):
+        self._rate(self.leader)
+        self._rate(self.co_leader, level="ok")
+        self._rate(self.other_leader, shift=self.second_shift)
+        self.event.rating_visibility = Event.RATING_VISIBILITY_TEAM
+        self.event.save()
+
+        rows = self._list(self.leader)
+        self.assertEqual({r["shift"] for r in rows}, {self.shift.id})
+        self.assertEqual(len(rows), 2)
+
+    def test_team_visibility_does_not_expose_ratings_to_the_volunteer(self):
+        self._rate(self.leader)
+        self.event.rating_visibility = Event.RATING_VISIBILITY_TEAM
+        self.event.save()
+
+        self.assertEqual(self._list(self.volunteer), [])
+
+    def test_list_filters(self):
+        self._rate(self.leader)
+        self._rate(self.other_leader, shift=self.second_shift)
+
+        self.assertEqual(len(self._list(self.organizer, f"?shift={self.second_shift.id}")), 1)
+        self.assertEqual(len(self._list(self.organizer, f"?user={self.volunteer.id}")), 2)
+        self.assertEqual(len(self._list(self.organizer, f"?event={self.event.id}")), 2)
+
+    def test_author_can_edit_level_and_note(self):
+        rating_id = self._rate(self.leader).data["id"]
+
+        response = self.client.patch(f"/api/ratings/{rating_id}/", {"level": "utmerket", "note": "Bedre enn først antatt"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        rating = Rating.objects.get()
+        self.assertEqual((rating.level, rating.note), ("utmerket", "Bedre enn først antatt"))
+
+    def test_editing_to_bekymring_without_note_rejected(self):
+        rating_id = self._rate(self.leader).data["id"]
+
+        response = self.client.patch(f"/api/ratings/{rating_id}/", {"level": "bekymring"}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Rating.objects.get().level, "god")
+
+    def test_clearing_note_on_a_bekymring_rejected(self):
+        rating_id = self._rate(self.leader, level="bekymring", note="Kom for sent").data["id"]
+
+        response = self.client.patch(f"/api/ratings/{rating_id}/", {"note": ""}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Rating.objects.get().note, "Kom for sent")
+
+    def test_cannot_retarget_a_rating(self):
+        rating_id = self._rate(self.leader).data["id"]
+
+        response = self.client.patch(f"/api/ratings/{rating_id}/", {"user": self.bystander.id}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Rating.objects.get().user, self.volunteer)
+
+    def test_other_leader_cannot_edit_or_delete_even_if_they_can_see_it(self):
+        rating_id = self._rate(self.leader).data["id"]
+        self.event.rating_visibility = Event.RATING_VISIBILITY_TEAM
+        self.event.save()
+
+        self.client.force_authenticate(user=self.co_leader)
+        self.assertEqual(self.client.patch(f"/api/ratings/{rating_id}/", {"level": "ok"}, format="json").status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/ratings/{rating_id}/").status_code, 403)
+        self.assertEqual(Rating.objects.get().level, "god")
+
+    def test_author_and_admin_can_delete(self):
+        first = self._rate(self.leader).data["id"]
+        second = self._rate(self.co_leader).data["id"]
+
+        self.client.force_authenticate(user=self.leader)
+        self.assertEqual(self.client.delete(f"/api/ratings/{first}/").status_code, 204)
+        self.client.force_authenticate(user=self.organizer)
+        self.assertEqual(self.client.delete(f"/api/ratings/{second}/").status_code, 204)
+        self.assertFalse(Rating.objects.exists())
+
+    def test_rating_survives_assignment_removal(self):
+        self._rate(self.leader)
+        Assignment.objects.filter(user=self.volunteer, oppgave_slot=self.slot).delete()
+
+        self.assertEqual(Rating.objects.count(), 1)
+
+    def test_rating_visibility_is_an_admin_editable_event_setting(self):
+        self.client.force_authenticate(user=self.organizer)
+        response = self.client.patch(f"/api/events/{self.event.id}/", {"rating_visibility": "team"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.rating_visibility, "team")
+
+        self.client.force_authenticate(user=self.leader)
+        response = self.client.patch(f"/api/events/{self.event.id}/", {"rating_visibility": "own"}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_unauthenticated_gets_401(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/ratings/").status_code, 401)
