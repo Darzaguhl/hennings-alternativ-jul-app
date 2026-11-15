@@ -17,6 +17,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from .email import send_invite_email, send_password_setup_email
 from .models import (
     Assignment,
+    Commendation,
     Event,
     EventCheckIn,
     Invite,
@@ -35,6 +36,7 @@ from .models import (
 from .serializers import (
     AcceptInviteSerializer,
     AssignmentSerializer,
+    CommendationSerializer,
     EmailTokenObtainPairSerializer,
     EventSerializer,
     InventoryCategorySerializer,
@@ -1414,4 +1416,66 @@ class SkillViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         if not _is_any_event_admin(self.request.user):
             raise PermissionDenied("Only an admin can delete oppgaver.")
+        instance.delete()
+
+
+class CommendationViewSet(viewsets.ModelViewSet):
+    """Leaders' "fremhev" flags -- see Commendation. Internal only: the
+    queryset is scoped to event admins (everything on their events) and to
+    each leader's own flags, so a flagged volunteer -- or any other
+    volunteer -- gets an empty list, never someone's flag on them.
+
+    A leader can flag only someone with a confirmed Assignment on a vakt
+    they lead (admins: anyone assigned on their event's vakter). Flags are
+    raised during the event, so there's no date window enforced here."""
+
+    serializer_class = CommendationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        user = self.request.user
+        admin_event_ids = Membership.objects.filter(
+            user=user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]
+        ).values("event_id")
+        queryset = Commendation.objects.select_related(
+            "user", "flagged_by", "shift", "oppgave_slot__skill"
+        ).filter(Q(event_id__in=admin_event_ids) | Q(flagged_by=user))
+
+        params = self.request.query_params
+        for param, field in (("event", "event_id"), ("shift", "shift_id"), ("user", "user_id")):
+            value = params.get(param)
+            if value:
+                queryset = queryset.filter(**{field: value})
+        return queryset
+
+    def perform_create(self, serializer):
+        shift = serializer.validated_data["shift"]
+        person = serializer.validated_data["user"]
+        requester = self.request.user
+
+        if not (shift.event.is_admin(requester) or shift.is_led_by(requester)):
+            raise PermissionDenied("Only an admin or this vakt's leader can flag someone.")
+        if person.pk == requester.pk:
+            raise ValidationError("You can't flag yourself.")
+
+        assignment = Assignment.objects.filter(shift=shift, user=person).select_related("oppgave_slot").first()
+        if not assignment:
+            raise ValidationError("That person isn't assigned to this vakt.")
+
+        serializer.save(event=shift.event, oppgave_slot=assignment.oppgave_slot, flagged_by=requester)
+
+    def perform_update(self, serializer):
+        flag = serializer.instance
+        if not (flag.event.is_admin(self.request.user) or flag.flagged_by_id == self.request.user.pk):
+            raise PermissionDenied("Only an admin or the leader who flagged them can edit this.")
+        # Only the note is editable -- who/where the flag is about is fixed
+        # at creation, so a flag can't be re-pointed at someone else.
+        if set(serializer.validated_data) - {"note"}:
+            raise ValidationError("Only the note can be changed.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not (instance.event.is_admin(self.request.user) or instance.flagged_by_id == self.request.user.pk):
+            raise PermissionDenied("Only an admin or the leader who flagged them can remove this.")
         instance.delete()

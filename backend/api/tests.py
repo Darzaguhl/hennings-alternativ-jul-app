@@ -11,6 +11,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     Assignment,
+    Commendation,
     Event,
     EventCheckIn,
     Invite,
@@ -2989,3 +2990,173 @@ class PublicSkillsEndpointTests(TestCase):
         response = self.client.get("/api/public/skills/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, [])
+
+
+class CommendationTests(TestCase):
+    """Leaders' "fremhev" flags: raised during the event on someone
+    confirmed onto a vakt they lead, strictly internal -- the flagged
+    volunteer (or anyone who isn't an admin or the flag's author) must
+    never be able to read it."""
+
+    def setUp(self):
+        self.organizer = User.objects.create_user(username="organizer", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        self.other_leader = User.objects.create_user(username="other_leader", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw", first_name="Kari", last_name="Nordmann")
+        self.bystander = User.objects.create_user(username="bystander", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.organizer)
+        today = datetime.date.today()
+        self.shift = Shift.objects.create(
+            event=self.event, title="Kjøkken", date=today,
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        self.other_shift = Shift.objects.create(
+            event=self.event, title="Vertskap", date=today,
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.organizer,
+        )
+        self.shift.leaders.add(self.leader)
+        self.other_shift.leaders.add(self.other_leader)
+        self.slot = make_slot(self.shift, skill_name="Kokk")
+        self.other_slot = make_slot(self.other_shift, skill_name="Vert")
+        Assignment.objects.create(oppgave_slot=self.slot, user=self.volunteer, confirmed_by=self.organizer)
+        self.client = APIClient()
+
+    def _flag(self, as_user, shift=None, user=None, **extra):
+        self.client.force_authenticate(user=as_user)
+        return self.client.post(
+            "/api/commendations/",
+            {"shift": (shift or self.shift).id, "user": (user or self.volunteer).id, **extra},
+            format="json",
+        )
+
+    def test_leader_can_flag_someone_assigned_on_their_vakt(self):
+        response = self._flag(self.leader, note="Tok initiativ")
+
+        self.assertEqual(response.status_code, 201)
+        flag = Commendation.objects.get()
+        self.assertEqual(flag.user, self.volunteer)
+        self.assertEqual(flag.flagged_by, self.leader)
+        self.assertEqual(flag.event, self.event)
+        self.assertEqual(flag.oppgave_slot, self.slot)
+        self.assertEqual(flag.note, "Tok initiativ")
+        self.assertEqual(response.data["user_name"], "Kari Nordmann")
+        self.assertEqual(response.data["skill_name"], "Kokk")
+
+    def test_client_cannot_set_flagged_by_or_event(self):
+        response = self._flag(self.leader, flagged_by=self.organizer.id, event=999)
+
+        self.assertEqual(response.status_code, 201)
+        flag = Commendation.objects.get()
+        self.assertEqual(flag.flagged_by, self.leader)
+        self.assertEqual(flag.event, self.event)
+
+    def test_leader_cannot_flag_on_a_vakt_they_do_not_lead(self):
+        response = self._flag(self.other_leader, shift=self.shift)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Commendation.objects.exists())
+
+    def test_plain_volunteer_cannot_flag(self):
+        response = self._flag(self.bystander)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_cannot_flag_someone_not_assigned_to_the_vakt(self):
+        response = self._flag(self.leader, user=self.bystander)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Commendation.objects.exists())
+
+    def test_cannot_flag_yourself(self):
+        Assignment.objects.create(
+            oppgave_slot=make_slot(self.shift, skill_name="Servering"), user=self.leader, confirmed_by=self.organizer
+        )
+
+        response = self._flag(self.leader, user=self.leader)
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_admin_can_flag_anyone_assigned_on_their_event(self):
+        response = self._flag(self.organizer)
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_flagged_volunteer_cannot_see_their_own_flag(self):
+        self._flag(self.leader)
+        flag = Commendation.objects.get()
+        self.client.force_authenticate(user=self.volunteer)
+
+        self.assertEqual(self.client.get("/api/commendations/").data, [])
+        self.assertEqual(self.client.get(f"/api/commendations/{flag.id}/").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/commendations/?user={self.volunteer.id}").data, [])
+
+    def test_flag_is_not_exposed_through_the_users_endpoint(self):
+        self._flag(self.leader, note="Hemmelig")
+        self.client.force_authenticate(user=self.volunteer)
+
+        me = self.client.get("/api/users/me/")
+
+        self.assertNotIn("Hemmelig", str(me.data))
+        self.assertNotIn("commendation", str(me.data).lower())
+
+    def test_a_different_leader_cannot_see_someone_elses_flag(self):
+        self._flag(self.leader)
+        self.client.force_authenticate(user=self.other_leader)
+
+        self.assertEqual(self.client.get("/api/commendations/").data, [])
+
+    def test_leader_sees_only_their_own_flags_and_admin_sees_all(self):
+        self._flag(self.leader)
+        self._flag(self.organizer)
+
+        self.client.force_authenticate(user=self.leader)
+        self.assertEqual(len(self.client.get("/api/commendations/").data), 1)
+        self.client.force_authenticate(user=self.organizer)
+        self.assertEqual(len(self.client.get("/api/commendations/").data), 2)
+
+    def test_list_can_be_filtered_by_event_and_shift(self):
+        self._flag(self.organizer)
+        self.client.force_authenticate(user=self.organizer)
+
+        self.assertEqual(len(self.client.get(f"/api/commendations/?event={self.event.id}").data), 1)
+        self.assertEqual(len(self.client.get(f"/api/commendations/?shift={self.other_shift.id}").data), 0)
+
+    def test_author_can_edit_the_note_but_not_retarget_the_flag(self):
+        self._flag(self.leader, note="Før")
+        flag = Commendation.objects.get()
+        self.client.force_authenticate(user=self.leader)
+
+        ok = self.client.patch(f"/api/commendations/{flag.id}/", {"note": "Etter"}, format="json")
+        bad = self.client.patch(f"/api/commendations/{flag.id}/", {"user": self.bystander.id}, format="json")
+
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(bad.status_code, 400)
+        flag.refresh_from_db()
+        self.assertEqual(flag.note, "Etter")
+        self.assertEqual(flag.user, self.volunteer)
+
+    def test_author_and_admin_can_delete_but_another_leader_cannot(self):
+        self._flag(self.leader)
+        flag = Commendation.objects.get()
+
+        self.client.force_authenticate(user=self.other_leader)
+        self.assertEqual(self.client.delete(f"/api/commendations/{flag.id}/").status_code, 404)
+        self.assertTrue(Commendation.objects.exists())
+
+        self.client.force_authenticate(user=self.leader)
+        self.assertEqual(self.client.delete(f"/api/commendations/{flag.id}/").status_code, 204)
+
+        self._flag(self.leader)
+        self.client.force_authenticate(user=self.organizer)
+        self.assertEqual(self.client.delete(f"/api/commendations/{Commendation.objects.get().id}/").status_code, 204)
+
+    def test_flag_survives_the_assignment_being_removed(self):
+        self._flag(self.leader)
+        Assignment.objects.all().delete()
+
+        self.assertEqual(Commendation.objects.count(), 1)
+
+    def test_unauthenticated_cannot_list(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/commendations/").status_code, 401)
+

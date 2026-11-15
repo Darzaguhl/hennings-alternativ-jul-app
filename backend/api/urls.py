@@ -2,7 +2,7 @@ from django.urls import include, path
 from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from .views import (EmailTokenObtainPairView, EventViewSet, InventoryCategoryViewSet,
+from .views import (CommendationViewSet, EmailTokenObtainPairView, EventViewSet, InventoryCategoryViewSet,
                     InventoryItemViewSet, OppgaveSlotViewSet,
                     QRCodeViewSet, RegisterView, ShiftConflictViewSet,
                     ShiftViewSet, SkillViewSet, UserViewSet, X1SignupViewSet,
@@ -20,6 +20,7 @@ router.register(r'x1-signups', X1SignupViewSet)
 router.register(r'skills', SkillViewSet)
 router.register(r'inventory-categories', InventoryCategoryViewSet)
 router.register(r'inventory-items', InventoryItemViewSet)
+router.register(r'commendations', CommendationViewSet, basename='commendation')
 router.register(r'qrcodes', QRCodeViewSet)
 
 urlpatterns = [
