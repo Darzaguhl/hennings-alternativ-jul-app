@@ -24,6 +24,7 @@ import { useSettings } from "../../SettingsContext";
 import OppgaverSection from "../../../components/OppgaverSection";
 import VakterSection from "../../../components/VakterSection";
 import PoolSection from "../../../components/PoolSection";
+import TeamSection from "../../../components/TeamSection";
 import CheckinSection from "../../../components/CheckinSection";
 
 type CheckinMode = "personal_qr" | "event_qr";
@@ -539,6 +540,8 @@ export default function EventScreen() {
         <OppgaverSection />
 
         {isCheckinStaff && <PoolSection eventId={event.id} />}
+
+        <TeamSection eventId={event.id} />
 
         {event.code && <Text style={styles.codeHint}>ID: {event.code}</Text>}
       </ScrollView>

@@ -6,6 +6,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from .models import (
     Assignment,
+    Commendation,
     Event,
     EventCheckIn,
     Invite,
@@ -563,3 +564,39 @@ class AssignmentSerializer(serializers.ModelSerializer):
         model = Assignment
         fields = ["id", "shift", "oppgave_slot", "user", "confirmed_by", "confirmed_at"]
         read_only_fields = fields
+
+
+class CommendationSerializer(serializers.ModelSerializer):
+    """Internal-only -- see Commendation. event/oppgave_slot/flagged_by are
+    derived server-side from the Assignment and the requester, never taken
+    from the client; the client only says who (user) and on which vakt
+    (shift), plus an optional note."""
+
+    user_email = serializers.CharField(source="user.email", read_only=True)
+    user_name = serializers.SerializerMethodField()
+    flagged_by_email = serializers.CharField(source="flagged_by.email", read_only=True, default=None)
+    shift_title = serializers.CharField(source="shift.title", read_only=True)
+    skill_name = serializers.CharField(source="oppgave_slot.skill.name", read_only=True, default=None)
+
+    class Meta:
+        model = Commendation
+        fields = [
+            "id",
+            "event",
+            "user",
+            "user_email",
+            "user_name",
+            "shift",
+            "shift_title",
+            "oppgave_slot",
+            "skill_name",
+            "flagged_by",
+            "flagged_by_email",
+            "note",
+            "created_at",
+        ]
+        read_only_fields = ["event", "oppgave_slot", "flagged_by", "created_at"]
+
+    def get_user_name(self, obj):
+        return f"{obj.user.first_name} {obj.user.last_name}".strip()
+

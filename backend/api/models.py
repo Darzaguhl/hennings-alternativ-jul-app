@@ -660,3 +660,43 @@ class Assignment(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user} assigned to {self.oppgave_slot}"
+
+
+class Commendation(models.Model):
+    """A leader's "this person could take on more responsibility" flag,
+    raised during the event ("Fremhev"). Positive-only by design -- concerns
+    go through the post-event rating, not here -- and strictly internal:
+    the flagged volunteer must never be able to read it (see
+    CommendationViewSet, which scopes the queryset to admins and to the
+    flag's own author, and never exposes it on any user-facing serializer).
+
+    Tied to the Assignment the person actually worked (not just any
+    signup), so a leader can only flag someone who was confirmed onto a
+    shift they lead. shift/oppgave_slot are copied from that assignment
+    rather than FK'd to it, so the flag survives the assignment being
+    changed or removed later.
+
+    Not unique per (event, user): the same person can be flagged by
+    several leaders, or on several shifts -- repeated flags are the signal.
+    """
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="commendations")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="commendations")
+    shift = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="commendations")
+    oppgave_slot = models.ForeignKey(
+        OppgaveSlot, on_delete=models.SET_NULL, null=True, blank=True, related_name="commendations"
+    )
+    flagged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="commendations_given",
+    )
+    note = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user} fremhevet @ {self.shift}"
