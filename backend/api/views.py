@@ -14,7 +14,7 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .standing import compute_standings
+from .standing import STATUS_NO_SHOW, STATUS_UNTRACKED, attendance_records, compute_standings
 from .email import send_invite_email, send_password_setup_email
 from .models import (
     Assignment,
@@ -666,6 +666,51 @@ class EventViewSet(viewsets.ModelViewSet):
         if not deleted:
             return Response({"detail": "No check-in found for that user on that date."}, status=status.HTTP_404_NOT_FOUND)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="attendance")
+    def attendance(self, request, pk=None):
+        """Per-day picture of who signed up, who actually arrived and who
+        didn't -- the record behind "no-show" in volunteer standing. Admin
+        only. A past day on which nobody at all was checked in is flagged
+        `tracked: false` (check-in wasn't used), and its signups are
+        reported as "untracked" rather than all being called no-shows."""
+
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can see attendance."}, status=status.HTTP_403_FORBIDDEN)
+
+        records = attendance_records([event.pk])
+        users = User.objects.in_bulk({r["user"] for r in records})
+        order = {"no_show": 0, "untracked": 1, "upcoming": 2, "attended": 3, "walk_in": 4}
+
+        by_date = {}
+        for rec in records:
+            person = users[rec["user"]]
+            by_date.setdefault(rec["date"], []).append(
+                {
+                    "user": rec["user"],
+                    "user_email": person.email,
+                    "user_name": f"{person.first_name} {person.last_name}".strip(),
+                    "status": rec["status"],
+                    "oppgaver": rec["oppgaver"],
+                    "assigned": rec["assigned"],
+                }
+            )
+
+        days = []
+        for date in sorted(by_date):
+            people = sorted(by_date[date], key=lambda p: (order[p["status"]], (p["user_name"] or p["user_email"]).lower()))
+            days.append(
+                {
+                    "date": date.isoformat(),
+                    "checked_in": sum(1 for p in people if p["status"] in ("attended", "walk_in")),
+                    "signed_up": sum(1 for p in people if p["status"] != "walk_in"),
+                    "no_shows": sum(1 for p in people if p["status"] == STATUS_NO_SHOW),
+                    "tracked": not any(p["status"] == STATUS_UNTRACKED for p in people),
+                    "people": people,
+                }
+            )
+        return Response({"event": event.pk, "days": days})
 
     @action(detail=True, methods=["post"], url_path="self-checkin")
     def self_checkin(self, request, pk=None):

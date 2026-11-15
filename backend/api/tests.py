@@ -3444,13 +3444,16 @@ class StandingTests(TestCase):
         return shift
 
     def _worked(self, user, *, showed_up, event=None, days_ago=None, anchor_present=True):
-        """A past vakt the user was confirmed onto; showed_up controls their
-        check-in, anchor_present whether anyone at all checked in that day."""
+        """A past vakt the user signed up for; showed_up controls whether they
+        checked in (and so, as in real use, got an Assignment), anchor_present
+        whether anyone at all checked in that day."""
         event = event or self.event
         self._day += 1
         shift = self._shift(event, days_ago=days_ago if days_ago is not None else self._day)
         slot = make_slot(shift, skill_name=f"Oppgave {self._day}")
-        Assignment.objects.create(oppgave_slot=slot, user=user, confirmed_by=event.created_by)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=user)
+        if showed_up:
+            Assignment.objects.create(oppgave_slot=slot, user=user, confirmed_by=event.created_by)
         if anchor_present:
             EventCheckIn.objects.get_or_create(event=event, user=self.anchor, date=shift.date)
         if showed_up:
@@ -3472,7 +3475,7 @@ class StandingTests(TestCase):
 
     def test_volunteer_with_only_an_upcoming_assignment_is_new(self):
         shift = self._shift(days_ago=-3)
-        Assignment.objects.create(oppgave_slot=make_slot(shift), user=self.volunteer, confirmed_by=self.admin)
+        ShiftSignup.objects.create(oppgave_slot=make_slot(shift), user=self.volunteer)
 
         row = self._row()
         self.assertEqual(row["standing"], "new")
@@ -3511,15 +3514,17 @@ class StandingTests(TestCase):
         self.assertEqual(self._row()["standing"], "good")
 
         # 1 in 3 = 0.33 is over it.
-        Assignment.objects.filter(user=self.volunteer).order_by("date").first().delete()
-        EventCheckIn.objects.filter(user=self.volunteer).order_by("date").first().delete()
+        # Drop one attended day (the most recent; the no-show is the oldest).
+        attended_day = ShiftSignup.objects.filter(user=self.volunteer).order_by("-date").first().date
+        for model in (ShiftSignup, Assignment, EventCheckIn):
+            model.objects.filter(user=self.volunteer, date=attended_day).delete()
         row = self._row()
         self.assertEqual(row["no_show_rate"], 0.333)
         self.assertEqual(row["standing"], "concern")
 
-    def test_withdrawn_assignment_is_not_a_no_show(self):
+    def test_withdrawn_signup_is_not_a_no_show(self):
         shift = self._worked(self.volunteer, showed_up=False)
-        Assignment.objects.filter(shift=shift, user=self.volunteer).delete()
+        ShiftSignup.objects.filter(shift=shift, user=self.volunteer).delete()
         self._rate(shift, "ok")
 
         row = self._row()
@@ -3548,6 +3553,22 @@ class StandingTests(TestCase):
         row = self._row()
         self.assertEqual(row["standing"], "good")
         self.assertEqual(row["ratings"]["utmerket"], 1)
+
+    def test_checking_in_without_signing_up_counts_as_attendance_not_a_no_show(self):
+        shift = self._shift()
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=shift.date)
+
+        row = self._row()
+        self.assertEqual((row["walk_ins"], row["attended"], row["no_shows"]), (1, 0, 0))
+        self.assertEqual(row["standing"], "good")
+
+    def test_several_signups_for_one_missed_day_is_one_no_show(self):
+        shift = self._shift()
+        for name in ("Kokk", "Vert", "Oppvask"):
+            ShiftSignup.objects.create(oppgave_slot=make_slot(shift, skill_name=name), user=self.volunteer)
+        EventCheckIn.objects.create(event=self.event, user=self.anchor, date=shift.date)
+
+        self.assertEqual(self._row()["no_shows"], 1)
 
     def test_commendations_are_counted_but_do_not_change_standing(self):
         shift = self._worked(self.volunteer, showed_up=True)
@@ -3653,3 +3674,99 @@ class StandingTests(TestCase):
 
     def test_unauthenticated_gets_401(self):
         self.assertEqual(self.client.get("/api/standings/").status_code, 401)
+
+
+class AttendanceTests(TestCase):
+    """Per-day attendance for an event: who signed up, who arrived, who
+    didn't. Admin-only; the data behind "no-show" in standing."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.other_admin = User.objects.create_user(username="other_admin", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        self.kari = User.objects.create_user(username="kari", password="pw", first_name="Kari", last_name="Nordmann")
+        self.ola = User.objects.create_user(username="ola", password="pw", first_name="Ola", last_name="Hansen")
+        self.walkin = User.objects.create_user(username="walkin", password="pw", first_name="Per", last_name="Spontan")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        make_event(title="Annet", created_by=self.other_admin)
+        self.client = APIClient()
+        self.today = datetime.date.today()
+
+    def _day(self, days_ago):
+        shift = Shift.objects.create(
+            event=self.event, title=f"Vakt {days_ago}", date=self.today - datetime.timedelta(days=days_ago),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.admin,
+        )
+        return shift, make_slot(shift, skill_name="Kjøkken")
+
+    def _get(self, as_user=None):
+        self.client.force_authenticate(user=as_user or self.admin)
+        return self.client.get(f"/api/events/{self.event.id}/attendance/")
+
+    def test_marks_who_showed_up_and_who_did_not(self):
+        shift, slot = self._day(2)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.ola)
+        Assignment.objects.create(oppgave_slot=slot, user=self.kari, confirmed_by=self.admin)
+        EventCheckIn.objects.create(event=self.event, user=self.kari, date=shift.date)
+
+        response = self._get()
+
+        self.assertEqual(response.status_code, 200)
+        (day,) = response.data["days"]
+        self.assertEqual(day["date"], shift.date.isoformat())
+        self.assertEqual((day["signed_up"], day["checked_in"], day["no_shows"], day["tracked"]), (2, 1, 1, True))
+        by_name = {p["user_name"]: p for p in day["people"]}
+        self.assertEqual(by_name["Ola Hansen"]["status"], "no_show")
+        self.assertEqual(by_name["Kari Nordmann"]["status"], "attended")
+        self.assertEqual(by_name["Kari Nordmann"]["assigned"], "Kjøkken")
+        self.assertEqual(day["people"][0]["user_name"], "Ola Hansen")  # absentees sort first
+
+    def test_walk_in_without_signup_is_listed_and_not_counted_as_signed_up(self):
+        shift, slot = self._day(1)
+        EventCheckIn.objects.create(event=self.event, user=self.walkin, date=shift.date)
+
+        (day,) = self._get().data["days"]
+        self.assertEqual(day["people"][0]["status"], "walk_in")
+        self.assertEqual((day["signed_up"], day["checked_in"], day["no_shows"]), (0, 1, 0))
+
+    def test_day_without_any_check_ins_is_flagged_untracked_not_all_no_shows(self):
+        shift, slot = self._day(3)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+
+        (day,) = self._get().data["days"]
+        self.assertFalse(day["tracked"])
+        self.assertEqual(day["no_shows"], 0)
+        self.assertEqual(day["people"][0]["status"], "untracked")
+
+    def test_upcoming_day_is_not_a_no_show(self):
+        shift, slot = self._day(-2)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+
+        (day,) = self._get().data["days"]
+        self.assertEqual(day["people"][0]["status"], "upcoming")
+        self.assertTrue(day["tracked"])
+
+    def test_withdrawn_signup_disappears(self):
+        shift, slot = self._day(2)
+        signup = ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+        EventCheckIn.objects.create(event=self.event, user=self.ola, date=shift.date)
+        signup.delete()
+
+        (day,) = self._get().data["days"]
+        self.assertEqual([p["user_name"] for p in day["people"]], ["Ola Hansen"])
+
+    def test_days_are_returned_in_date_order(self):
+        for days_ago in (1, 5, 3):
+            shift, slot = self._day(days_ago)
+            ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+        dates = [d["date"] for d in self._get().data["days"]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(len(dates), 3)
+
+    def test_only_event_admins_can_see_it(self):
+        self.assertEqual(self._get(self.leader).status_code, 403)
+        self.assertEqual(self._get(self.kari).status_code, 403)
+        self.assertIn(self._get(self.other_admin).status_code, (403, 404))
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get(f"/api/events/{self.event.id}/attendance/").status_code, 401)

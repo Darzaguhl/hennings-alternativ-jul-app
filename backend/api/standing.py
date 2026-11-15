@@ -14,18 +14,21 @@ with the reasons that caused it):
   * new     -- nothing to judge by yet (no ratings, no past attendance data);
   * good    -- everything else.
 
-A no-show is a confirmed Assignment on a past date with no EventCheckIn for
-that person that day -- but only on days where *anyone* was checked in at
-all, so an event day where check-in simply wasn't used doesn't turn every
-volunteer into a no-show. Avmelding removes the Assignment, so a volunteer
-who withdrew in time is not a no-show.
+A no-show is a *signup* for a past day with no check-in from that person
+that day (Assignments are only created at check-in, so signups are the
+record of who said they would come). It only counts on days where *anyone*
+was checked in at all -- a day where check-in simply wasn't used would
+otherwise make every volunteer a no-show, so such days are reported as
+"untracked" (and flagged in the attendance view) instead of guessed at.
+Avmelding removes the signup, so a volunteer who withdrew in time is not a
+no-show.
 """
 
 from collections import defaultdict
 
 from django.utils import timezone
 
-from .models import Assignment, Commendation, EventCheckIn, Rating, StandingOverride
+from .models import Assignment, Commendation, EventCheckIn, Rating, ShiftSignup, StandingOverride
 
 NO_SHOW_THRESHOLD = 0.25
 
@@ -37,22 +40,86 @@ REASON_BEKYMRING = "bekymring"
 REASON_NO_SHOWS = "no_shows"
 
 
-def compute_standings(event_ids, today=None):
-    """Standing rows for every user with an Assignment or Rating in
-    `event_ids`, keyed by user id. Only data from those events is counted,
-    so an admin's view never reflects events they don't administer."""
+STATUS_ATTENDED = "attended"
+STATUS_NO_SHOW = "no_show"
+STATUS_UPCOMING = "upcoming"
+STATUS_UNTRACKED = "untracked"
+STATUS_WALK_IN = "walk_in"
+
+
+def attendance_records(event_ids, today=None):
+    """One record per (event, date, person) who signed up for, was assigned
+    to, or physically arrived on that day, with a status:
+
+      attended  -- signed up (or assigned) and checked in
+      walk_in   -- checked in without having signed up
+      no_show   -- signed up, the day is past, others checked in but they didn't
+      untracked -- signed up, day is past, but nobody was checked in at all
+      upcoming  -- signed up for today or later and not (yet) checked in
+
+    Shared by standing and the per-day attendance view so the two can never
+    disagree about who was absent."""
 
     today = today or timezone.localdate()
     event_ids = list(event_ids)
 
-    # (event, date) pairs on which at least one person was checked in --
-    # the only days we can meaningfully call someone absent.
-    arrivals_by_day = defaultdict(set)
+    arrivals = defaultdict(set)  # (event, date) -> user ids checked in
     for event_id, user_id, date in EventCheckIn.objects.filter(event_id__in=event_ids).values_list(
         "event_id", "user_id", "date"
     ):
-        arrivals_by_day[(event_id, date)].add(user_id)
+        arrivals[(event_id, date)].add(user_id)
 
+    people = {}  # (event, date, user) -> {"oppgaver": set, "assigned": name|None}
+
+    def entry(event_id, date, user_id):
+        return people.setdefault((event_id, date, user_id), {"oppgaver": set(), "assigned": None})
+
+    for event_id, user_id, date, skill in ShiftSignup.objects.filter(event_id__in=event_ids).values_list(
+        "event_id", "user_id", "date", "oppgave_slot__skill__name"
+    ):
+        entry(event_id, date, user_id)["oppgaver"].add(skill)
+    for event_id, user_id, date, skill in Assignment.objects.filter(event_id__in=event_ids).values_list(
+        "event_id", "user_id", "date", "oppgave_slot__skill__name"
+    ):
+        entry(event_id, date, user_id)["assigned"] = skill
+    for (event_id, date), user_ids in arrivals.items():
+        for user_id in user_ids:
+            entry(event_id, date, user_id)
+
+    records = []
+    for (event_id, date, user_id), info in people.items():
+        signed_up = bool(info["oppgaver"] or info["assigned"])
+        checked_in = user_id in arrivals.get((event_id, date), ())
+        if checked_in:
+            status = STATUS_ATTENDED if signed_up else STATUS_WALK_IN
+        elif date >= today:
+            status = STATUS_UPCOMING
+        elif arrivals.get((event_id, date)):
+            status = STATUS_NO_SHOW
+        else:
+            status = STATUS_UNTRACKED
+        records.append(
+            {
+                "event": event_id,
+                "date": date,
+                "user": user_id,
+                "status": status,
+                "signed_up": signed_up,
+                "checked_in": checked_in,
+                "oppgaver": sorted(o for o in info["oppgaver"] if o),
+                "assigned": info["assigned"],
+            }
+        )
+    return records
+
+
+def compute_standings(event_ids, today=None):
+    """Standing rows for every user with a signup, Assignment, check-in or
+    Rating in `event_ids`, keyed by user id. Only data from those events is
+    counted, so an admin's view never reflects events they don't
+    administer."""
+
+    event_ids = list(event_ids)
     rows = {}
 
     def row(user_id):
@@ -62,24 +129,24 @@ def compute_standings(event_ids, today=None):
                 "ratings": {level: 0 for level, _ in Rating.LEVEL_CHOICES},
                 "commendations": 0,
                 "attended": 0,
+                "walk_ins": 0,
                 "no_shows": 0,
                 "upcoming": 0,
                 "events": set(),
             }
         return rows[user_id]
 
-    for event_id, user_id, date in Assignment.objects.filter(event_id__in=event_ids).values_list(
-        "event_id", "user_id", "date"
-    ):
-        r = row(user_id)
-        r["events"].add(event_id)
-        if date >= today:
-            r["upcoming"] += 1
-        elif user_id in arrivals_by_day.get((event_id, date), ()):
+    for rec in attendance_records(event_ids, today):
+        r = row(rec["user"])
+        r["events"].add(rec["event"])
+        if rec["status"] == STATUS_ATTENDED:
             r["attended"] += 1
-        elif arrivals_by_day.get((event_id, date)):
+        elif rec["status"] == STATUS_WALK_IN:
+            r["walk_ins"] += 1
+        elif rec["status"] == STATUS_NO_SHOW:
             r["no_shows"] += 1
-        # else: a past day with no check-ins recorded at all -- unknowable.
+        elif rec["status"] == STATUS_UPCOMING:
+            r["upcoming"] += 1
 
     for event_id, user_id, level in Rating.objects.filter(event_id__in=event_ids).values_list(
         "event_id", "user_id", "level"
@@ -106,7 +173,7 @@ def compute_standings(event_ids, today=None):
 
         if reasons:
             computed = STANDING_CONCERN
-        elif judged == 0 and not any(r["ratings"].values()):
+        elif judged == 0 and not r["walk_ins"] and not any(r["ratings"].values()):
             computed = STANDING_NEW
         else:
             computed = STANDING_GOOD
