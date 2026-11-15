@@ -47,6 +47,54 @@ addition to e-mail + password. Open points to settle when picking this up:
 - Admin/staff roles must stay tied to our own memberships, not to whatever
   identity provider someone used.
 
+## CRM for donors (companies and individuals who give gifts)
+
+A system to track who gives gifts and how that turned out against what was
+promised. Per donor (company or individual): contact details and history
+across years, the **expected gift and expected amount**, and **what was
+actually received**, so expected vs received is visible per donor and per
+year. Open points to settle first:
+
+- "Amount": money (NOK), a quantity of items, or both? Gifts in Lager are
+  items in categories, so received gifts should probably be able to link to
+  or create the matching Lager entries rather than being typed twice.
+- Who owns the relationship with each donor, and follow-up reminders
+  (e.g. contact again before next Christmas).
+- Individuals are personal data: same care as volunteer data (who can see
+  it, retention, and a way to export or erase one person's record).
+- Whether a donor can also be a volunteer, and whether they share a record.
+
+## Equipment inventory (setup gear), with minimum-level alerts
+
+Inventory of the gear and supplies used to set up and run the event. This is
+separate from Lager, which tracks donated gifts going in and out; this is
+reusable equipment (and consumables) the organisation owns. Track what they
+have, what was taken out for the event and **what came back**, so losses and
+breakage are visible. 
+
+- **Minimum level per item.** Set a minimum quantity; when stock falls below
+  it, show an alert in a log (a "low stock" list an admin can read) instead
+  of relying on someone noticing. Start with the log; e-mail or push later.
+- Open points: storage location, check-out/in per team or station, and a
+  condition/lost/broken status on return. Consumables vs reusable items may
+  need slightly different handling.
+
+## Live event dashboard and station screens
+
+A live view used *during* the event. A person or a leader sends a short
+message, and it shows on a screen for their specific station. Open points:
+
+- A "station" concept (e.g. kitchen, entrance, nissetog) that screens and
+  senders are tied to; probably linked to oppgaver.
+- Screens are just a web page opened full-screen on a TV or tablet, with a
+  per-station link instead of a login, and updates pushed in real time
+  (websocket/SSE) or by short polling.
+- Who may post (any signed-up volunteer on that station vs leaders only),
+  how long a message stays up, and a way for a leader/admin to clear or
+  override one.
+- Overlaps with the push-notification idea below: decide whether station
+  messages and phone notifications share one message model.
+
 ## Ideas from the meeting notes (unprioritised)
 
 - Per-oppgave roles (editable, addable) with a time of day (e.g. 21:30
