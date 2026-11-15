@@ -7,6 +7,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import (
     Assignment,
     Commendation,
+    Rating,
     Event,
     EventCheckIn,
     Invite,
@@ -273,6 +274,7 @@ class EventSerializer(serializers.ModelSerializer):
             "signup_closes_at",
             "signups_open",
             "checkin_mode",
+            "rating_visibility",
             "created_by",
             "viewer_role",
         ]
@@ -600,3 +602,54 @@ class CommendationSerializer(serializers.ModelSerializer):
     def get_user_name(self, obj):
         return f"{obj.user.first_name} {obj.user.last_name}".strip()
 
+
+class RatingSerializer(serializers.ModelSerializer):
+    """Internal-only -- see Rating. event/oppgave_slot/rated_by are derived
+    server-side from the Assignment and the requester; the client says who
+    (user), on which vakt (shift), the level, and the note."""
+
+    user_email = serializers.CharField(source="user.email", read_only=True)
+    user_name = serializers.SerializerMethodField()
+    rated_by_email = serializers.CharField(source="rated_by.email", read_only=True, default=None)
+    shift_title = serializers.CharField(source="shift.title", read_only=True)
+    skill_name = serializers.CharField(source="oppgave_slot.skill.name", read_only=True, default=None)
+
+    class Meta:
+        model = Rating
+        fields = [
+            "id",
+            "event",
+            "user",
+            "user_email",
+            "user_name",
+            "shift",
+            "shift_title",
+            "oppgave_slot",
+            "skill_name",
+            "rated_by",
+            "rated_by_email",
+            "level",
+            "note",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["event", "oppgave_slot", "rated_by", "created_at", "updated_at"]
+        # Uniqueness is checked in RatingViewSet.perform_create (rated_by is
+        # server-derived, so DRF can't build the validator from the body).
+        validators = []
+
+    def get_user_name(self, obj):
+        return f"{obj.user.first_name} {obj.user.last_name}".strip()
+
+    def validate(self, attrs):
+        # On a partial update only some fields are present -- fall back to
+        # the stored values so "Bekymring needs a note" holds either way.
+        instance = self.instance
+        level = attrs.get("level", instance.level if instance else None)
+        note = attrs.get("note", instance.note if instance else "")
+        note = (note or "").strip()
+        if "note" in attrs:
+            attrs["note"] = note
+        if level == Rating.LEVEL_BEKYMRING and not note:
+            raise serializers.ValidationError({"note": "A note is required when the rating is Bekymring."})
+        return attrs

@@ -18,6 +18,7 @@ from .email import send_invite_email, send_password_setup_email
 from .models import (
     Assignment,
     Commendation,
+    Rating,
     Event,
     EventCheckIn,
     Invite,
@@ -37,6 +38,7 @@ from .serializers import (
     AcceptInviteSerializer,
     AssignmentSerializer,
     CommendationSerializer,
+    RatingSerializer,
     EmailTokenObtainPairSerializer,
     EventSerializer,
     InventoryCategorySerializer,
@@ -1478,4 +1480,71 @@ class CommendationViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         if not (instance.event.is_admin(self.request.user) or instance.flagged_by_id == self.request.user.pk):
             raise PermissionDenied("Only an admin or the leader who flagged them can remove this.")
+        instance.delete()
+
+
+class RatingViewSet(viewsets.ModelViewSet):
+    """Post-event ratings of volunteers -- see Rating. Internal only: the
+    queryset is scoped to event admins (everything on their events), each
+    rater's own ratings and, when the event's rating_visibility is "team",
+    ratings on vakter the viewer leads. A rated volunteer -- or anyone else
+    -- gets an empty list, never a rating of themselves.
+
+    A leader can rate only someone with an Assignment on a vakt they lead
+    (admins: anyone assigned on their event's vakter), and only once per
+    vakt -- edit the existing rating to change it."""
+
+    serializer_class = RatingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        user = self.request.user
+        admin_event_ids = Membership.objects.filter(
+            user=user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]
+        ).values("event_id")
+        queryset = Rating.objects.select_related("user", "rated_by", "shift", "oppgave_slot__skill").filter(
+            Q(event_id__in=admin_event_ids)
+            | Q(rated_by=user)
+            | Q(event__rating_visibility=Event.RATING_VISIBILITY_TEAM, shift__leaders=user)
+        ).distinct()
+
+        params = self.request.query_params
+        for param, field in (("event", "event_id"), ("shift", "shift_id"), ("user", "user_id")):
+            value = params.get(param)
+            if value:
+                queryset = queryset.filter(**{field: value})
+        return queryset
+
+    def perform_create(self, serializer):
+        shift = serializer.validated_data["shift"]
+        person = serializer.validated_data["user"]
+        requester = self.request.user
+
+        if not (shift.event.is_admin(requester) or shift.is_led_by(requester)):
+            raise PermissionDenied("Only an admin or this vakt's leader can rate someone.")
+        if person.pk == requester.pk:
+            raise ValidationError("You can't rate yourself.")
+
+        assignment = Assignment.objects.filter(shift=shift, user=person).select_related("oppgave_slot").first()
+        if not assignment:
+            raise ValidationError("That person isn't assigned to this vakt.")
+        if Rating.objects.filter(shift=shift, user=person, rated_by=requester).exists():
+            raise ValidationError("You have already rated this person on this vakt -- edit the existing rating.")
+
+        serializer.save(event=shift.event, oppgave_slot=assignment.oppgave_slot, rated_by=requester)
+
+    def perform_update(self, serializer):
+        rating = serializer.instance
+        if not (rating.event.is_admin(self.request.user) or rating.rated_by_id == self.request.user.pk):
+            raise PermissionDenied("Only an admin or the leader who gave this rating can edit it.")
+        # Only level and note are editable -- who/where the rating is about
+        # is fixed at creation, so it can't be re-pointed at someone else.
+        if set(serializer.validated_data) - {"level", "note"}:
+            raise ValidationError("Only the level and note can be changed.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not (instance.event.is_admin(self.request.user) or instance.rated_by_id == self.request.user.pk):
+            raise PermissionDenied("Only an admin or the leader who gave this rating can remove it.")
         instance.delete()

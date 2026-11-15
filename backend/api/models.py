@@ -96,6 +96,13 @@ class Event(models.Model):
 
     CHECKIN_MODE_PERSONAL_QR = "personal_qr"
     CHECKIN_MODE_EVENT_QR = "event_qr"
+    RATING_VISIBILITY_OWN = "own"
+    RATING_VISIBILITY_TEAM = "team"
+    RATING_VISIBILITY_CHOICES = (
+        (RATING_VISIBILITY_OWN, "Own — a leader sees only the ratings they gave themselves"),
+        (RATING_VISIBILITY_TEAM, "Team — a leader also sees other leaders' ratings of people on their vakter"),
+    )
+
     CHECKIN_MODE_CHOICES = (
         (CHECKIN_MODE_PERSONAL_QR, "Personal QR — an admin scans each volunteer's own badge"),
         (CHECKIN_MODE_EVENT_QR, "Event QR — volunteers scan one shared code themselves"),
@@ -123,6 +130,12 @@ class Event(models.Model):
         max_length=20,
         choices=CHECKIN_MODE_CHOICES,
         default=CHECKIN_MODE_EVENT_QR,
+    )
+    rating_visibility = models.CharField(
+        max_length=10,
+        choices=RATING_VISIBILITY_CHOICES,
+        default=RATING_VISIBILITY_OWN,
+        help_text="Who besides admins can read post-event ratings. See Rating.",
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -700,3 +713,59 @@ class Commendation(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user} fremhevet @ {self.shift}"
+
+
+class Rating(models.Model):
+    """A leader's (or admin's) post-event assessment of one volunteer on one
+    vakt: Utmerket / God / Ok / Bekymring. Strictly internal -- the rated
+    volunteer must never be able to read it (see RatingViewSet, which scopes
+    the queryset to admins, the rating's author and, if the event allows it,
+    the other leaders of that vakt; it is never on a user-facing serializer).
+
+    One rating per (shift, user, rated_by): a volunteer who worked two vakter
+    can be rated by each vakt's leader, and a vakt with two leaders gets two
+    independent opinions. A leader revisits their rating by editing it.
+
+    "Bekymring" must carry a note saying what happened -- a bare concern
+    flag is neither fair to the volunteer nor useful to whoever reads it
+    later. Like Commendation, shift/oppgave_slot are copied from the
+    Assignment the person actually worked, not FK'd to it, so the rating
+    survives the assignment being changed or removed afterwards.
+    """
+
+    LEVEL_UTMERKET = "utmerket"
+    LEVEL_GOD = "god"
+    LEVEL_OK = "ok"
+    LEVEL_BEKYMRING = "bekymring"
+    LEVEL_CHOICES = (
+        (LEVEL_UTMERKET, "Utmerket"),
+        (LEVEL_GOD, "God"),
+        (LEVEL_OK, "Ok"),
+        (LEVEL_BEKYMRING, "Bekymring"),
+    )
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="ratings")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="ratings")
+    shift = models.ForeignKey(Shift, on_delete=models.CASCADE, related_name="ratings")
+    oppgave_slot = models.ForeignKey(
+        OppgaveSlot, on_delete=models.SET_NULL, null=True, blank=True, related_name="ratings"
+    )
+    rated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="ratings_given",
+    )
+    level = models.CharField(max_length=10, choices=LEVEL_CHOICES)
+    note = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["shift", "user", "rated_by"], name="unique_rating_per_leader_per_shift"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user}: {self.level} @ {self.shift}"
