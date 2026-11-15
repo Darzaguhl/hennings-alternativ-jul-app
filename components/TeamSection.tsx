@@ -32,6 +32,25 @@ interface Commendation {
   shift: number;
 }
 
+type RatingLevel = "utmerket" | "god" | "ok" | "bekymring";
+
+interface Rating {
+  id: number;
+  user: number;
+  shift: number;
+  rated_by: number | null;
+  level: RatingLevel;
+  note: string;
+}
+
+const LEVELS: { value: RatingLevel; label: string; color: string; bg: string }[] = [
+  { value: "utmerket", label: "Utmerket", color: "#166534", bg: "#dcfce7" },
+  { value: "god", label: "God", color: "#166534", bg: "#ecfdf5" },
+  { value: "ok", label: "Ok", color: "#475569", bg: "#f1f5f9" },
+  { value: "bekymring", label: "Bekymring", color: "#b91c1c", bg: "#fee2e2" },
+];
+const levelInfo = (level: RatingLevel) => LEVELS.find((l) => l.value === level) ?? LEVELS[2];
+
 const memberName = (user: TeamMember) =>
   `${user.first_name ?? ""} ${user.last_name ?? ""}`.trim() || user.email || user.username;
 
@@ -59,6 +78,12 @@ export default function TeamSection({ eventId }: { eventId: number }) {
   const [notingKey, setNotingKey] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  // Post-event ratings: my own rating per person per vakt (the API only
+  // returns ratings I'm allowed to read), plus the open editor's draft.
+  const [ratings, setRatings] = useState<Rating[]>([]);
+  const [ratingKey, setRatingKey] = useState<string | null>(null);
+  const [ratingLevel, setRatingLevel] = useState<RatingLevel | null>(null);
+  const [ratingNote, setRatingNote] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -72,11 +97,13 @@ export default function TeamSection({ eventId }: { eventId: number }) {
       setShifts(led);
       if (led.length === 0) return;
 
-      const [flagsRes, ...teamRes] = await Promise.all([
+      const [flagsRes, ratingsRes, ...teamRes] = await Promise.all([
         apiFetch(`/api/commendations/?event=${eventId}`),
+        apiFetch(`/api/ratings/?event=${eventId}`),
         ...led.map((s) => apiFetch(`/api/shifts/${s.id}/assignments/`)),
       ]);
       if (flagsRes.ok) setFlags(await flagsRes.json());
+      if (ratingsRes.ok) setRatings(await ratingsRes.json());
       const next: Record<number, TeamAssignment[]> = {};
       for (let i = 0; i < led.length; i++) {
         next[led[i].id] = teamRes[i].ok ? await teamRes[i].json() : [];
@@ -123,6 +150,79 @@ export default function TeamSection({ eventId }: { eventId: number }) {
     [apiFetch, note]
   );
 
+  const ratingFor = (shiftId: number, userId: number) =>
+    ratings.find((r) => r.shift === shiftId && r.user === userId && r.rated_by === currentUser?.id);
+
+  const openRating = (key: string, existing?: Rating) => {
+    setRatingKey(ratingKey === key ? null : key);
+    setRatingLevel(existing?.level ?? null);
+    setRatingNote(existing?.note ?? "");
+  };
+
+  const handleRate = useCallback(
+    async (shiftId: number, userId: number, existing?: Rating) => {
+      if (!ratingLevel) {
+        Alert.alert("Velg en vurdering", "Velg Utmerket, God, Ok eller Bekymring først.");
+        return;
+      }
+      if (ratingLevel === "bekymring" && !ratingNote.trim()) {
+        Alert.alert("Begrunnelse mangler", "Bekymring må ha en kort begrunnelse.");
+        return;
+      }
+      const key = `${shiftId}-${userId}`;
+      setBusyKey(key);
+      try {
+        const response = await apiFetch(existing ? `/api/ratings/${existing.id}/` : "/api/ratings/", {
+          method: existing ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            existing
+              ? { level: ratingLevel, note: ratingNote.trim() }
+              : { shift: shiftId, user: userId, level: ratingLevel, note: ratingNote.trim() }
+          ),
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => null);
+          throw new Error(
+            body?.note?.[0] ?? body?.detail ?? (Array.isArray(body) ? body[0] : null) ?? "Kunne ikke lagre vurderingen."
+          );
+        }
+        const saved: Rating = await response.json();
+        setRatings((prev) => (existing ? prev.map((r) => (r.id === saved.id ? saved : r)) : [saved, ...prev]));
+        setRatingKey(null);
+      } catch (err: any) {
+        Alert.alert("Feil", err?.message ?? "Kunne ikke lagre vurderingen.");
+      } finally {
+        setBusyKey(null);
+      }
+    },
+    [apiFetch, ratingLevel, ratingNote]
+  );
+
+  const handleRemoveRating = useCallback(
+    (rating: Rating) => {
+      Alert.alert("Fjerne vurderingen?", undefined, [
+        { text: "Avbryt", style: "cancel" },
+        {
+          text: "Fjern",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              const response = await apiFetch(`/api/ratings/${rating.id}/`, { method: "DELETE" });
+              if (!response.ok && response.status !== 204) throw new Error(`delete ${response.status}`);
+              setRatings((prev) => prev.filter((r) => r.id !== rating.id));
+              setRatingKey(null);
+            } catch (err) {
+              console.error("Error removing rating", err);
+              Alert.alert("Feil", "Kunne ikke fjerne vurderingen.");
+            }
+          },
+        },
+      ]);
+    },
+    [apiFetch]
+  );
+
   const handleUnflag = useCallback(
     (flag: Commendation) => {
       Alert.alert("Fjerne fremhevingen?", undefined, [
@@ -166,7 +266,8 @@ export default function TeamSection({ eventId }: { eventId: number }) {
         </TouchableOpacity>
       </View>
       <Text style={styles.hint}>
-        Fremhev noen som kan ta mer ansvar. Kun admin og du ser dette — personen får ikke vite om det.
+        Fremhev noen som kan ta mer ansvar, og vurder de frivillige etter vakten. Kun admin og du ser dette — personen
+        får ikke vite om det.
       </Text>
 
       {shifts.map((shift) => {
@@ -186,6 +287,7 @@ export default function TeamSection({ eventId }: { eventId: number }) {
             {members.map((assignment) => {
               const key = `${shift.id}-${assignment.user.id}`;
               const flag = flagFor(shift.id, assignment.user.id);
+              const rating = ratingFor(shift.id, assignment.user.id);
               return (
                 <View key={assignment.id} style={styles.memberBlock}>
                   <View style={styles.memberRow}>
@@ -212,6 +314,66 @@ export default function TeamSection({ eventId }: { eventId: number }) {
                       </TouchableOpacity>
                     )}
                   </View>
+
+                  <View style={styles.ratingRow}>
+                    {rating ? (
+                      <View
+                        style={[styles.levelPill, { backgroundColor: levelInfo(rating.level).bg }]}
+                      >
+                        <Text style={[styles.levelPillText, { color: levelInfo(rating.level).color }]}>
+                          {levelInfo(rating.level).label}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.meta}>Ikke vurdert</Text>
+                    )}
+                    <TouchableOpacity onPress={() => openRating(key, rating)}>
+                      <Text style={styles.refreshText}>{rating ? "Endre vurdering" : "Vurder"}</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {rating?.note && ratingKey !== key ? <Text style={styles.noteText}>«{rating.note}»</Text> : null}
+
+                  {ratingKey === key && (
+                    <View style={styles.ratingEditor}>
+                      <View style={styles.levelRow}>
+                        {LEVELS.map((l) => (
+                          <TouchableOpacity
+                            key={l.value}
+                            style={[
+                              styles.levelChip,
+                              ratingLevel === l.value && { backgroundColor: l.color, borderColor: l.color },
+                            ]}
+                            onPress={() => setRatingLevel(l.value)}
+                          >
+                            <Text style={[styles.levelChipText, ratingLevel === l.value && { color: "#fff" }]}>
+                              {l.label}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                      <TextInput
+                        style={styles.noteInput}
+                        value={ratingNote}
+                        onChangeText={setRatingNote}
+                        placeholder={ratingLevel === "bekymring" ? "Påkrevd: hva skjedde?" : "Valgfritt: en kort kommentar"}
+                        maxLength={500}
+                      />
+                      <View style={styles.noteRow}>
+                        <TouchableOpacity
+                          style={[styles.flagButton, busyKey === key && styles.buttonDisabled]}
+                          disabled={busyKey === key}
+                          onPress={() => handleRate(shift.id, assignment.user.id, rating)}
+                        >
+                          <Text style={styles.flagButtonText}>Lagre</Text>
+                        </TouchableOpacity>
+                        {rating && (
+                          <TouchableOpacity onPress={() => handleRemoveRating(rating)}>
+                            <Text style={styles.removeText}>Fjern</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    </View>
+                  )}
 
                   {notingKey === key && !flag && (
                     <View style={styles.noteRow}>
@@ -280,4 +442,20 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   buttonDisabled: { opacity: 0.5 },
+  ratingRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 4 },
+  levelPill: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999 },
+  levelPillText: { fontSize: 12, fontWeight: "700" },
+  noteText: { fontSize: 13, color: "#475569", fontStyle: "italic", paddingHorizontal: 4 },
+  ratingEditor: { gap: 8 },
+  levelRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  levelChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    backgroundColor: "#fff",
+  },
+  levelChipText: { fontSize: 13, fontWeight: "600", color: "#0f172a" },
+  removeText: { color: "#b91c1c", fontWeight: "600" },
 });
