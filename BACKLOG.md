@@ -87,8 +87,12 @@ that show up on a big screen.
 **The screen.** One screen shows all stations at once, each station (an
 oppgave) as its own horizontal lane. A new message enters its station's lane
 from the right side of the screen. Each message shows **who sent it and when**
-(sender name and timestamp). A message stays until newer messages push it
-out of the lane. (Our reading of "pushed out by others"; confirm.)
+(sender name and timestamp).
+
+**Message age.** A configurable timer (default about 15 minutes) decides when
+a message becomes "old". Fresh messages sit on the right; once a message is
+old it moves to the left side of its lane and stacks there with the other
+old ones.
 
 **Who sends and who sees.**
 - Leaders and volunteers can send a message to a station.
@@ -96,11 +100,11 @@ out of the lane. (Our reading of "pushed out by others"; confirm.)
   wrote themselves (their own sent list). The big screen shows everything.
 
 **Admin moderation.** An admin sets a status on each message, e.g.
-`waiting` / `active` / `cleared`. Our reading: `waiting` = sent but not shown
-yet (held for approval or queued), `active` = on the screen, `cleared` =
-taken down. Confirm whether new messages start as `waiting` (admin approves
-each one) or go straight to `active` (admin only clears), since that decides
-how much work the admin has during the event.
+`waiting` / `active` / `cleared`: `waiting` = sent but not shown yet,
+`active` = on the screen, `cleared` = taken down. Approval is a setting:
+either an admin moves each message from `waiting` to `active` by hand, or the
+admin switches it to **auto**, so new messages go straight to `active` and the
+admin only clears the bad ones.
 
 Open points:
 - A "station" tied to oppgaver, and which station(s) a sender may post to
@@ -108,8 +112,9 @@ Open points:
 - The screen is a web page opened full-screen on a TV or tablet, with a
   secret link rather than a login, updated in real time (websocket/SSE) or by
   short polling.
-- How many messages a lane keeps visible before the oldest is pushed out, and
-  whether a very old one fades regardless.
+- How many old messages the left-hand stack keeps before the oldest drops
+  off, and whether the timer and the approval mode (manual/auto) are set per
+  event or per station.
 - Overlaps with the push-notification idea below: decide whether station
   messages and phone notifications share one message model.
 
