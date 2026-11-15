@@ -81,17 +81,35 @@ breakage are visible.
 
 ## Live event dashboard and station screens
 
-A live view used *during* the event. A person or a leader sends a short
-message, and it shows on a screen for their specific station. Open points:
+A live view used *during* the event: people and leaders send short messages
+that show up on a big screen.
 
-- A "station" concept (e.g. kitchen, entrance, nissetog) that screens and
-  senders are tied to; probably linked to oppgaver.
-- Screens are just a web page opened full-screen on a TV or tablet, with a
-  per-station link instead of a login, and updates pushed in real time
-  (websocket/SSE) or by short polling.
-- Who may post (any signed-up volunteer on that station vs leaders only),
-  how long a message stays up, and a way for a leader/admin to clear or
-  override one.
+**The screen.** One screen shows all stations at once, each station (an
+oppgave) as its own horizontal lane. A new message enters its station's lane
+from the right side of the screen. Each message shows **who sent it and when**
+(sender name and timestamp). A message stays until newer messages push it
+out of the lane. (Our reading of "pushed out by others"; confirm.)
+
+**Who sends and who sees.**
+- Leaders and volunteers can send a message to a station.
+- Senders do **not** see each other's messages. A sender only sees what they
+  wrote themselves (their own sent list). The big screen shows everything.
+
+**Admin moderation.** An admin sets a status on each message, e.g.
+`waiting` / `active` / `cleared`. Our reading: `waiting` = sent but not shown
+yet (held for approval or queued), `active` = on the screen, `cleared` =
+taken down. Confirm whether new messages start as `waiting` (admin approves
+each one) or go straight to `active` (admin only clears), since that decides
+how much work the admin has during the event.
+
+Open points:
+- A "station" tied to oppgaver, and which station(s) a sender may post to
+  (only their own, or any).
+- The screen is a web page opened full-screen on a TV or tablet, with a
+  secret link rather than a login, updated in real time (websocket/SSE) or by
+  short polling.
+- How many messages a lane keeps visible before the oldest is pushed out, and
+  whether a very old one fades regardless.
 - Overlaps with the push-notification idea below: decide whether station
   messages and phone notifications share one message model.
 
