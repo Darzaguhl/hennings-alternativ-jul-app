@@ -81,17 +81,43 @@ breakage are visible.
 
 ## Live event dashboard and station screens
 
-A live view used *during* the event. A person or a leader sends a short
-message, and it shows on a screen for their specific station. Open points:
+A live view used *during* the event: people and leaders send short messages
+that show up on a big screen.
 
-- A "station" concept (e.g. kitchen, entrance, nissetog) that screens and
-  senders are tied to; probably linked to oppgaver.
-- Screens are just a web page opened full-screen on a TV or tablet, with a
-  per-station link instead of a login, and updates pushed in real time
-  (websocket/SSE) or by short polling.
-- Who may post (any signed-up volunteer on that station vs leaders only),
-  how long a message stays up, and a way for a leader/admin to clear or
-  override one.
+**The screen.** One screen shows all stations at once, each station (an
+oppgave) as its own horizontal lane. A new message enters its station's lane
+from the right side of the screen. Each message shows **who sent it and when**
+(sender name and timestamp).
+
+**Message age.** A configurable timer (default about 15 minutes) decides when
+a message becomes "old". Fresh messages sit on the right; once a message is
+old it moves to the left side of its lane and stacks there with the other
+old ones.
+
+**Who sends and who sees.**
+- Leaders and volunteers can send a message to a station.
+- Senders do **not** see each other's messages. A sender only sees what they
+  wrote themselves (their own sent list). The big screen shows everything.
+
+**Admin moderation.** An admin sets a status on each message, e.g.
+`waiting` / `active` / `cleared`: `waiting` = sent but not shown yet,
+`active` = on the screen, `cleared` = taken down. Approval is a setting:
+either an admin moves each message from `waiting` to `active` by hand, or the
+admin switches it to **auto**, so new messages go straight to `active` and the
+admin only clears the bad ones.
+
+Open points:
+- A "station" tied to oppgaver, and which station(s) a sender may post to
+  (only their own, or any).
+- The screen is a web page opened full-screen on a TV or tablet, with a
+  secret link rather than a login, updated in real time (websocket/SSE) or by
+  short polling.
+- The left-hand stack of old messages keeps **10** per lane; when an 11th
+  arrives, the oldest is cleared. Make the 10 configurable too.
+- The message-age timer, the approval mode (manual/auto) and the stack size
+  are **event-level settings**, with sensible defaults (15 min, manual, 10).
+  They are stored as settings, not hardcoded, so they can be changed per
+  event (and later per station if that turns out to be needed).
 - Overlaps with the push-notification idea below: decide whether station
   messages and phone notifications share one message model.
 
