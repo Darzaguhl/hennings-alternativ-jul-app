@@ -112,9 +112,12 @@ Open points:
 - The screen is a web page opened full-screen on a TV or tablet, with a
   secret link rather than a login, updated in real time (websocket/SSE) or by
   short polling.
-- How many old messages the left-hand stack keeps before the oldest drops
-  off, and whether the timer and the approval mode (manual/auto) are set per
-  event or per station.
+- The left-hand stack of old messages keeps **10** per lane; when an 11th
+  arrives, the oldest is cleared. Make the 10 configurable too.
+- The message-age timer, the approval mode (manual/auto) and the stack size
+  are **event-level settings**, with sensible defaults (15 min, manual, 10).
+  They are stored as settings, not hardcoded, so they can be changed per
+  event (and later per station if that turns out to be needed).
 - Overlaps with the push-notification idea below: decide whether station
   messages and phone notifications share one message model.
 
