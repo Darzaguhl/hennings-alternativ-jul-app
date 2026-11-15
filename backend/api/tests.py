@@ -26,6 +26,7 @@ from .models import (
     ShiftConflict,
     ShiftSignup,
     Skill,
+    StandingOverride,
     X1Signup,
 )
 
@@ -3416,3 +3417,239 @@ class RatingTests(TestCase):
     def test_unauthenticated_gets_401(self):
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.get("/api/ratings/").status_code, 401)
+
+
+class StandingTests(TestCase):
+    """Internal volunteer standing, derived from ratings, check-ins and flags
+    (api/standing.py). Admin-only; the volunteer never sees it."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.other_admin = User.objects.create_user(username="other_admin", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        self.anchor = User.objects.create_user(username="anchor", password="pw")  # always shows up
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw", first_name="Kari", last_name="Nordmann")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.other_event = make_event(title="Annet", created_by=self.other_admin)
+        self.client = APIClient()
+        self._day = 0
+
+    def _shift(self, event=None, days_ago=1):
+        event = event or self.event
+        shift = Shift.objects.create(
+            event=event, title=f"Vakt {self._day}", date=datetime.date.today() - datetime.timedelta(days=days_ago),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=event.created_by,
+        )
+        self._day += 1
+        return shift
+
+    def _worked(self, user, *, showed_up, event=None, days_ago=None, anchor_present=True):
+        """A past vakt the user was confirmed onto; showed_up controls their
+        check-in, anchor_present whether anyone at all checked in that day."""
+        event = event or self.event
+        self._day += 1
+        shift = self._shift(event, days_ago=days_ago if days_ago is not None else self._day)
+        slot = make_slot(shift, skill_name=f"Oppgave {self._day}")
+        Assignment.objects.create(oppgave_slot=slot, user=user, confirmed_by=event.created_by)
+        if anchor_present:
+            EventCheckIn.objects.get_or_create(event=event, user=self.anchor, date=shift.date)
+        if showed_up:
+            EventCheckIn.objects.get_or_create(event=event, user=user, date=shift.date)
+        return shift
+
+    def _rate(self, shift, level, user=None, event=None, note=""):
+        if level == "bekymring" and not note:
+            note = "Se notat"
+        return Rating.objects.create(
+            event=event or self.event, user=user or self.volunteer, shift=shift, rated_by=self.leader, level=level, note=note
+        )
+
+    def _row(self, as_user=None, user=None):
+        self.client.force_authenticate(user=as_user or self.admin)
+        response = self.client.get(f"/api/standings/{(user or self.volunteer).id}/")
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def test_volunteer_with_only_an_upcoming_assignment_is_new(self):
+        shift = self._shift(days_ago=-3)
+        Assignment.objects.create(oppgave_slot=make_slot(shift), user=self.volunteer, confirmed_by=self.admin)
+
+        row = self._row()
+        self.assertEqual(row["standing"], "new")
+        self.assertEqual(row["upcoming"], 1)
+        self.assertIsNone(row["no_show_rate"])
+
+    def test_attending_makes_good_standing(self):
+        self._worked(self.volunteer, showed_up=True)
+
+        row = self._row()
+        self.assertEqual(row["standing"], "good")
+        self.assertEqual((row["attended"], row["no_shows"], row["no_show_rate"]), (1, 0, 0.0))
+        self.assertEqual(row["reasons"], [])
+
+    def test_no_show_when_others_checked_in_but_they_did_not(self):
+        self._worked(self.volunteer, showed_up=False)
+
+        row = self._row()
+        self.assertEqual(row["no_shows"], 1)
+        self.assertEqual(row["no_show_rate"], 1.0)
+        self.assertEqual(row["standing"], "concern")
+        self.assertEqual(row["reasons"], ["no_shows"])
+
+    def test_day_with_no_check_ins_at_all_is_not_a_no_show(self):
+        self._worked(self.volunteer, showed_up=False, anchor_present=False)
+
+        row = self._row()
+        self.assertEqual(row["no_shows"], 0)
+        self.assertEqual(row["standing"], "new")
+
+    def test_no_show_threshold_boundary(self):
+        # 1 no-show in 4 judged days = 0.25, which is not *over* the threshold.
+        for _ in range(3):
+            self._worked(self.volunteer, showed_up=True)
+        self._worked(self.volunteer, showed_up=False)
+        self.assertEqual(self._row()["standing"], "good")
+
+        # 1 in 3 = 0.33 is over it.
+        Assignment.objects.filter(user=self.volunteer).order_by("date").first().delete()
+        EventCheckIn.objects.filter(user=self.volunteer).order_by("date").first().delete()
+        row = self._row()
+        self.assertEqual(row["no_show_rate"], 0.333)
+        self.assertEqual(row["standing"], "concern")
+
+    def test_withdrawn_assignment_is_not_a_no_show(self):
+        shift = self._worked(self.volunteer, showed_up=False)
+        Assignment.objects.filter(shift=shift, user=self.volunteer).delete()
+        self._rate(shift, "ok")
+
+        row = self._row()
+        self.assertEqual(row["no_shows"], 0)
+        self.assertEqual(row["standing"], "good")
+
+    def test_bekymring_rating_means_concern_even_with_perfect_attendance(self):
+        shift = self._worked(self.volunteer, showed_up=True)
+        self._rate(shift, "bekymring", note="Uhøflig mot gjester")
+
+        row = self._row()
+        self.assertEqual(row["standing"], "concern")
+        self.assertEqual(row["reasons"], ["bekymring"])
+        self.assertEqual(row["ratings"]["bekymring"], 1)
+
+    def test_both_reasons_are_reported(self):
+        shift = self._worked(self.volunteer, showed_up=False)
+        self._rate(shift, "bekymring")
+
+        self.assertEqual(self._row()["reasons"], ["bekymring", "no_shows"])
+
+    def test_good_ratings_alone_give_good_standing(self):
+        shift = self._shift()
+        self._rate(shift, "utmerket")
+
+        row = self._row()
+        self.assertEqual(row["standing"], "good")
+        self.assertEqual(row["ratings"]["utmerket"], 1)
+
+    def test_commendations_are_counted_but_do_not_change_standing(self):
+        shift = self._worked(self.volunteer, showed_up=True)
+        Commendation.objects.create(event=self.event, user=self.volunteer, shift=shift, flagged_by=self.leader)
+
+        row = self._row()
+        self.assertEqual(row["commendations"], 1)
+        self.assertEqual(row["standing"], "good")
+
+    def test_override_wins_over_computed_and_keeps_computed_visible(self):
+        shift = self._worked(self.volunteer, showed_up=True)
+        self._rate(shift, "bekymring")
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.put(
+            f"/api/standings/{self.volunteer.id}/override/", {"level": "good", "note": "Engangshendelse, avklart"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["standing"], "good")
+        self.assertEqual(response.data["computed"], "concern")
+        self.assertEqual(response.data["override_note"], "Engangshendelse, avklart")
+        self.assertEqual(StandingOverride.objects.get().set_by, self.admin)
+
+    def test_override_can_flag_concern_on_someone_who_looks_fine(self):
+        self._worked(self.volunteer, showed_up=True)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.put(
+            f"/api/standings/{self.volunteer.id}/override/", {"level": "concern", "note": "Meldt av gjest"}, format="json"
+        )
+
+        self.assertEqual(response.data["standing"], "concern")
+        self.assertEqual(response.data["computed"], "good")
+
+    def test_override_requires_valid_level_and_a_note(self):
+        self._worked(self.volunteer, showed_up=True)
+        self.client.force_authenticate(user=self.admin)
+        url = f"/api/standings/{self.volunteer.id}/override/"
+
+        self.assertEqual(self.client.put(url, {"level": "good", "note": ""}, format="json").status_code, 400)
+        self.assertEqual(self.client.put(url, {"level": "good", "note": "   "}, format="json").status_code, 400)
+        self.assertEqual(self.client.put(url, {"level": "excellent", "note": "x"}, format="json").status_code, 400)
+        self.assertEqual(self.client.put(url, {"level": "good", "note": "x" * 301}, format="json").status_code, 400)
+        self.assertFalse(StandingOverride.objects.exists())
+
+    def test_override_can_be_updated_and_cleared(self):
+        shift = self._worked(self.volunteer, showed_up=True)
+        self._rate(shift, "bekymring")
+        self.client.force_authenticate(user=self.admin)
+        url = f"/api/standings/{self.volunteer.id}/override/"
+        self.client.put(url, {"level": "good", "note": "Første"}, format="json")
+        self.client.put(url, {"level": "concern", "note": "Andre"}, format="json")
+
+        self.assertEqual(StandingOverride.objects.count(), 1)
+        self.assertEqual(StandingOverride.objects.get().note, "Andre")
+
+        self.assertEqual(self.client.delete(url).status_code, 204)
+        row = self._row()
+        self.assertIsNone(row["override"])
+        self.assertEqual(row["standing"], "concern")  # back to the automatic one
+
+    def test_list_filters_by_standing_and_sorts_by_name(self):
+        good = User.objects.create_user(username="good", password="pw", first_name="Anne", last_name="Berg")
+        self._worked(good, showed_up=True)
+        self._worked(self.volunteer, showed_up=False)
+        self.client.force_authenticate(user=self.admin)
+
+        everyone = self.client.get("/api/standings/").data
+        self.assertEqual([r["user_name"] for r in everyone if r["user"] in (good.id, self.volunteer.id)], ["Anne Berg", "Kari Nordmann"])
+
+        concerned = self.client.get("/api/standings/?standing=concern").data
+        self.assertEqual([r["user"] for r in concerned], [self.volunteer.id])
+
+    def test_non_admins_get_an_empty_list_and_404(self):
+        self._worked(self.volunteer, showed_up=True)
+        self.event.shifts.first().leaders.add(self.leader)
+
+        for who in (self.leader, self.volunteer):
+            self.client.force_authenticate(user=who)
+            self.assertEqual(self.client.get("/api/standings/").data, [])
+            self.assertEqual(self.client.get(f"/api/standings/{self.volunteer.id}/").status_code, 404)
+            self.assertEqual(
+                self.client.put(f"/api/standings/{self.volunteer.id}/override/", {"level": "good", "note": "x"}, format="json").status_code,
+                404,
+            )
+        self.assertFalse(StandingOverride.objects.exists())
+
+    def test_admin_only_sees_people_and_data_from_their_own_events(self):
+        # Kari worked event A fine, but was rated Bekymring at event B.
+        self._worked(self.volunteer, showed_up=True)
+        other_shift = self._worked(self.volunteer, showed_up=True, event=self.other_event)
+        self._rate(other_shift, "bekymring", event=self.other_event)
+
+        self.assertEqual(self._row(self.admin)["standing"], "good")  # B's rating isn't theirs to count
+        self.assertEqual(self._row(self.other_admin)["standing"], "concern")
+
+        stranger = User.objects.create_user(username="stranger", password="pw")
+        self._worked(stranger, showed_up=True, event=self.other_event)
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(self.client.get(f"/api/standings/{stranger.id}/").status_code, 404)
+        self.assertNotIn(stranger.id, [r["user"] for r in self.client.get("/api/standings/").data])
+
+    def test_unauthenticated_gets_401(self):
+        self.assertEqual(self.client.get("/api/standings/").status_code, 401)

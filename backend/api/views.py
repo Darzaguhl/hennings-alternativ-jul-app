@@ -14,11 +14,13 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .standing import compute_standings
 from .email import send_invite_email, send_password_setup_email
 from .models import (
     Assignment,
     Commendation,
     Rating,
+    StandingOverride,
     Event,
     EventCheckIn,
     Invite,
@@ -1548,3 +1550,78 @@ class RatingViewSet(viewsets.ModelViewSet):
         if not (instance.event.is_admin(self.request.user) or instance.rated_by_id == self.request.user.pk):
             raise PermissionDenied("Only an admin or the leader who gave this rating can remove it.")
         instance.delete()
+
+
+class StandingViewSet(viewsets.ViewSet):
+    """Internal volunteer standing -- see api/standing.py. Admin-only and
+    read-mostly: standing is derived from ratings, check-ins and flags, and
+    the only thing an admin can write is an override with a reason. Only
+    data from events the requester administers is ever counted or listed;
+    anyone who administers no event gets an empty list. The volunteer being
+    described has no access at all (lookup is by user id, so a volunteer
+    asking about themselves is just "not in your scope" -> 404)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _rows(self, request):
+        admin_event_ids = list(
+            Membership.objects.filter(
+                user=request.user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]
+            ).values_list("event_id", flat=True)
+        )
+        if not admin_event_ids:
+            return []
+        rows = compute_standings(admin_event_ids)
+        users = get_user_model().objects.in_bulk(list(rows))
+        result = []
+        for user_id, row in rows.items():
+            person = users.get(user_id)
+            if person is None:
+                continue
+            result.append(
+                {
+                    **row,
+                    "user_email": person.email,
+                    "user_name": f"{person.first_name} {person.last_name}".strip(),
+                }
+            )
+        result.sort(key=lambda r: (r["user_name"] or r["user_email"]).lower())
+        return result
+
+    def list(self, request):
+        rows = self._rows(request)
+        wanted = request.query_params.get("standing")
+        if wanted:
+            rows = [r for r in rows if r["standing"] == wanted]
+        return Response(rows)
+
+    def retrieve(self, request, pk=None):
+        for row in self._rows(request):
+            if str(row["user"]) == str(pk):
+                return Response(row)
+        return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=["put", "delete"], url_path="override")
+    def override(self, request, pk=None):
+        """PUT {level: good|concern, note} sets the manual override; DELETE
+        clears it, returning the person to their automatic standing."""
+        if not any(str(r["user"]) == str(pk) for r in self._rows(request)):
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        target = get_object_or_404(get_user_model(), pk=pk)
+
+        if request.method == "DELETE":
+            StandingOverride.objects.filter(user=target).delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        level = request.data.get("level")
+        note = str(request.data.get("note") or "").strip()
+        if level not in dict(StandingOverride.LEVEL_CHOICES):
+            raise ValidationError({"level": "Must be 'good' or 'concern'."})
+        if not note:
+            raise ValidationError({"note": "A note explaining the override is required."})
+        if len(note) > 300:
+            raise ValidationError({"note": "Keep the note under 300 characters."})
+        StandingOverride.objects.update_or_create(
+            user=target, defaults={"level": level, "note": note, "set_by": request.user}
+        )
+        return self.retrieve(request, pk=pk)
