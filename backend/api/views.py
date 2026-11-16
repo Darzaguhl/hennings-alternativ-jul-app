@@ -14,11 +14,14 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .standing import STATUS_NO_SHOW, attendance_records, compute_standings
 from .email import send_invite_email, send_password_setup_email
 from .models import (
+    AbsenceExcuse,
     Assignment,
     Commendation,
     Rating,
+    StandingOverride,
     Event,
     EventCheckIn,
     Invite,
@@ -664,6 +667,105 @@ class EventViewSet(viewsets.ModelViewSet):
         if not deleted:
             return Response({"detail": "No check-in found for that user on that date."}, status=status.HTTP_404_NOT_FOUND)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="attendance")
+    def attendance(self, request, pk=None):
+        """Per-day picture of who signed up, who actually arrived and who
+        didn't -- the record behind "no-show" in volunteer standing. Admin
+        only. Check-in is expected every day, so a past signup with no
+        check-in is a no-show unless an admin has excused it (see
+        attendance_excuse)."""
+
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can see attendance."}, status=status.HTTP_403_FORBIDDEN)
+
+        records = attendance_records([event.pk])
+        users = User.objects.in_bulk({r["user"] for r in records})
+        order = {"no_show": 0, "excused": 1, "upcoming": 2, "attended": 3, "walk_in": 4}
+
+        by_date = {}
+        for rec in records:
+            person = users[rec["user"]]
+            by_date.setdefault(rec["date"], []).append(
+                {
+                    "user": rec["user"],
+                    "user_email": person.email,
+                    "user_name": f"{person.first_name} {person.last_name}".strip(),
+                    "status": rec["status"],
+                    "oppgaver": rec["oppgaver"],
+                    "assigned": rec["assigned"],
+                    "excuse_note": rec["excuse_note"],
+                }
+            )
+
+        days = []
+        for date in sorted(by_date):
+            people = sorted(by_date[date], key=lambda p: (order[p["status"]], (p["user_name"] or p["user_email"]).lower()))
+            days.append(
+                {
+                    "date": date.isoformat(),
+                    "checked_in": sum(1 for p in people if p["status"] in ("attended", "walk_in")),
+                    "signed_up": sum(1 for p in people if p["status"] != "walk_in"),
+                    "no_shows": sum(1 for p in people if p["status"] == STATUS_NO_SHOW),
+                    "excused": sum(1 for p in people if p["status"] == "excused"),
+                    "people": people,
+                }
+            )
+        return Response({"event": event.pk, "days": days})
+
+    @action(detail=True, methods=["post", "delete"], url_path="attendance/excuse")
+    def attendance_excuse(self, request, pk=None):
+        """Excuse (POST) or un-excuse (DELETE) one absence so it stops
+        counting against the volunteer's standing.
+
+        POST {user_id, date, note?} excuses one person's absence on that
+        day; POST {date, all: true, note?} excuses every current no-show on
+        that day (e.g. a day check-in wasn't run). Only a real, unexcused
+        no-show can be excused -- nothing is recorded for someone who
+        attended, withdrew, or is still upcoming. DELETE {user_id, date}
+        takes the excuse back. Admin only."""
+
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can excuse an absence."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            date = datetime.date.fromisoformat(str(request.data.get("date")))
+        except ValueError:
+            return Response({"detail": "date must be YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if request.method == "DELETE":
+            deleted, _ = AbsenceExcuse.objects.filter(
+                event=event, user_id=request.data.get("user_id"), date=date
+            ).delete()
+            if not deleted:
+                return Response({"detail": "No excuse found for that person on that date."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        note = str(request.data.get("note") or "").strip()
+        if len(note) > 300:
+            return Response({"detail": "Keep the note under 300 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        absent = [r["user"] for r in attendance_records([event.pk]) if r["date"] == date and r["status"] == STATUS_NO_SHOW]
+        if request.data.get("all"):
+            targets = absent
+        else:
+            try:
+                user_id = int(request.data.get("user_id"))
+            except (TypeError, ValueError):
+                return Response({"detail": "user_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+            if user_id not in absent:
+                return Response(
+                    {"detail": "That person has no unexcused absence on that date."}, status=status.HTTP_400_BAD_REQUEST
+                )
+            targets = [user_id]
+
+        for user_id in targets:
+            AbsenceExcuse.objects.update_or_create(
+                event=event, user_id=user_id, date=date, defaults={"note": note, "excused_by": request.user}
+            )
+        return Response({"excused": len(targets)})
 
     @action(detail=True, methods=["post"], url_path="self-checkin")
     def self_checkin(self, request, pk=None):
@@ -1548,3 +1650,78 @@ class RatingViewSet(viewsets.ModelViewSet):
         if not (instance.event.is_admin(self.request.user) or instance.rated_by_id == self.request.user.pk):
             raise PermissionDenied("Only an admin or the leader who gave this rating can remove it.")
         instance.delete()
+
+
+class StandingViewSet(viewsets.ViewSet):
+    """Internal volunteer standing -- see api/standing.py. Admin-only and
+    read-mostly: standing is derived from ratings, check-ins and flags, and
+    the only thing an admin can write is an override with a reason. Only
+    data from events the requester administers is ever counted or listed;
+    anyone who administers no event gets an empty list. The volunteer being
+    described has no access at all (lookup is by user id, so a volunteer
+    asking about themselves is just "not in your scope" -> 404)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _rows(self, request):
+        admin_event_ids = list(
+            Membership.objects.filter(
+                user=request.user, role__in=[Membership.ROLE_OWNER, Membership.ROLE_ADMIN]
+            ).values_list("event_id", flat=True)
+        )
+        if not admin_event_ids:
+            return []
+        rows = compute_standings(admin_event_ids)
+        users = get_user_model().objects.in_bulk(list(rows))
+        result = []
+        for user_id, row in rows.items():
+            person = users.get(user_id)
+            if person is None:
+                continue
+            result.append(
+                {
+                    **row,
+                    "user_email": person.email,
+                    "user_name": f"{person.first_name} {person.last_name}".strip(),
+                }
+            )
+        result.sort(key=lambda r: (r["user_name"] or r["user_email"]).lower())
+        return result
+
+    def list(self, request):
+        rows = self._rows(request)
+        wanted = request.query_params.get("standing")
+        if wanted:
+            rows = [r for r in rows if r["standing"] == wanted]
+        return Response(rows)
+
+    def retrieve(self, request, pk=None):
+        for row in self._rows(request):
+            if str(row["user"]) == str(pk):
+                return Response(row)
+        return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=["put", "delete"], url_path="override")
+    def override(self, request, pk=None):
+        """PUT {level: good|concern, note} sets the manual override; DELETE
+        clears it, returning the person to their automatic standing."""
+        if not any(str(r["user"]) == str(pk) for r in self._rows(request)):
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        target = get_object_or_404(get_user_model(), pk=pk)
+
+        if request.method == "DELETE":
+            StandingOverride.objects.filter(user=target).delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        level = request.data.get("level")
+        note = str(request.data.get("note") or "").strip()
+        if level not in dict(StandingOverride.LEVEL_CHOICES):
+            raise ValidationError({"level": "Must be 'good' or 'concern'."})
+        if not note:
+            raise ValidationError({"note": "A note explaining the override is required."})
+        if len(note) > 300:
+            raise ValidationError({"note": "Keep the note under 300 characters."})
+        StandingOverride.objects.update_or_create(
+            user=target, defaults={"level": level, "note": note, "set_by": request.user}
+        )
+        return self.retrieve(request, pk=pk)
