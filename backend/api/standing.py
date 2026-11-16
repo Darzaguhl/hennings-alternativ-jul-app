@@ -16,19 +16,19 @@ with the reasons that caused it):
 
 A no-show is a *signup* for a past day with no check-in from that person
 that day (Assignments are only created at check-in, so signups are the
-record of who said they would come). It only counts on days where *anyone*
-was checked in at all -- a day where check-in simply wasn't used would
-otherwise make every volunteer a no-show, so such days are reported as
-"untracked" (and flagged in the attendance view) instead of guessed at.
-Avmelding removes the signup, so a volunteer who withdrew in time is not a
-no-show.
+record of who said they would come). Check-in is expected to be used every
+day, so a past day with signups and nobody checked in really does read as
+everyone absent -- an admin can excuse those absences in bulk (see
+AbsenceExcuse) if that's not what happened. Avmelding removes the signup, so
+a volunteer who withdrew in time is not a no-show, and an excused absence
+drops out of the rate entirely.
 """
 
 from collections import defaultdict
 
 from django.utils import timezone
 
-from .models import Assignment, Commendation, EventCheckIn, Rating, ShiftSignup, StandingOverride
+from .models import AbsenceExcuse, Assignment, Commendation, EventCheckIn, Rating, ShiftSignup, StandingOverride
 
 NO_SHOW_THRESHOLD = 0.25
 
@@ -43,7 +43,7 @@ REASON_NO_SHOWS = "no_shows"
 STATUS_ATTENDED = "attended"
 STATUS_NO_SHOW = "no_show"
 STATUS_UPCOMING = "upcoming"
-STATUS_UNTRACKED = "untracked"
+STATUS_EXCUSED = "excused"
 STATUS_WALK_IN = "walk_in"
 
 
@@ -53,8 +53,8 @@ def attendance_records(event_ids, today=None):
 
       attended  -- signed up (or assigned) and checked in
       walk_in   -- checked in without having signed up
-      no_show   -- signed up, the day is past, others checked in but they didn't
-      untracked -- signed up, day is past, but nobody was checked in at all
+      no_show   -- signed up, the day is past, and they never checked in
+      excused   -- as no_show, but an admin has excused the absence
       upcoming  -- signed up for today or later and not (yet) checked in
 
     Shared by standing and the per-day attendance view so the two can never
@@ -68,6 +68,13 @@ def attendance_records(event_ids, today=None):
         "event_id", "user_id", "date"
     ):
         arrivals[(event_id, date)].add(user_id)
+
+    excuses = {
+        (event_id, user_id, date): note
+        for event_id, user_id, date, note in AbsenceExcuse.objects.filter(event_id__in=event_ids).values_list(
+            "event_id", "user_id", "date", "note"
+        )
+    }
 
     people = {}  # (event, date, user) -> {"oppgaver": set, "assigned": name|None}
 
@@ -94,10 +101,10 @@ def attendance_records(event_ids, today=None):
             status = STATUS_ATTENDED if signed_up else STATUS_WALK_IN
         elif date >= today:
             status = STATUS_UPCOMING
-        elif arrivals.get((event_id, date)):
-            status = STATUS_NO_SHOW
+        elif (event_id, user_id, date) in excuses:
+            status = STATUS_EXCUSED
         else:
-            status = STATUS_UNTRACKED
+            status = STATUS_NO_SHOW
         records.append(
             {
                 "event": event_id,
@@ -108,6 +115,7 @@ def attendance_records(event_ids, today=None):
                 "checked_in": checked_in,
                 "oppgaver": sorted(o for o in info["oppgaver"] if o),
                 "assigned": info["assigned"],
+                "excuse_note": excuses.get((event_id, user_id, date), ""),
             }
         )
     return records
@@ -131,6 +139,7 @@ def compute_standings(event_ids, today=None):
                 "attended": 0,
                 "walk_ins": 0,
                 "no_shows": 0,
+                "excused": 0,
                 "upcoming": 0,
                 "events": set(),
             }
@@ -145,6 +154,8 @@ def compute_standings(event_ids, today=None):
             r["walk_ins"] += 1
         elif rec["status"] == STATUS_NO_SHOW:
             r["no_shows"] += 1
+        elif rec["status"] == STATUS_EXCUSED:
+            r["excused"] += 1
         elif rec["status"] == STATUS_UPCOMING:
             r["upcoming"] += 1
 

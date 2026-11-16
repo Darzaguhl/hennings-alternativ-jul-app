@@ -800,3 +800,33 @@ class StandingOverride(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user}: {self.level}"
+
+
+class AbsenceExcuse(models.Model):
+    """An admin's decision that one specific absence shouldn't count against
+    someone -- a late sick call, a family emergency -- recorded per person
+    per day. Avmelding in time already removes the signup, so this is for
+    the cases that came too late (or never made it into the system).
+
+    An excused absence is neither a no-show nor attendance: it simply drops
+    out of the volunteer's no-show rate. Internal only, like all standing
+    data. Only meaningful for a day the person actually signed up for and
+    missed; attendance_excuse refuses to excuse anything else.
+    """
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="absence_excuses")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="absence_excuses")
+    date = models.DateField()
+    note = models.CharField(max_length=300, blank=True)
+    excused_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="absence_excuses_given"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["event", "user", "date"], name="unique_absence_excuse_per_day"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user} excused @ {self.event} ({self.date})"

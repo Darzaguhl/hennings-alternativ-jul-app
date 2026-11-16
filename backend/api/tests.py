@@ -10,6 +10,7 @@ from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
+    AbsenceExcuse,
     Assignment,
     Commendation,
     Event,
@@ -3499,12 +3500,35 @@ class StandingTests(TestCase):
         self.assertEqual(row["standing"], "concern")
         self.assertEqual(row["reasons"], ["no_shows"])
 
-    def test_day_with_no_check_ins_at_all_is_not_a_no_show(self):
+    def test_day_with_no_check_ins_at_all_counts_as_no_show(self):
+        # Check-in is expected every day, so nobody checking in is absence,
+        # not "unknown" (an admin can excuse the day in bulk if need be).
         self._worked(self.volunteer, showed_up=False, anchor_present=False)
 
         row = self._row()
-        self.assertEqual(row["no_shows"], 0)
-        self.assertEqual(row["standing"], "new")
+        self.assertEqual(row["no_shows"], 1)
+        self.assertEqual(row["standing"], "concern")
+
+    def test_excused_absence_does_not_count_and_is_reported(self):
+        shift = self._worked(self.volunteer, showed_up=False)
+        AbsenceExcuse.objects.create(event=self.event, user=self.volunteer, date=shift.date, excused_by=self.admin)
+
+        row = self._row()
+        self.assertEqual((row["no_shows"], row["excused"]), (0, 1))
+        self.assertIsNone(row["no_show_rate"])
+        self.assertEqual(row["standing"], "new")  # nothing left to judge by
+
+    def test_excused_days_drop_out_of_the_rate_but_other_days_still_count(self):
+        for _ in range(3):
+            self._worked(self.volunteer, showed_up=True)
+        excused = self._worked(self.volunteer, showed_up=False)
+        self._worked(self.volunteer, showed_up=False)
+        AbsenceExcuse.objects.create(event=self.event, user=self.volunteer, date=excused.date, excused_by=self.admin)
+
+        row = self._row()
+        self.assertEqual((row["attended"], row["no_shows"], row["excused"]), (3, 1, 1))
+        self.assertEqual(row["no_show_rate"], 0.25)
+        self.assertEqual(row["standing"], "good")
 
     def test_no_show_threshold_boundary(self):
         # 1 no-show in 4 judged days = 0.25, which is not *over* the threshold.
@@ -3715,7 +3739,7 @@ class AttendanceTests(TestCase):
         self.assertEqual(response.status_code, 200)
         (day,) = response.data["days"]
         self.assertEqual(day["date"], shift.date.isoformat())
-        self.assertEqual((day["signed_up"], day["checked_in"], day["no_shows"], day["tracked"]), (2, 1, 1, True))
+        self.assertEqual((day["signed_up"], day["checked_in"], day["no_shows"], day["excused"]), (2, 1, 1, 0))
         by_name = {p["user_name"]: p for p in day["people"]}
         self.assertEqual(by_name["Ola Hansen"]["status"], "no_show")
         self.assertEqual(by_name["Kari Nordmann"]["status"], "attended")
@@ -3730,14 +3754,13 @@ class AttendanceTests(TestCase):
         self.assertEqual(day["people"][0]["status"], "walk_in")
         self.assertEqual((day["signed_up"], day["checked_in"], day["no_shows"]), (0, 1, 0))
 
-    def test_day_without_any_check_ins_is_flagged_untracked_not_all_no_shows(self):
+    def test_day_without_any_check_ins_reads_as_everyone_absent(self):
         shift, slot = self._day(3)
         ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
 
         (day,) = self._get().data["days"]
-        self.assertFalse(day["tracked"])
-        self.assertEqual(day["no_shows"], 0)
-        self.assertEqual(day["people"][0]["status"], "untracked")
+        self.assertEqual(day["no_shows"], 1)
+        self.assertEqual(day["people"][0]["status"], "no_show")
 
     def test_upcoming_day_is_not_a_no_show(self):
         shift, slot = self._day(-2)
@@ -3745,7 +3768,6 @@ class AttendanceTests(TestCase):
 
         (day,) = self._get().data["days"]
         self.assertEqual(day["people"][0]["status"], "upcoming")
-        self.assertTrue(day["tracked"])
 
     def test_withdrawn_signup_disappears(self):
         shift, slot = self._day(2)
@@ -3770,3 +3792,95 @@ class AttendanceTests(TestCase):
         self.assertIn(self._get(self.other_admin).status_code, (403, 404))
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.get(f"/api/events/{self.event.id}/attendance/").status_code, 401)
+
+    # --- excusing absences -------------------------------------------------
+
+    def _missed_day(self, days_ago=2):
+        """Kari signed up and never came; Ola came."""
+        shift, slot = self._day(days_ago)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.ola)
+        EventCheckIn.objects.create(event=self.event, user=self.ola, date=shift.date)
+        return shift
+
+    def _excuse(self, body, as_user=None, method="post"):
+        self.client.force_authenticate(user=as_user or self.admin)
+        return getattr(self.client, method)(f"/api/events/{self.event.id}/attendance/excuse/", body, format="json")
+
+    def test_admin_can_excuse_one_absence_with_a_note(self):
+        shift = self._missed_day()
+
+        response = self._excuse({"user_id": self.kari.id, "date": shift.date.isoformat(), "note": "Syk, ringte kl 16"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"excused": 1})
+        excuse = AbsenceExcuse.objects.get()
+        self.assertEqual((excuse.user, excuse.excused_by, excuse.note), (self.kari, self.admin, "Syk, ringte kl 16"))
+        (day,) = self._get().data["days"]
+        kari = next(p for p in day["people"] if p["user"] == self.kari.id)
+        self.assertEqual((kari["status"], kari["excuse_note"]), ("excused", "Syk, ringte kl 16"))
+        self.assertEqual((day["no_shows"], day["excused"]), (0, 1))
+
+    def test_note_is_optional(self):
+        shift = self._missed_day()
+        self.assertEqual(self._excuse({"user_id": self.kari.id, "date": shift.date.isoformat()}).status_code, 200)
+
+    def test_excusing_twice_is_harmless_but_the_second_is_rejected_as_not_absent(self):
+        shift = self._missed_day()
+        body = {"user_id": self.kari.id, "date": shift.date.isoformat()}
+        self._excuse(body)
+
+        self.assertEqual(self._excuse(body).status_code, 400)
+        self.assertEqual(AbsenceExcuse.objects.count(), 1)
+
+    def test_cannot_excuse_someone_who_attended_or_never_signed_up_or_is_upcoming(self):
+        shift = self._missed_day()
+        date = shift.date.isoformat()
+        self.assertEqual(self._excuse({"user_id": self.ola.id, "date": date}).status_code, 400)  # attended
+        self.assertEqual(self._excuse({"user_id": self.walkin.id, "date": date}).status_code, 400)  # never signed up
+        future, slot = self._day(-2)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)
+        self.assertEqual(self._excuse({"user_id": self.kari.id, "date": future.date.isoformat()}).status_code, 400)
+        self.assertFalse(AbsenceExcuse.objects.exists())
+
+    def test_bulk_excuse_covers_every_no_show_that_day_only(self):
+        shift = self._missed_day(days_ago=3)
+        other_day = self._missed_day(days_ago=1)
+        third, slot = self._day(5)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.walkin)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.kari)  # nobody checked in on that day
+
+        response = self._excuse({"date": third.date.isoformat(), "all": True, "note": "Innsjekk ble ikke kjørt"})
+
+        self.assertEqual(response.data, {"excused": 2})
+        self.assertEqual(AbsenceExcuse.objects.filter(date=third.date).count(), 2)
+        self.assertEqual(AbsenceExcuse.objects.count(), 2)  # the other days are untouched
+        days = {d["date"]: d for d in self._get().data["days"]}
+        self.assertEqual(days[shift.date.isoformat()]["no_shows"], 1)
+        self.assertEqual(days[other_day.date.isoformat()]["no_shows"], 1)
+
+    def test_excuse_can_be_withdrawn(self):
+        shift = self._missed_day()
+        body = {"user_id": self.kari.id, "date": shift.date.isoformat()}
+        self._excuse(body)
+
+        self.assertEqual(self._excuse(body, method="delete").status_code, 204)
+        (day,) = self._get().data["days"]
+        self.assertEqual(day["no_shows"], 1)
+        self.assertEqual(self._excuse(body, method="delete").status_code, 404)
+
+    def test_excuse_needs_a_valid_date_and_user(self):
+        self._missed_day()
+        self.assertEqual(self._excuse({"user_id": self.kari.id, "date": "garbage"}).status_code, 400)
+        self.assertEqual(self._excuse({"user_id": self.kari.id}).status_code, 400)
+        shift_date = (self.today - datetime.timedelta(days=2)).isoformat()
+        self.assertEqual(self._excuse({"date": shift_date}).status_code, 400)
+        self.assertEqual(self._excuse({"user_id": self.kari.id, "date": shift_date, "note": "x" * 301}).status_code, 400)
+
+    def test_only_event_admins_can_excuse(self):
+        shift = self._missed_day()
+        body = {"user_id": self.kari.id, "date": shift.date.isoformat()}
+        self.assertEqual(self._excuse(body, as_user=self.leader).status_code, 403)
+        self.assertEqual(self._excuse(body, as_user=self.kari).status_code, 403)
+        self.assertEqual(self._excuse(body, as_user=self.leader, method="delete").status_code, 403)
+        self.assertFalse(AbsenceExcuse.objects.exists())

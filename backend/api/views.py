@@ -14,9 +14,10 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .standing import STATUS_NO_SHOW, STATUS_UNTRACKED, attendance_records, compute_standings
+from .standing import STATUS_NO_SHOW, attendance_records, compute_standings
 from .email import send_invite_email, send_password_setup_email
 from .models import (
+    AbsenceExcuse,
     Assignment,
     Commendation,
     Rating,
@@ -671,9 +672,9 @@ class EventViewSet(viewsets.ModelViewSet):
     def attendance(self, request, pk=None):
         """Per-day picture of who signed up, who actually arrived and who
         didn't -- the record behind "no-show" in volunteer standing. Admin
-        only. A past day on which nobody at all was checked in is flagged
-        `tracked: false` (check-in wasn't used), and its signups are
-        reported as "untracked" rather than all being called no-shows."""
+        only. Check-in is expected every day, so a past signup with no
+        check-in is a no-show unless an admin has excused it (see
+        attendance_excuse)."""
 
         event = self.get_object()
         if not event.is_admin(request.user):
@@ -681,7 +682,7 @@ class EventViewSet(viewsets.ModelViewSet):
 
         records = attendance_records([event.pk])
         users = User.objects.in_bulk({r["user"] for r in records})
-        order = {"no_show": 0, "untracked": 1, "upcoming": 2, "attended": 3, "walk_in": 4}
+        order = {"no_show": 0, "excused": 1, "upcoming": 2, "attended": 3, "walk_in": 4}
 
         by_date = {}
         for rec in records:
@@ -694,6 +695,7 @@ class EventViewSet(viewsets.ModelViewSet):
                     "status": rec["status"],
                     "oppgaver": rec["oppgaver"],
                     "assigned": rec["assigned"],
+                    "excuse_note": rec["excuse_note"],
                 }
             )
 
@@ -706,11 +708,64 @@ class EventViewSet(viewsets.ModelViewSet):
                     "checked_in": sum(1 for p in people if p["status"] in ("attended", "walk_in")),
                     "signed_up": sum(1 for p in people if p["status"] != "walk_in"),
                     "no_shows": sum(1 for p in people if p["status"] == STATUS_NO_SHOW),
-                    "tracked": not any(p["status"] == STATUS_UNTRACKED for p in people),
+                    "excused": sum(1 for p in people if p["status"] == "excused"),
                     "people": people,
                 }
             )
         return Response({"event": event.pk, "days": days})
+
+    @action(detail=True, methods=["post", "delete"], url_path="attendance/excuse")
+    def attendance_excuse(self, request, pk=None):
+        """Excuse (POST) or un-excuse (DELETE) one absence so it stops
+        counting against the volunteer's standing.
+
+        POST {user_id, date, note?} excuses one person's absence on that
+        day; POST {date, all: true, note?} excuses every current no-show on
+        that day (e.g. a day check-in wasn't run). Only a real, unexcused
+        no-show can be excused -- nothing is recorded for someone who
+        attended, withdrew, or is still upcoming. DELETE {user_id, date}
+        takes the excuse back. Admin only."""
+
+        event = self.get_object()
+        if not event.is_admin(request.user):
+            return Response({"detail": "Only an admin can excuse an absence."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            date = datetime.date.fromisoformat(str(request.data.get("date")))
+        except ValueError:
+            return Response({"detail": "date must be YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if request.method == "DELETE":
+            deleted, _ = AbsenceExcuse.objects.filter(
+                event=event, user_id=request.data.get("user_id"), date=date
+            ).delete()
+            if not deleted:
+                return Response({"detail": "No excuse found for that person on that date."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        note = str(request.data.get("note") or "").strip()
+        if len(note) > 300:
+            return Response({"detail": "Keep the note under 300 characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+        absent = [r["user"] for r in attendance_records([event.pk]) if r["date"] == date and r["status"] == STATUS_NO_SHOW]
+        if request.data.get("all"):
+            targets = absent
+        else:
+            try:
+                user_id = int(request.data.get("user_id"))
+            except (TypeError, ValueError):
+                return Response({"detail": "user_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+            if user_id not in absent:
+                return Response(
+                    {"detail": "That person has no unexcused absence on that date."}, status=status.HTTP_400_BAD_REQUEST
+                )
+            targets = [user_id]
+
+        for user_id in targets:
+            AbsenceExcuse.objects.update_or_create(
+                event=event, user_id=user_id, date=date, defaults={"note": note, "excused_by": request.user}
+            )
+        return Response({"excused": len(targets)})
 
     @action(detail=True, methods=["post"], url_path="self-checkin")
     def self_checkin(self, request, pk=None):
