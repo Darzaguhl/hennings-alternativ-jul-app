@@ -45,12 +45,44 @@ interface AuthUser {
   last_name: string;
 }
 
+// Which "Sign in with Google/Microsoft" options the backend has switched on,
+// plus their public client IDs (not secrets). Empty when none are set up.
+export interface SocialProviders {
+  google?: { client_id: string };
+  microsoft?: { client_id: string };
+}
+
+export type SocialProvider = "google" | "microsoft";
+
+interface SocialLoginResult {
+  created: boolean;
+  profileComplete: boolean;
+}
+
+// Norwegian text for the backend's error codes (api/social_views.py).
+const socialErrorMessage = (code?: string) => {
+  switch (code) {
+    case "password_account":
+      return "Denne e-postadressen har allerede en konto med passord. Logg inn med e-post og passord i stedet.";
+    case "email_unverified":
+      return "Leverandøren har ikke bekreftet e-postadressen din, så vi kan ikke logge deg inn med den. Prøv en annen konto.";
+    case "provider_not_configured":
+      return "Denne innloggingsmåten er ikke satt opp ennå.";
+    case "inactive":
+      return "Kontoen er deaktivert.";
+    default:
+      return "Kunne ikke logge inn. Prøv igjen.";
+  }
+};
+
 interface AuthContextType {
   token: string | null;
   refreshToken: string | null;
   currentUser: AuthUser | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
+  fetchSocialProviders: () => Promise<SocialProviders>;
+  socialLogin: (provider: SocialProvider, idToken: string) => Promise<SocialLoginResult>;
   logout: () => Promise<void>;
   apiFetch: (...args: FetchArgs) => ReturnType<typeof fetch>;
   refreshCurrentUser: () => Promise<void>;
@@ -66,6 +98,8 @@ const AuthContext = createContext<AuthContextType>({
   currentUser: null,
   loading: true,
   login: noop,
+  fetchSocialProviders: async () => ({}),
+  socialLogin: noop,
   logout: noop,
   apiFetch: () => Promise.reject(new Error("Auth context not initialised")),
   refreshCurrentUser: noop,
@@ -183,6 +217,37 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   }, [persistTokens, fetchCurrentUser]);
 
+  // Unauthenticated; any failure just means "no social sign-in".
+  const fetchSocialProviders = useCallback(async (): Promise<SocialProviders> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/social/providers/`);
+      return response.ok ? await response.json() : {};
+    } catch {
+      return {};
+    }
+  }, []);
+
+  // Google/Microsoft ID token -> our own session (the backend verifies the
+  // token and creates a volunteer account for a new e-mail). Never grants a
+  // role: admin/leader access still comes only from our own memberships.
+  const socialLogin = useCallback(
+    async (provider: SocialProvider, idToken: string): Promise<SocialLoginResult> => {
+      const response = await fetch(`${API_BASE_URL}/api/auth/social/`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, id_token: idToken }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(socialErrorMessage(body?.code));
+      if (!body?.access || !body?.refresh) throw new Error("Malformed login response");
+
+      await persistTokens(body.access, body.refresh);
+      await fetchCurrentUser(body.access);
+      return { created: !!body.created, profileComplete: !!body.profile_complete };
+    },
+    [persistTokens, fetchCurrentUser]
+  );
+
   const logout = useCallback(async () => {
     try {
       await clearTokens();
@@ -264,8 +329,19 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const refreshCurrentUser = useCallback(() => fetchCurrentUser(), [fetchCurrentUser]);
 
   const value = useMemo(
-    () => ({ token, refreshToken, currentUser, loading, login, logout, apiFetch, refreshCurrentUser }),
-    [token, refreshToken, currentUser, loading, login, logout, apiFetch, refreshCurrentUser]
+    () => ({
+      token,
+      refreshToken,
+      currentUser,
+      loading,
+      login,
+      fetchSocialProviders,
+      socialLogin,
+      logout,
+      apiFetch,
+      refreshCurrentUser,
+    }),
+    [token, refreshToken, currentUser, loading, login, fetchSocialProviders, socialLogin, logout, apiFetch, refreshCurrentUser]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

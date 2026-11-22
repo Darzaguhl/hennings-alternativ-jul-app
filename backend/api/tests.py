@@ -1,10 +1,12 @@
 import datetime
+import time
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -27,6 +29,7 @@ from .models import (
     ShiftConflict,
     ShiftSignup,
     Skill,
+    SocialIdentity,
     StandingOverride,
     X1Signup,
 )
@@ -3884,3 +3887,596 @@ class AttendanceTests(TestCase):
         self.assertEqual(self._excuse(body, as_user=self.kari).status_code, 403)
         self.assertEqual(self._excuse(body, as_user=self.leader, method="delete").status_code, 403)
         self.assertFalse(AbsenceExcuse.objects.exists())
+
+
+GOOGLE_WEB = "web-client.apps.googleusercontent.com"
+GOOGLE_IOS = "ios-client.apps.googleusercontent.com"
+MS_CLIENT = "00000000-ms-client"
+MS_PERSONAL_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"
+MS_WORK_TENANT = "11111111-2222-3333-4444-555555555555"
+
+
+def _rsa_keypair():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    return pem, private.public_key()
+
+
+class _FakeJwkClient:
+    """Stands in for PyJWKClient: hands back our test public key instead of
+    fetching the provider's key set over the network."""
+
+    def __init__(self, public_key):
+        self.public_key = public_key
+
+    def get_signing_key_from_jwt(self, token):
+        return mock.Mock(key=self.public_key)
+
+
+@override_settings(
+    GOOGLE_OAUTH_WEB_CLIENT_ID=GOOGLE_WEB,
+    GOOGLE_OAUTH_EXTRA_CLIENT_IDS=[GOOGLE_IOS],
+    MICROSOFT_OAUTH_CLIENT_ID=MS_CLIENT,
+)
+class SocialTokenVerificationTests(TestCase):
+    """api/social.py: ID tokens are checked for signature, issuer, audience
+    and expiry, and the e-mail is only called verified when the provider
+    really vouches for it."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Not setUpTestData: Django deep-copies those attributes per test,
+        # and RSA key objects can't be copied. Generating keys is slow-ish,
+        # so do it once per class.
+        super().setUpClass()
+        cls.private_pem, cls.public_key = _rsa_keypair()
+        cls.other_pem, _ = _rsa_keypair()
+
+    def setUp(self):
+        patcher = mock.patch("api.social._jwk_client", return_value=_FakeJwkClient(self.public_key))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _mint(self, claims, key=None):
+        import jwt
+
+        now = int(time.time())
+        payload = {"iat": now, "exp": now + 600, **claims}
+        return jwt.encode(payload, key or self.private_pem, algorithm="RS256", headers={"kid": "test"})
+
+    def _google(self, **overrides):
+        claims = {
+            "iss": "https://accounts.google.com", "aud": GOOGLE_WEB, "sub": "g-123",
+            "email": "Kari@Example.com", "email_verified": True, "given_name": "Kari", "family_name": "Nordmann",
+        }
+        claims.update(overrides)
+        return self._mint(claims)
+
+    def _microsoft(self, tenant=MS_PERSONAL_TENANT, **overrides):
+        claims = {
+            "iss": f"https://login.microsoftonline.com/{tenant}/v2.0", "tid": tenant, "aud": MS_CLIENT,
+            "sub": "m-456", "email": "Ola@Example.com", "name": "Ola Hansen",
+        }
+        claims.update(overrides)
+        return self._mint(claims)
+
+    def test_valid_google_token(self):
+        from .social import verify_id_token
+
+        claims = verify_id_token("google", self._google())
+
+        self.assertEqual(
+            (claims.subject, claims.email, claims.email_verified, claims.first_name, claims.last_name),
+            ("g-123", "kari@example.com", True, "Kari", "Nordmann"),
+        )
+
+    def test_google_accepts_any_configured_client_id_as_audience(self):
+        from .social import verify_id_token
+
+        self.assertEqual(verify_id_token("google", self._google(aud=GOOGLE_IOS)).subject, "g-123")
+
+    def test_google_rejects_token_minted_for_another_app(self):
+        from .social import SocialAuthError, verify_id_token
+
+        with self.assertRaises(SocialAuthError) as ctx:
+            verify_id_token("google", self._google(aud="someone-elses-app"))
+        self.assertEqual(ctx.exception.code, "invalid_token")
+
+    def test_google_rejects_wrong_issuer_expired_and_badly_signed_tokens(self):
+        from .social import SocialAuthError, verify_id_token
+
+        bad = [
+            self._google(iss="https://evil.example.com"),
+            self._google(exp=int(time.time()) - 60),
+            self._mint(
+                {"iss": "https://accounts.google.com", "aud": GOOGLE_WEB, "sub": "x", "email": "a@b.no"}, key=self.other_pem
+            ),
+            "not.a.jwt",
+        ]
+        for token in bad:
+            with self.assertRaises(SocialAuthError):
+                verify_id_token("google", token)
+
+    def test_google_unverified_email_is_reported_as_such(self):
+        from .social import verify_id_token
+
+        self.assertFalse(verify_id_token("google", self._google(email_verified=False)).email_verified)
+        self.assertTrue(verify_id_token("google", self._google(email_verified="true")).email_verified)
+        claims = verify_id_token("google", self._google(email_verified=None))
+        self.assertFalse(claims.email_verified)
+
+    def test_microsoft_personal_account_email_is_verified_and_name_is_split(self):
+        from .social import verify_id_token
+
+        claims = verify_id_token("microsoft", self._microsoft())
+
+        self.assertEqual((claims.email, claims.email_verified), ("ola@example.com", True))
+        self.assertEqual((claims.first_name, claims.last_name), ("Ola", "Hansen"))
+
+    def test_microsoft_personal_account_falls_back_to_preferred_username(self):
+        from .social import verify_id_token
+
+        token = self._microsoft(email=None, preferred_username="Ola@Outlook.com")
+        claims = verify_id_token("microsoft", token)
+        self.assertEqual((claims.email, claims.email_verified), ("ola@outlook.com", True))
+
+    def test_microsoft_work_account_email_is_not_trusted_without_domain_proof(self):
+        from .social import verify_id_token
+
+        self.assertFalse(verify_id_token("microsoft", self._microsoft(tenant=MS_WORK_TENANT)).email_verified)
+        proven = verify_id_token("microsoft", self._microsoft(tenant=MS_WORK_TENANT, xms_edov=True))
+        self.assertTrue(proven.email_verified)
+
+    def test_microsoft_work_account_never_trusts_preferred_username(self):
+        from .social import verify_id_token
+
+        token = self._microsoft(tenant=MS_WORK_TENANT, email=None, preferred_username="boss@victim.no")
+        claims = verify_id_token("microsoft", token)
+        self.assertEqual((claims.email, claims.email_verified), ("", False))
+
+    def test_microsoft_rejects_issuer_that_does_not_match_tenant(self):
+        from .social import SocialAuthError, verify_id_token
+
+        token = self._microsoft(iss=f"https://login.microsoftonline.com/{MS_WORK_TENANT}/v2.0")  # tid says personal
+        with self.assertRaises(SocialAuthError):
+            verify_id_token("microsoft", token)
+
+    def test_microsoft_rejects_wrong_audience(self):
+        from .social import SocialAuthError, verify_id_token
+
+        with self.assertRaises(SocialAuthError):
+            verify_id_token("microsoft", self._microsoft(aud="another-client"))
+
+    def test_unknown_provider_and_empty_token_rejected(self):
+        from .social import SocialAuthError, verify_id_token
+
+        for provider, token in (("apple", "x"), ("google", ""), ("google", None), ("google", 123)):
+            with self.assertRaises(SocialAuthError):
+                verify_id_token(provider, token)
+
+    def test_unconfigured_provider_is_reported_as_not_set_up(self):
+        from .social import SocialAuthError, verify_id_token
+
+        with override_settings(GOOGLE_OAUTH_WEB_CLIENT_ID="", GOOGLE_OAUTH_EXTRA_CLIENT_IDS=[]):
+            with self.assertRaises(SocialAuthError) as ctx:
+                verify_id_token("google", self._google())
+        self.assertEqual((ctx.exception.code, ctx.exception.status), ("provider_not_configured", 503))
+        with override_settings(MICROSOFT_OAUTH_CLIENT_ID=""):
+            with self.assertRaises(SocialAuthError) as ctx:
+                verify_id_token("microsoft", self._microsoft())
+        self.assertEqual(ctx.exception.status, 503)
+
+
+@override_settings(
+    GOOGLE_OAUTH_WEB_CLIENT_ID=GOOGLE_WEB,
+    MICROSOFT_OAUTH_CLIENT_ID=MS_CLIENT,
+)
+class SocialLoginTests(TestCase):
+    """POST /api/auth/social/ and friends. The token check itself is covered
+    above; here the verified claims are supplied directly."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def _claims(self, **overrides):
+        from .social import SocialClaims
+
+        base = dict(
+            provider="google", subject="g-1", email="kari@example.com", email_verified=True,
+            first_name="Kari", last_name="Nordmann",
+        )
+        base.update(overrides)
+        return SocialClaims(**base)
+
+    def _login(self, claims=None, **body):
+        with mock.patch("api.social_views.verify_id_token", return_value=claims or self._claims()):
+            return self.client.post(
+                "/api/auth/social/", {"provider": "google", "id_token": "tok", **body}, format="json"
+            )
+
+    def test_unknown_email_creates_a_volunteer_account(self):
+        response = self._login()
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["created"])
+        self.assertFalse(response.data["profile_complete"])
+        user = User.objects.get(email="kari@example.com")
+        self.assertEqual((user.username, user.first_name, user.last_name), ("kari@example.com", "Kari", "Nordmann"))
+        self.assertFalse(user.has_usable_password())
+        self.assertFalse(user.is_staff or user.is_superuser)
+        self.assertFalse(Membership.objects.filter(user=user).exists())
+        identity = SocialIdentity.objects.get()
+        self.assertEqual((identity.user, identity.provider, identity.subject), (user, "google", "g-1"))
+
+    def test_issued_tokens_work_against_the_api(self):
+        response = self._login()
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
+        me = self.client.get("/api/users/me/")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.data["email"], "kari@example.com")
+
+    def test_create_false_does_not_create_an_account(self):
+        response = self._login(create=False)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "no_account")
+        self.assertFalse(User.objects.exists())
+        self.assertFalse(SocialIdentity.objects.exists())
+
+    def test_returning_identity_logs_in_even_if_the_provider_email_changed(self):
+        first = self._login()
+        user = User.objects.get(email="kari@example.com")
+
+        again = self._login(self._claims(email="kari.new@example.com"))
+
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.data["created"])
+        self.assertEqual(again.data["user"]["id"], user.id)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertEqual(SocialIdentity.objects.count(), 1)
+        self.assertEqual(first.data["user"]["id"], user.id)
+
+    def test_returning_identity_still_requires_a_verified_email_only_for_first_link(self):
+        self._login()
+        again = self._login(self._claims(email_verified=False))
+        self.assertEqual(again.status_code, 200)
+
+    def test_passwordless_account_with_matching_email_is_linked_and_old_sessions_revoked(self):
+        existing = User.objects.create_user(username="kari@example.com", email="kari@example.com")
+        existing.set_unusable_password()
+        existing.save()
+        stale = RefreshToken.for_user(existing)  # e.g. the session a pre-registrant was handed
+
+        response = self._login(self._claims(email="Kari@Example.com"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["created"])
+        self.assertEqual(response.data["user"]["id"], existing.id)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertEqual(SocialIdentity.objects.get().user, existing)
+        refresh = self.client.post("/api/token/refresh/", {"refresh": str(stale)}, format="json")
+        self.assertEqual(refresh.status_code, 401)
+
+    def test_account_with_a_password_is_not_auto_linked(self):
+        existing = User.objects.create_user(username="kari@example.com", email="kari@example.com", password="s3cret-pass!")
+        session = RefreshToken.for_user(existing)
+
+        response = self._login()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "password_account")
+        self.assertNotIn("access", response.data)
+        self.assertFalse(SocialIdentity.objects.exists())
+        still_valid = self.client.post("/api/token/refresh/", {"refresh": str(session)}, format="json")
+        self.assertEqual(still_valid.status_code, 200)  # a refused attempt must not log anyone out
+
+    def test_staff_account_with_password_cannot_be_taken_over_by_email_alone(self):
+        admin = User.objects.create_user(username="boss@example.com", email="boss@example.com", password="s3cret-pass!")
+        event = make_event(title="Jul", created_by=admin)
+
+        response = self._login(self._claims(subject="attacker", email="boss@example.com"))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(SocialIdentity.objects.exists())
+        self.assertTrue(event.is_admin(admin))
+
+    def test_unverified_email_is_refused(self):
+        response = self._login(self._claims(email_verified=False))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "email_unverified")
+        self.assertFalse(User.objects.exists())
+
+    def test_missing_email_is_refused(self):
+        self.assertEqual(self._login(self._claims(email="", email_verified=False)).status_code, 400)
+
+    def test_inactive_account_cannot_sign_in(self):
+        user = User.objects.create_user(username="kari@example.com", email="kari@example.com", is_active=False)
+        user.set_unusable_password()
+        user.save()
+
+        response = self._login()
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(SocialIdentity.objects.exists())
+
+        SocialIdentity.objects.create(user=user, provider="google", subject="g-1")
+        self.assertEqual(self._login().status_code, 403)
+
+    def test_same_subject_cannot_be_claimed_by_a_second_email_account(self):
+        self._login()
+        other = User.objects.create_user(username="ola@example.com", email="ola@example.com")
+        other.set_unusable_password()
+        other.save()
+
+        response = self._login(self._claims(email="ola@example.com"))  # same Google subject
+
+        self.assertEqual(response.data["user"]["email"], "kari@example.com")
+        self.assertEqual(SocialIdentity.objects.count(), 1)
+
+    def test_verification_failure_is_reported_with_its_code(self):
+        from .social import SocialAuthError
+
+        with mock.patch("api.social_views.verify_id_token", side_effect=SocialAuthError("invalid_token", "nope")):
+            response = self.client.post("/api/auth/social/", {"provider": "google", "id_token": "x"}, format="json")
+        self.assertEqual((response.status_code, response.data["code"]), (400, "invalid_token"))
+
+    def test_garbage_token_and_unknown_provider_rejected_without_mocks(self):
+        for body in ({"provider": "google", "id_token": "garbage"}, {"provider": "apple", "id_token": "x"}, {}):
+            response = self.client.post("/api/auth/social/", body, format="json")
+            self.assertEqual(response.status_code, 400, body)
+        self.assertFalse(User.objects.exists())
+
+    def test_social_created_account_cannot_log_in_with_a_guessed_password(self):
+        self._login()
+        for guess in ("", "password", "kari@example.com"):
+            response = self.client.post("/api/token/", {"email": "kari@example.com", "password": guess}, format="json")
+            self.assertIn(response.status_code, (400, 401))
+            self.assertNotIn("access", response.data)
+
+    def test_profile_can_be_completed_afterwards(self):
+        response = self._login()
+        user_id = response.data["user"]["id"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
+
+        patch = self.client.patch(
+            f"/api/users/{user_id}/",
+            {"phone": "12345678", "address": "Testveien 1, 0123 Oslo", "birthdate": "1990-05-15"},
+            format="json",
+        )
+        self.assertEqual(patch.status_code, 200)
+
+        self.client.credentials()
+        again = self._login()
+        self.assertTrue(again.data["profile_complete"])
+
+    def test_microsoft_provider_creates_its_own_identity(self):
+        self._login()
+        response = self._login(self._claims(provider="microsoft", subject="m-9"))
+
+        self.assertEqual(response.status_code, 200)  # same verified address -> same (passwordless) account
+        self.assertEqual(SocialIdentity.objects.filter(user__email="kari@example.com").count(), 2)
+
+    def test_providers_endpoint_lists_only_configured_providers_with_public_ids(self):
+        response = self.client.get("/api/auth/social/providers/")
+        self.assertEqual(
+            response.data, {"google": {"client_id": GOOGLE_WEB}, "microsoft": {"client_id": MS_CLIENT}}
+        )
+        with override_settings(MICROSOFT_OAUTH_CLIENT_ID="", GOOGLE_OAUTH_WEB_CLIENT_ID=""):
+            self.assertEqual(self.client.get("/api/auth/social/providers/").data, {})
+
+
+@override_settings(GOOGLE_OAUTH_WEB_CLIENT_ID=GOOGLE_WEB, MICROSOFT_OAUTH_CLIENT_ID=MS_CLIENT)
+class SocialLinkingTests(TestCase):
+    """Connecting / disconnecting a provider from a signed-in account -- how
+    someone with a password (e.g. an admin) gets social sign-in."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="boss@example.com", email="boss@example.com", password="s3cret-pass!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _claims(self, **overrides):
+        from .social import SocialClaims
+
+        base = dict(provider="google", subject="g-boss", email="boss@gmail.com", email_verified=True, first_name="", last_name="")
+        base.update(overrides)
+        return SocialClaims(**base)
+
+    def _link(self, claims=None, provider="google"):
+        with mock.patch("api.social_views.verify_id_token", return_value=claims or self._claims()):
+            return self.client.post("/api/auth/social/identities/", {"provider": provider, "id_token": "t"}, format="json")
+
+    def test_signed_in_user_can_link_a_provider_with_a_different_email(self):
+        response = self._link()
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual([i["provider"] for i in response.data], ["google"])
+        identity = SocialIdentity.objects.get()
+        self.assertEqual((identity.user, identity.subject), (self.user, "g-boss"))
+
+    def test_linked_account_can_then_sign_in_with_the_provider_and_keeps_its_roles(self):
+        event = make_event(title="Jul", created_by=self.user)
+        self._link()
+
+        self.client.force_authenticate(user=None)
+        with mock.patch("api.social_views.verify_id_token", return_value=self._claims()):
+            response = self.client.post(
+                "/api/auth/social/", {"provider": "google", "id_token": "t", "create": False}, format="json"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["user"]["id"], self.user.id)
+        self.assertTrue(event.is_admin(self.user))
+
+    def test_linking_is_idempotent_for_the_same_identity(self):
+        self._link()
+        again = self._link()
+
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(SocialIdentity.objects.count(), 1)
+
+    def test_identity_belonging_to_someone_else_cannot_be_linked(self):
+        other = User.objects.create_user(username="ola@example.com", email="ola@example.com")
+        SocialIdentity.objects.create(user=other, provider="google", subject="g-boss")
+
+        response = self._link()
+
+        self.assertEqual((response.status_code, response.data["code"]), (409, "already_linked"))
+        self.assertEqual(SocialIdentity.objects.get().user, other)
+
+    def test_only_one_identity_per_provider(self):
+        self._link()
+        response = self._link(self._claims(subject="g-second"))
+
+        self.assertEqual((response.status_code, response.data["code"]), (409, "provider_already_linked"))
+
+    def test_can_link_both_providers(self):
+        self._link()
+        response = self._link(self._claims(provider="microsoft", subject="m-1"), provider="microsoft")
+
+        self.assertEqual([i["provider"] for i in response.data], ["google", "microsoft"])
+
+    def test_list_shows_only_my_own_identities(self):
+        self._link()
+        other = User.objects.create_user(username="ola@example.com", email="ola@example.com")
+        SocialIdentity.objects.create(user=other, provider="microsoft", subject="m-ola")
+
+        response = self.client.get("/api/auth/social/identities/")
+        self.assertEqual([i["provider"] for i in response.data], ["google"])
+
+    def test_unlink(self):
+        self._link()
+
+        self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 204)
+        self.assertFalse(SocialIdentity.objects.exists())
+        self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 404)
+
+    def test_cannot_unlink_the_only_way_to_sign_in(self):
+        self.user.set_unusable_password()
+        self.user.save()
+        self._link()
+
+        response = self.client.delete("/api/auth/social/identities/google/")
+
+        self.assertEqual((response.status_code, response.data["code"]), (400, "last_login_method"))
+        self.assertEqual(SocialIdentity.objects.count(), 1)
+
+    def test_can_unlink_one_of_two_without_a_password(self):
+        self.user.set_unusable_password()
+        self.user.save()
+        self._link()
+        self._link(self._claims(provider="microsoft", subject="m-1"), provider="microsoft")
+
+        self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 204)
+
+    def test_cannot_unlink_someone_elses_identity(self):
+        other = User.objects.create_user(username="ola@example.com", email="ola@example.com")
+        SocialIdentity.objects.create(user=other, provider="google", subject="g-ola")
+
+        self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 404)
+        self.assertEqual(SocialIdentity.objects.count(), 1)
+
+    def test_link_endpoints_need_authentication(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/auth/social/identities/").status_code, 401)
+        self.assertEqual(self.client.post("/api/auth/social/identities/", {}, format="json").status_code, 401)
+        self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 401)
+
+
+@override_settings(GOOGLE_OAUTH_WEB_CLIENT_ID=GOOGLE_WEB, MICROSOFT_OAUTH_CLIENT_ID=MS_CLIENT)
+class LegacyEmailAccountsStillWorkTests(TestCase):
+    """Social sign-in is purely additive: with Google/Microsoft switched on,
+    accounts that only ever used an e-mail address -- with a password, or
+    the passwordless website registration -- keep working exactly as before,
+    and an account never needs a provider linked."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def test_email_and_password_account_logs_in_without_any_provider_linked(self):
+        User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+
+        response = self.client.post("/api/token/", {"email": "old@example.com", "password": "s3cret-pass!"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertFalse(SocialIdentity.objects.exists())
+
+    def test_passwordless_website_registration_still_works_and_gives_a_session(self):
+        make_event(title="Jul", created_by=User.objects.create_user(username="org", password="pw"))
+
+        # The website form sends no password (valid_registration_payload includes
+        # one by default, so blank it to match what the site really submits).
+        response = self.client.post("/api/register/", valid_registration_payload(password=""), format="json")
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="new.volunteer@example.com")
+        self.assertFalse(user.has_usable_password())
+        self.assertFalse(user.social_identities.exists())
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
+        self.assertEqual(self.client.get("/api/users/me/").status_code, 200)
+
+    def test_passwordless_account_can_still_get_a_password_by_e_mail_link(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com")
+        user.set_unusable_password()
+        user.save()
+
+        self.client.post("/api/password-setup/request/", {"email": "old@example.com"}, format="json")
+        token = PasswordSetupToken.objects.get(user=user)
+        confirm = self.client.post(
+            "/api/password-setup/confirm/", {"token": str(token.token), "password": "Brand-new-pass-1"}, format="json"
+        )
+        self.assertEqual(confirm.status_code, 200)
+
+        login = self.client.post("/api/token/", {"email": "old@example.com", "password": "Brand-new-pass-1"}, format="json")
+        self.assertEqual(login.status_code, 200)
+
+    def test_account_created_by_social_sign_in_can_add_an_e_mail_password_later(self):
+        from .social import SocialClaims
+
+        claims = SocialClaims("google", "g-1", "kari@example.com", True, "Kari", "Nordmann")
+        with mock.patch("api.social_views.verify_id_token", return_value=claims):
+            self.assertEqual(
+                self.client.post("/api/auth/social/", {"provider": "google", "id_token": "t"}, format="json").status_code,
+                201,
+            )
+        user = User.objects.get(email="kari@example.com")
+        self.assertFalse(user.has_usable_password())
+
+        self.client.post("/api/password-setup/request/", {"email": "kari@example.com"}, format="json")
+        token = PasswordSetupToken.objects.get(user=user)
+        self.client.post(
+            "/api/password-setup/confirm/", {"token": str(token.token), "password": "Brand-new-pass-1"}, format="json"
+        )
+
+        login = self.client.post("/api/token/", {"email": "kari@example.com", "password": "Brand-new-pass-1"}, format="json")
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(user.social_identities.count(), 1)  # both ways in now work
+
+    def test_a_signed_in_password_user_who_never_links_anything_is_unaffected(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+        self.client.force_authenticate(user=user)
+
+        self.assertEqual(self.client.get("/api/users/me/").status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/social/identities/").data, [])
+
+    def test_social_sign_in_never_removes_or_changes_an_existing_password(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+        from .social import SocialClaims
+
+        claims = SocialClaims("google", "g-1", "old@example.com", True, "", "")
+        with mock.patch("api.social_views.verify_id_token", return_value=claims):
+            refused = self.client.post("/api/auth/social/", {"provider": "google", "id_token": "t"}, format="json")
+
+        self.assertEqual(refused.status_code, 409)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("s3cret-pass!"))

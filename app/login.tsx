@@ -1,16 +1,37 @@
 // app/login.tsx
 import { useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Image, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import SocialLoginButtons from "../components/SocialLoginButtons";
 import { colors, fonts, theme } from "../constants/theme";
-import { useAuth } from "./AuthContext";
+import { useAuth, type SocialProvider, type SocialProviders } from "./AuthContext";
 
 export default function LoginScreen() {
-  const { login } = useAuth();
+  const { login, socialLogin, fetchSocialProviders } = useAuth();
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [providers, setProviders] = useState<SocialProviders>({});
+
+  useEffect(() => {
+    fetchSocialProviders().then(setProviders);
+  }, [fetchSocialProviders]);
+
+  // A first-time Google/Microsoft sign-in creates a volunteer account with
+  // just a name and e-mail -- send them to fill in the contact details the
+  // organisation needs before anything else.
+  const handleSocialToken = async (provider: SocialProvider, idToken: string) => {
+    setLoading(true);
+    try {
+      const { profileComplete } = await socialLogin(provider, idToken);
+      router.replace(profileComplete ? "/events" : "/complete-profile");
+    } catch (err: any) {
+      Alert.alert("Kunne ikke logge inn", err?.message ?? "Noe gikk galt");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLogin = async () => {
     if (!email || !password) {
@@ -60,6 +81,12 @@ export default function LoginScreen() {
           <Text style={styles.buttonText}>Logg inn</Text>
         )}
       </TouchableOpacity>
+      <SocialLoginButtons
+        providers={providers}
+        disabled={loading}
+        onToken={handleSocialToken}
+        onError={(message) => Alert.alert("Kunne ikke logge inn", message)}
+      />
       <TouchableOpacity onPress={() => router.push("/set-password")} style={styles.setPasswordLink}>
         <Text style={styles.setPasswordLinkText}>Glemt passord, eller ny bruker? Sett det her</Text>
       </TouchableOpacity>

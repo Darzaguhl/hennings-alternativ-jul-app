@@ -27,25 +27,32 @@ design, as agreed:
   volunteer's request to see or erase their data must be easy to honour.
   Mention this data in the signup privacy text.
 
-## Sign in with other identity providers
+## Sign in with other identity providers (remaining)
 
-Let people sign up and log in with **Google, Microsoft, Apple and Meta**, in
-addition to e-mail + password. Open points to settle when picking this up:
+**Done:** Google and Microsoft sign-in on the mobile app, the admin dashboard
+and the website signup form (`/api/auth/social/`, see `api/social.py` and
+`api/social_views.py`). A first sign-in with an unknown verified e-mail
+creates a volunteer account (the dashboard never creates one). A verified
+e-mail only auto-links to an account that has *no password*; accounts with a
+password sign in with it once and connect a provider on the dashboard's
+"Innlogging" page. Roles still come only from our own memberships.
 
-- Where: website signup, the mobile app, the admin dashboard, or all three.
-- Account linking: match on a *verified* e-mail so someone who already
-  registered passwordless (the normal website path) lands on their existing
-  account instead of a duplicate. Never auto-link on an unverified e-mail.
-- Apple: if the iOS app offers any third-party login, App Store review
-  expects Sign in with Apple (or an equivalent privacy-preserving option)
-  alongside it, so Apple is effectively required for the app.
-- Meta/Facebook needs an app review and business verification, and doesn't
-  always return an e-mail; it's the heaviest of the four. Consider doing
-  Google, Microsoft and Apple first.
-- Backend: a library such as django-allauth or python-social-auth that ends
-  in our existing SimpleJWT tokens; the app would use expo-auth-session.
-- Admin/staff roles must stay tied to our own memberships, not to whatever
-  identity provider someone used.
+Still open:
+
+- **Apple.** If the iOS app offers any third-party login, App Store review
+  expects Sign in with Apple alongside it, so this is effectively required
+  before the iOS app ships with Google/Microsoft buttons. Needs an Apple
+  Developer account (99 USD/year); same verification approach, plus Apple
+  only reports the e-mail on the very first sign-in.
+- **Meta/Facebook.** Needs an app review and business verification, and
+  doesn't always return an e-mail. Heaviest of the four.
+- **Connect/disconnect in the mobile app.** Only the dashboard has the
+  "Innlogging" page. A volunteer who set a password via the e-mailed link
+  and later taps Google in the app is told to use their password; give the
+  app the same connect screen if that comes up.
+- Microsoft work/school accounts only sign in when the tenant asserts domain
+  ownership (`xms_edov`); personal Microsoft accounts and Google always work.
+  Revisit if staff with work accounts are refused.
 
 ## CRM for donors (companies and individuals who give gifts)
 

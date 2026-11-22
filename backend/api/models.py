@@ -830,3 +830,33 @@ class AbsenceExcuse(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user} excused @ {self.event} ({self.date})"
+
+
+class SocialIdentity(models.Model):
+    """Links a User to an account at an external identity provider
+    ("Sign in with Google/Microsoft"). The provider only ever proves *who
+    someone is*; it never grants anything here -- admin/leader access stays
+    entirely in our own Memberships and shift leaders, so linking a Google
+    account to a staff user doesn't change what that user can do.
+
+    Looked up by (provider, subject), not e-mail: a person can change their
+    address at the provider without losing access, and nobody can claim an
+    identity by registering an address. One identity per provider per user.
+    """
+
+    PROVIDER_CHOICES = (("google", "Google"), ("microsoft", "Microsoft"))
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="social_identities")
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES)
+    subject = models.CharField(max_length=255)
+    email = models.EmailField(blank=True, help_text="The address the provider reported when linked; informational.")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["provider", "subject"], name="unique_social_identity_subject"),
+            models.UniqueConstraint(fields=["user", "provider"], name="unique_social_identity_per_provider"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user} @ {self.provider}"

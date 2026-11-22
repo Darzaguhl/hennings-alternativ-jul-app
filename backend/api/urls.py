@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from .social_views import social_identities, social_identity_detail, social_login, social_providers
 from .views import (CommendationViewSet, RatingViewSet, StandingViewSet, EmailTokenObtainPairView, EventViewSet, InventoryCategoryViewSet,
                     InventoryItemViewSet, OppgaveSlotViewSet,
                     QRCodeViewSet, RegisterView, ShiftConflictViewSet,
@@ -47,6 +48,11 @@ urlpatterns = [
 
     # JWT token endpoints (login by email)
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    # "Sign in with Google / Microsoft" -- see api/social_views.py.
+    path('auth/social/providers/', social_providers, name='social-providers'),
+    path('auth/social/', social_login, name='social-login'),
+    path('auth/social/identities/', social_identities, name='social-identities'),
+    path('auth/social/identities/<str:provider>/', social_identity_detail, name='social-identity-detail'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
     # Admin: cross-event history (signups vs. actual fill, for gauging
