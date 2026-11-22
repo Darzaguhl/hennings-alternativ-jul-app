@@ -4793,7 +4793,7 @@ class CrmSuggestionTests(TestCase):
         self.assertEqual(PlanLine.objects.filter(year=2026).count(), 1)
 
 
-def make_food_workbook(*, with_food=True, with_contacts=True):
+def make_food_workbook(*, with_food=True, with_contacts=True, extra_items=0):
     """A small workbook shaped like the real one, with invented companies."""
     from io import BytesIO
 
@@ -4834,6 +4834,9 @@ def make_food_workbook(*, with_food=True, with_contacts=True):
                      None, None, None, False, None, None])
         food.append([True, "Koldt", "Hummus", None, "5kg", None, None, "5kg fra Mills via Per", None, None, "Gave", None, None,
                      True, None, None])
+        for n in range(extra_items):
+            food.append([True, "Varmmat", f"Vare {n}", f"{n + 10} kg", f"{n + 10} kg", None, None, f"{n + 10} kg",
+                         f"{n + 20} kg", "Acme Bakeri", "Gave", d(2025, 12, 22), "Leveres", True, "tomt juleaften", "Bra mengde"])
         food.append([None])
         food.append(["MOTTATT FRA GRUPPEN:", None, "(brukt til lunsj)"])
         nxt = wb.create_sheet("2026 - Matvarer")
@@ -4843,6 +4846,8 @@ def make_food_workbook(*, with_food=True, with_contacts=True):
         nxt.append([False, "Dessert", "Kake", None, "180 stk", "200 stk", "Acme Bakeri", "Betalt 394,- per stykk", None, None, False])
         nxt.append([False, "Koldt", "Leverpostei", None, "34.8 kg", "45 kg", "Mills via Per", None, None, None, False])
         nxt.append([False, "Koldt", "Hummus", None, "5kg", "6 kg", "Per - Mills", None, None, None, False])
+        for n in range(extra_items):
+            nxt.append([False, "Varmmat", f"Vare {n}", None, f"{n + 10} kg", f"{n + 20} kg", "Acme Bakeri", "Gave", None, None, False])
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -4977,6 +4982,36 @@ class CrmImportTests(TestCase):
 
         self.assertEqual((Donor.objects.count(), DonorContact.objects.count(), FoodItem.objects.count(), PlanLine.objects.count()), counts)
         self.assertEqual((second["donors"]["created"], second["lines"]["created"], second["items"]["created"]), (0, 0, 0))
+
+    def test_reimporting_reports_no_updates_when_nothing_changed(self):
+        self._import()
+        second = self._import()
+
+        self.assertEqual(second["lines"], {"created": 0, "updated": 0})
+        self.assertEqual(second["contacts"], {"created": 0, "updated": 0})
+
+    def test_import_makes_a_roughly_constant_number_of_queries_however_large_the_workbook(self):
+        """The import once looked every row up and saved it on its own --
+        about 1,500 queries for the real workbook, which against a database on
+        another machine outlasts the web server's patience and the request is
+        cut off. It reads once and writes in bulk; this fails if that regresses."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from .crm_import import import_workbook
+
+        with CaptureQueriesContext(connection) as small:
+            import_workbook(make_food_workbook())
+        PlanLine.objects.all().delete()
+        FoodItem.objects.all().delete()
+        DonorContact.objects.all().delete()
+        Donor.objects.all().delete()
+        with CaptureQueriesContext(connection) as large:
+            report = import_workbook(make_food_workbook(extra_items=150))
+
+        self.assertGreater(report["lines"]["created"], 400)
+        self.assertLess(len(large), 150, f"{len(large)} queries for {report['lines']['created']} lines")
+        self.assertLess(len(large) - len(small), 12)  # 150 more rows cost almost nothing extra
 
     def test_reimporting_never_overwrites_edits_made_in_the_crm(self):
         self._import()
