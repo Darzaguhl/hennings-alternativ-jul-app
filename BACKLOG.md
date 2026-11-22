@@ -4,20 +4,11 @@ Things we've agreed to build or want to consider, across the backend, app,
 admin dashboard and website. Keep entries short; move done items out (git
 history is the record).
 
-## Next up: leader feedback and volunteer standing
+## Next up: filtered e-mail to past volunteers, and retention
 
-Fremhev (leaders flag people during the event) is done. The rest of the
-design, as agreed:
+Done: fremhev, post-event ratings, internal standing (with overrides),
+per-day attendance and excusing absences. What is left of that design:
 
-- **Post-event rating.** Per person, per oppgave, per leader, so someone who
-  worked two oppgaver can be rated by both leaders. Scale: Utmerket / God /
-  Ok / Bekymring. "Bekymring" requires a note. Entered by leaders or admins.
-  Who can read ratings is an event setting; default is admins see all and a
-  leader sees only their own.
-- **Standing (internal only).** Derived from ratings, no-show/attendance
-  data we already track, and optionally the number of fremhevinger. Roughly:
-  good standing = no "Bekymring", no-show rate under a threshold. Admins can
-  override. Never shown to the volunteer.
 - **Filtered e-mail to past volunteers**, asking them to sign up again.
   Filter by standing, years taken part, attended, X1 eligibility, oppgave
   skills. Show recipient count and a preview before sending; keep a send log;
@@ -25,7 +16,7 @@ design, as agreed:
 - **Retention setting + delete-everything-about-a-person admin action.**
   Default is to keep indefinitely (the organisation's decision), but a
   volunteer's request to see or erase their data must be easy to honour.
-  Mention this data in the signup privacy text.
+  Mention this data (ratings, standing, attendance) in the signup privacy text.
 
 ## Sign in with other identity providers (remaining)
 
@@ -54,22 +45,37 @@ Still open:
   ownership (`xms_edov`); personal Microsoft accounts and Google always work.
   Revisit if staff with work accounts are refused.
 
-## CRM for donors (companies and individuals who give gifts)
+## CRM for donors: what is left
 
-A system to track who gives gifts and how that turned out against what was
-promised. Per donor (company or individual): contact details and history
-across years, the **expected gift and expected amount**, and **what was
-actually received**, so expected vs received is visible per donor and per
-year. Open points to settle first:
+**Done (first version):** donors and their contacts (Givere), the yearly food
+plan per item with who provides it, what was asked for / confirmed / received,
+and how it went (Matplan), guest counts per day, suggested quantities for next
+year with reasons, "plan next year from last year", and an admin-only Excel
+import of the food workbook. Suggestions are rule-based on purpose: last
+year's amount, adjusted for whether it ran out (early) or was left over, and
+scaled by expected guests when counts exist.
 
-- "Amount": money (NOK), a quantity of items, or both? Gifts in Lager are
-  items in categories, so received gifts should probably be able to link to
-  or create the matching Lager entries rather than being typed twice.
-- Who owns the relationship with each donor, and follow-up reminders
-  (e.g. contact again before next Christmas).
-- Individuals are personal data: same care as volunteer data (who can see
-  it, retention, and a way to export or erase one person's record).
-- Whether a donor can also be a volunteer, and whether they share a record.
+Still open:
+
+- **Kjøreliste (pickups and deliveries).** The workbook's driving list: per
+  supplier a date, time window, address, phone, vehicle and done/not done, plus
+  "not agreed yet". Belongs next to the plan lines.
+- **Follow-up reminders.** `next_contact_on` exists and "Må følges opp" flags
+  donors; nothing nudges anyone yet (e-mail or a digest).
+- **Better predictions** as data accrues: per-guest rates once several years of
+  guest counts exist, a trend over more than two years, and supplier
+  reliability (confirmed vs delivered) feeding a risk flag on unconfirmed lines.
+  The outcome (ran out / leftover) should be entered by hand after each event;
+  the imported ones are only guesses from old comments.
+- **Link received gifts to Lager** instead of typing them twice, and
+  expected-vs-received per delivery with a "kastet" status.
+- **Money gifts and individual donors.** Lines are food with quantities and unit
+  prices; cash gifts and per-person giving history aren't modelled.
+- **Personal data:** contacts are business contacts' details. A per-person
+  export/erase action and a retention rule are still to do (same as for
+  volunteers).
+- Kitchen sheets in the workbook (menu, heating instructions, prep list) are
+  operations, not CRM, and are not imported.
 
 ## Equipment inventory (setup gear), with minimum-level alerts
 

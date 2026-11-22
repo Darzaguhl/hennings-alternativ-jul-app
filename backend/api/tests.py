@@ -14,6 +14,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     AbsenceExcuse,
     Assignment,
+    Donor,
+    DonorContact,
+    FoodItem,
+    GuestCount,
+    PlanLine,
     Commendation,
     Event,
     EventCheckIn,
@@ -4480,3 +4485,854 @@ class LegacyEmailAccountsStillWorkTests(TestCase):
         self.assertEqual(refused.status_code, 409)
         user.refresh_from_db()
         self.assertTrue(user.check_password("s3cret-pass!"))
+
+
+# =============================================================================
+# CRM: donors, the yearly food plan, forecasting and the Excel import
+# =============================================================================
+
+
+def _dec(value):
+    from decimal import Decimal
+
+    return None if value is None else Decimal(str(value))
+
+
+def make_line(year, name="Ribbe", donor=None, item=None, **fields):
+    item = item or FoodItem.objects.get_or_create(name__iexact=name, defaults={"name": name, "category": "Varmmat"})[0]
+    for key in ("quantity_requested", "quantity_confirmed", "quantity_received", "leftover_quantity"):
+        if key in fields:
+            fields[key] = _dec(fields[key])
+    return PlanLine.objects.create(year=year, item=item, donor=donor, **fields)
+
+
+class CrmParsingTests(TestCase):
+    """Reading the free text people type into the sheets."""
+
+    def test_quantity_number_and_unit(self):
+        from decimal import Decimal
+
+        from .crm import parse_quantity
+
+        self.assertEqual(parse_quantity("100 stk"), (Decimal("100.00"), "stk", ""))
+        self.assertEqual(parse_quantity("48 kg"), (Decimal("48.00"), "kg", ""))
+        self.assertEqual(parse_quantity("1800 liter?"), (Decimal("1800.00"), "l", ""))
+        self.assertEqual(parse_quantity("55,44 liter"), (Decimal("55.44"), "l", ""))
+        self.assertEqual(parse_quantity("20stk"), (Decimal("20.00"), "stk", ""))
+
+    def test_quantity_extra_words_are_kept_in_the_note(self):
+        from decimal import Decimal
+
+        from .crm import parse_quantity
+
+        self.assertEqual(parse_quantity("7 kasser av hver"), (Decimal("7.00"), "kasser", "av hver"))
+        self.assertEqual(parse_quantity("100kg Costa finmalt"), (Decimal("100.00"), "kg", "Costa finmalt"))
+        self.assertEqual(parse_quantity("4 spann, 4 kg"), (Decimal("4.00"), "spann", "4 kg"))
+
+    def test_quantity_range_uses_the_middle_and_keeps_the_text(self):
+        from decimal import Decimal
+
+        from .crm import parse_quantity
+
+        self.assertEqual(parse_quantity("40-50kg"), (Decimal("45.00"), "kg", "40-50kg"))
+
+    def test_quantity_with_the_same_unit_from_several_sources_is_summed(self):
+        from decimal import Decimal
+
+        from .crm import parse_quantity
+
+        quantity, unit, note = parse_quantity("6kg fra A, 28,8kg kjøpt fra B")
+        self.assertEqual((quantity, unit), (Decimal("34.80"), "kg"))
+        self.assertIn("kjøpt fra B", note)
+
+    def test_quantity_without_a_number_or_unit(self):
+        from decimal import Decimal
+
+        from .crm import parse_quantity
+
+        self.assertEqual(parse_quantity(None), (None, "", ""))
+        self.assertEqual(parse_quantity("Fått en del fra mat"), (None, "", "Fått en del fra mat"))
+        self.assertEqual(parse_quantity(128), (Decimal("128.00"), "", ""))
+        quantity, unit, note = parse_quantity("2 av hver")
+        self.assertEqual((quantity, unit, note), (Decimal("2.00"), "", "2 av hver"))
+
+    def test_acquisition_and_price(self):
+        from decimal import Decimal
+
+        from .crm import parse_acquisition
+
+        self.assertEqual(parse_acquisition("Gave", "kg"), ("gift", None, ""))
+        self.assertEqual(parse_acquisition("Spons", "kg"), ("gift", None, ""))
+        self.assertEqual(parse_acquisition("Betalt 209,- per kg", "kg")[:2], ("purchase", Decimal("209.00")))
+        self.assertEqual(parse_acquisition("Betaler 10,- per liter", "l")[:2], ("purchase", Decimal("10.00")))
+        self.assertEqual(parse_acquisition("Gave og kjøp", "")[0], "mixed")
+        self.assertEqual(parse_acquisition("", "kg"), ("unknown", None, ""))
+
+    def test_price_per_a_different_unit_is_not_multiplied(self):
+        from .crm import parse_acquisition
+
+        acquisition, price, note = parse_acquisition("Betalt 99,- per 500g", "kg")
+        self.assertEqual((acquisition, price), ("purchase", None))
+        self.assertIn("99", note)
+
+    def test_a_price_alone_means_we_pay(self):
+        from decimal import Decimal
+
+        from .crm import parse_acquisition
+
+        self.assertEqual(parse_acquisition("Kransekake 900g: 100,- per stk", "stk")[:2], ("purchase", Decimal("100.00")))
+
+    def test_outcome_guessed_from_comments(self):
+        from decimal import Decimal
+
+        from .crm import guess_outcome
+
+        self.assertEqual(guess_outcome("tomt juleaften", "", "kg"), ("ran_out_early", None))
+        self.assertEqual(guess_outcome("", "Ble tomt", "kg"), ("ran_out", None))
+        self.assertEqual(guess_outcome("", "Hadde igjen 200kg.", "kg"), ("leftover", Decimal("200.00")))
+        self.assertEqual(guess_outcome("", "Hadde igjen 200kg.", "l"), ("leftover", None))  # unit differs
+        self.assertEqual(guess_outcome("", "Bra mengde", "kg"), ("right", None))
+        self.assertEqual(guess_outcome("", "Bra mengde, noen igjen til ryddevakter", "kg"), ("right", None))
+        self.assertEqual(guess_outcome("", "Ble tomt, bra mengde.", "kg"), ("right", None))
+
+    def test_contradictory_or_empty_comments_guess_nothing(self):
+        from .crm import guess_outcome
+
+        self.assertEqual(guess_outcome("tomt første dag", "Masse igjen på en pall", "kg"), ("", None))
+        self.assertEqual(guess_outcome("", "", "kg"), ("", None))
+        self.assertEqual(guess_outcome("", "Sjekk med Christine", "kg"), ("", None))
+
+
+class CrmSuggestionTests(TestCase):
+    """Next year's quantity from how last year went -- always with reasons."""
+
+    def _suggest(self, ratio=None, **fields):
+        from .crm import suggest_for_line
+
+        return suggest_for_line(make_line(2025, **fields), ratio)
+
+    def test_ran_out_early_adds_30_percent(self):
+        s = self._suggest(quantity_confirmed=100, unit="kg", outcome="ran_out_early")
+        self.assertEqual((s.quantity, s.action), (_dec(130), "increase"))
+        self.assertIn("+30 %", s.reasons[0])
+
+    def test_ran_out_adds_15_percent(self):
+        s = self._suggest(quantity_confirmed=200, unit="kg", outcome="ran_out")
+        self.assertEqual((s.quantity, s.action), (_dec(230), "increase"))
+
+    def test_right_keeps_the_amount(self):
+        s = self._suggest(quantity_confirmed=100, unit="kg", outcome="right")
+        self.assertEqual((s.quantity, s.action), (_dec(100), "keep"))
+
+    def test_known_leftover_is_mostly_subtracted(self):
+        s = self._suggest(quantity_confirmed=500, unit="kg", outcome="leftover", leftover_quantity=200)
+        self.assertEqual((s.quantity, s.action), (_dec(340), "decrease"))  # 500 - 0.8 * 200
+        self.assertIn("200", s.reasons[0])
+
+    def test_unknown_leftover_trims_15_percent(self):
+        s = self._suggest(quantity_confirmed=100, unit="kg", outcome="leftover")
+        self.assertEqual((s.quantity, s.action), (_dec(85), "decrease"))
+
+    def test_leftover_larger_than_the_order_never_goes_below_30_percent(self):
+        s = self._suggest(quantity_confirmed=100, unit="kg", outcome="leftover", leftover_quantity=150)
+        self.assertEqual(s.quantity, _dec(30))
+
+    def test_no_outcome_keeps_the_amount_with_low_confidence(self):
+        s = self._suggest(quantity_confirmed=100, unit="kg")
+        self.assertEqual((s.quantity, s.action, s.confidence), (_dec(100), "keep", "low"))
+
+    def test_confidence_reflects_where_the_outcome_came_from(self):
+        manual = self._suggest(name="A", quantity_confirmed=10, unit="kg", outcome="right", outcome_source="manual")
+        guessed = self._suggest(name="B", quantity_confirmed=10, unit="kg", outcome="right", outcome_source="imported")
+        self.assertEqual((manual.confidence, guessed.confidence), ("high", "medium"))
+
+    def test_base_falls_back_from_confirmed_to_requested_to_received(self):
+        self.assertEqual(self._suggest(name="A", quantity_requested=40, unit="kg").basis_quantity, _dec(40))
+        self.assertEqual(self._suggest(name="B", quantity_received=30, unit="kg").basis_quantity, _dec(30))
+        self.assertEqual(
+            self._suggest(name="C", quantity_confirmed=50, quantity_requested=40, unit="kg").basis_quantity, _dec(50)
+        )
+
+    def test_drop_note_and_cancelled_lines_are_suggested_dropped(self):
+        note = self._suggest(name="A", quantity_confirmed=50, unit="kg", next_year_note="Dropp sennep, ble ikke brukt")
+        cancelled = self._suggest(name="B", quantity_confirmed=50, unit="kg", status="cancelled")
+        keep = self._suggest(name="C", quantity_confirmed=50, unit="kg", next_year_note="Ikke dropp denne")
+        self.assertEqual((note.action, note.quantity), ("drop", _dec(0)))
+        self.assertEqual(cancelled.action, "drop")
+        self.assertNotEqual(keep.action, "drop")
+
+    def test_a_line_with_no_amount_gives_no_suggestion(self):
+        s = self._suggest(unit="kg")
+        self.assertEqual((s.action, s.quantity), ("none", None))
+
+    def test_guest_ratio_scales_the_suggestion(self):
+        s = self._suggest(ratio=_dec("1.5"), quantity_confirmed=100, unit="kg", outcome="right")
+        self.assertEqual(s.quantity, _dec(150))
+        self.assertIn("gjester", s.reasons[-1].lower())
+
+    def test_rounding_gives_orderable_figures(self):
+        from .crm import round_nice
+
+        self.assertEqual(round_nice(_dec("2.4")), _dec("2.5"))
+        self.assertEqual(round_nice(_dec("13.4")), _dec("13"))
+        self.assertEqual(round_nice(_dec("123")), _dec("120"))
+        self.assertEqual(round_nice(_dec("1559")), _dec("1550"))
+        self.assertEqual(round_nice(_dec("0")), _dec("0"))
+
+    def test_guest_ratio_needs_counts_for_both_years(self):
+        from .crm import guest_ratio
+
+        GuestCount.objects.create(date=datetime.date(2025, 12, 24), guests=600)
+        GuestCount.objects.create(date=datetime.date(2025, 12, 25), guests=400)
+        self.assertIsNone(guest_ratio(2025, 2026))  # nothing yet for 2026
+        self.assertEqual(guest_ratio(2025, 2026, expected_guests=1500), _dec("1.5"))
+        self.assertIsNone(guest_ratio(2024, 2026, expected_guests=1500))  # nothing for the basis year
+        GuestCount.objects.create(date=datetime.date(2026, 12, 24), guests=500)
+        self.assertEqual(guest_ratio(2025, 2026), _dec("0.5"))
+
+    def test_forecast_uses_the_latest_year_with_an_amount_and_compares_with_the_plan(self):
+        from .crm import forecast
+
+        make_line(2024, quantity_confirmed=200, unit="kg")
+        make_line(2025, quantity_confirmed=200, unit="kg", outcome="ran_out")
+        make_line(2026, quantity_requested=190, unit="kg")
+
+        (row,) = forecast(2026)
+
+        self.assertEqual((row["basis_year"], row["basis_quantity"], row["suggested_quantity"]), (2025, _dec(200), _dec(230)))
+        self.assertEqual((row["action"], row["planned_quantity"]), ("increase", _dec(190)))
+
+    def test_forecast_skips_a_year_with_no_amounts(self):
+        from .crm import forecast
+
+        make_line(2024, quantity_confirmed=200, unit="kg")
+        make_line(2025, unit="kg")  # a placeholder line, nothing in it
+
+        (row,) = forecast(2026)
+        self.assertEqual(row["basis_year"], 2024)
+
+    def test_forecast_sums_an_items_lines_from_several_donors(self):
+        from .crm import forecast
+
+        a, b = Donor.objects.create(name="A"), Donor.objects.create(name="B")
+        item = FoodItem.objects.create(name="Leverpostei", category="Kaldt")
+        make_line(2025, item=item, donor=a, quantity_confirmed=6, unit="kg", outcome="right")
+        make_line(2025, item=item, donor=b, quantity_confirmed=30, unit="kg", outcome="ran_out")
+
+        (row,) = forecast(2026)
+        # Each line is rounded on its own (6 + 34.5 -> 6 + 35), then summed.
+        self.assertEqual(row["suggested_quantity"], _dec(41))
+        self.assertEqual(row["basis_quantity"], _dec(36))
+
+    def test_forecast_of_a_dropped_item(self):
+        from .crm import forecast
+
+        make_line(2025, quantity_confirmed=50, unit="kg", next_year_note="Dropp")
+        (row,) = forecast(2026)
+        self.assertEqual((row["action"], row["suggested_quantity"], row["basis_quantity"]), ("drop", _dec(0), _dec(50)))
+
+    def test_forecast_ignores_items_with_no_history(self):
+        from .crm import forecast
+
+        make_line(2026, quantity_requested=10, unit="kg")
+        self.assertEqual(forecast(2026), [])
+
+    def test_plan_year_creates_lines_from_last_year(self):
+        from .crm import plan_year
+
+        donor = Donor.objects.create(name="Nordic")
+        via = Donor.objects.create(name="Hjelp")
+        make_line(2025, "Ribbe", donor=donor, quantity_confirmed=500, unit="kg", outcome="ran_out_early",
+                  acquisition="purchase", unit_price=209, via_donor=via)
+        make_line(2025, "Sennep", donor=donor, quantity_confirmed=20, unit="kg", next_year_note="Dropp")
+
+        result = plan_year(2026)
+
+        self.assertEqual(result, {"created": 1, "existing": 0, "skipped_dropped": 1})
+        line = PlanLine.objects.get(year=2026)
+        self.assertEqual((line.item.name, line.donor, line.via_donor), ("Ribbe", donor, via))
+        self.assertEqual((line.quantity_requested, line.unit, line.status), (_dec(650), "kg", "planned"))  # 500 * 1.3
+        self.assertEqual((line.acquisition, line.unit_price), ("purchase", _dec(209)))
+        self.assertIsNone(line.quantity_confirmed)
+        self.assertIsNone(line.quantity_received)
+        self.assertEqual(line.outcome, "")
+
+    def test_plan_year_does_not_duplicate_a_line_whose_donor_was_only_recorded_on_one_side(self):
+        from .crm import plan_year
+
+        mills = Donor.objects.create(name="Mills")
+        make_line(2025, "Hummus", donor=None, quantity_confirmed=5, unit="kg", outcome="right")
+        make_line(2026, "Hummus", donor=mills, quantity_requested=6, unit="kg")  # the donor is only known here
+
+        self.assertEqual(plan_year(2026), {"created": 0, "existing": 1, "skipped_dropped": 0})
+        self.assertEqual(PlanLine.objects.filter(year=2026).count(), 1)
+
+    def test_plan_year_still_adds_a_second_donor_for_the_same_item(self):
+        from .crm import plan_year
+
+        a, b = Donor.objects.create(name="A"), Donor.objects.create(name="B")
+        item = FoodItem.objects.create(name="Leverpostei", category="Kaldt")
+        make_line(2025, item=item, donor=a, quantity_confirmed=6, unit="kg")
+        make_line(2025, item=item, donor=b, quantity_confirmed=30, unit="kg")
+        make_line(2026, item=item, donor=a, quantity_requested=6, unit="kg")  # only A planned so far
+
+        self.assertEqual(plan_year(2026)["created"], 1)
+        self.assertEqual(sorted(PlanLine.objects.filter(year=2026).values_list("donor__name", flat=True)), ["A", "B"])
+
+    def test_plan_year_never_touches_existing_lines_and_is_repeatable(self):
+        from .crm import plan_year
+
+        donor = Donor.objects.create(name="Nordic")
+        make_line(2025, "Ribbe", donor=donor, quantity_confirmed=500, unit="kg", outcome="ran_out")
+        mine = make_line(2026, "Ribbe", donor=donor, quantity_requested=400, unit="kg", status="asked")
+
+        self.assertEqual(plan_year(2026), {"created": 0, "existing": 1, "skipped_dropped": 0})
+        self.assertEqual(plan_year(2026)["created"], 0)
+        mine.refresh_from_db()
+        self.assertEqual((mine.quantity_requested, mine.status), (_dec(400), "asked"))
+        self.assertEqual(PlanLine.objects.filter(year=2026).count(), 1)
+
+
+def make_food_workbook(*, with_food=True, with_contacts=True):
+    """A small workbook shaped like the real one, with invented companies."""
+    from io import BytesIO
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    contacts = wb.active
+    contacts.title = "Kontakt & Levering"
+    if not with_contacts:
+        wb.remove(contacts)
+    else:
+        contacts.append([None, None, "Leverandør", "Kontaktperson", "Kontaktinfo", "Spons eller kjøpt"])
+        contacts.append(["Anna", "Kake", "Acme Bakeri", "Lise Hansen og Ola Berg", "lise@acme.example, ola@acme.example", "Kjøpt"])
+        contacts.append(["Anne ", None, "Nordic Kjøtt", "Kari Nord (Salgssjef)", "kari@nordic.example", "Spons"])
+        contacts.append([None, None, None, "Per Assistent", "assistent@nordic.example", "Spons"])
+        contacts.append(["Christine", None, "Fjell Mineralvann", "Tor", "tor@fjell.example", "Kjøpt"])
+        contacts.append(["Chrisitne", None, "Hjelp AS", "Per", "per@hjelp.example, per@hjelp2.example", "Spons og kjøp"])
+    if with_food:
+        head = ["Sikret?", "Kategori", "Matvare", "Mengde 2024", "Ønsket mengde 2025", "Kommentar", None,
+                "Bekreftet mengde 2025", "Ønsket Mengde 2026", "Leverandør", "Betalt / gave", "Leveransedato",
+                "Hentes / leveres", "MOTTATT?", "TOMT NÅR?", "Kommentar til 2026"]
+        food = wb.create_sheet("Matvarer")
+        food.append(head)
+        d = datetime.datetime
+        food.append([True, "Varmmat", "Ribbe", "510 kg", "500kg", "ok", None, "500kg", "500kg", "Nordic Kjøtt", "Gave",
+                     d(2025, 12, 22), "Leveres", True, None, "Bra mengde."])
+        food.append([True, "Dessert", "Kake", "180 stk", "180 stk", None, None, "180 stk", None, "Acme Bakeri",
+                     "Betalt 394,- per stykk", d(2025, 12, 22), "Hentes", True, "tomt juleaften", "Kan øke."])
+        food.append([True, "Koldt", "Leverpostei", None, "40-50kg", None, None, "6kg fra Mills via Per, 28,8kg kjøpt fra X",
+                     "40 kg", "Mills via Per", "Gave og kjøp", None, None, True, None, "Hadde igjen 10kg"])
+        food.append([False, "Drikke", "Brus", "1500 stk", "1500 stk", None, None, None, None, "Fjell mineralvann", None,
+                     None, None, False, None, "Dropp, ikke populært"])
+        food.append([True, "Sauser", "Sennep", "20kg", "20kg", None, None, "6 spann", "6 spann", "per", "kjøpt", None,
+                     None, True, None, "Dropp sennep"])
+        food.append([True, "Tilbehør", "Nøtter - DROPPET", "5 kg", "5 kg", None, None, None, None, None, None, None,
+                     None, False, None, None])
+        food.append([None, "Drikke", "Eplejuice", "50l", "80l", None, None, "Fått en del fra gruppen", None, "Fjell Mineralvann",
+                     None, None, None, False, None, None])
+        food.append([True, "Koldt", "Hummus", None, "5kg", None, None, "5kg fra Mills via Per", None, None, "Gave", None, None,
+                     True, None, None])
+        food.append([None])
+        food.append(["MOTTATT FRA GRUPPEN:", None, "(brukt til lunsj)"])
+        nxt = wb.create_sheet("2026 - Matvarer")
+        nxt.append(["Sikret?", "Kategori", "Matvare", None, "Bekreftet mengde 2025", "Ønsket Mengde 2026",
+                    "Leverandør i fjor", "Betalt / gave", "Leveransedato", "Hentes / leveres", "MOTTATT?"])
+        nxt.append([False, "Varmmat", "Ribbe", None, "500kg", "480 kg", "Nordic Kjøtt", None, None, None, False])
+        nxt.append([False, "Dessert", "Kake", None, "180 stk", "200 stk", "Acme Bakeri", "Betalt 394,- per stykk", None, None, False])
+        nxt.append([False, "Koldt", "Leverpostei", None, "34.8 kg", "45 kg", "Mills via Per", None, None, None, False])
+        nxt.append([False, "Koldt", "Hummus", None, "5kg", "6 kg", "Per - Mills", None, None, None, False])
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+class CrmImportTests(TestCase):
+    def _import(self, **kwargs):
+        from .crm_import import import_workbook
+
+        return import_workbook(make_food_workbook(), **kwargs)
+
+    def test_reads_years_from_the_headers(self):
+        self.assertEqual(self._import()["years"], {"previous": 2024, "current": 2025, "next": 2026})
+
+    def test_contacts_sheet_creates_donors_contacts_owner_and_relationship(self):
+        self._import()
+
+        acme = Donor.objects.get(name="Acme Bakeri")
+        self.assertEqual((acme.owner_name, acme.relationship), ("Anna", "supplier"))
+        self.assertEqual(
+            sorted(acme.contacts.values_list("name", "email")),
+            [("Lise Hansen", "lise@acme.example"), ("Ola Berg", "ola@acme.example")],
+        )
+        self.assertTrue(acme.contacts.get(name="Lise Hansen").is_primary)
+        self.assertEqual(Donor.objects.get(name="Hjelp AS").relationship, "both")
+
+    def test_role_in_brackets_becomes_the_role_and_continuation_rows_join_the_previous_donor(self):
+        self._import()
+
+        nordic = Donor.objects.get(name="Nordic Kjøtt")
+        self.assertEqual(nordic.contacts.get(name="Kari Nord").role, "Salgssjef")
+        self.assertEqual(nordic.contacts.count(), 2)
+        self.assertTrue(nordic.contacts.filter(name="Per Assistent", email="assistent@nordic.example").exists())
+
+    def test_extra_email_for_one_person_is_kept_in_the_notes(self):
+        self._import()
+
+        per = DonorContact.objects.get(name="Per")
+        self.assertEqual(per.email, "per@hjelp.example")
+        self.assertIn("per@hjelp2.example", per.notes)
+
+    def test_owner_typos_are_folded_onto_the_name_seen_elsewhere(self):
+        self._import()
+
+        self.assertEqual(Donor.objects.get(name="Hjelp AS").owner_name, "Christine")
+        self.assertEqual(Donor.objects.get(name="Nordic Kjøtt").owner_name, "Anne")
+
+    def test_supplier_spellings_resolve_to_existing_donors_and_intermediaries(self):
+        self._import()
+
+        mills = Donor.objects.get(name="Mills")
+        hjelp = Donor.objects.get(name="Hjelp AS")
+        leverpostei = PlanLine.objects.get(year=2025, item__name="Leverpostei")
+        self.assertEqual((leverpostei.donor, leverpostei.via_donor), (mills, hjelp))
+        # lower-case spelling "per" is the contact at Hjelp AS
+        self.assertEqual(PlanLine.objects.get(year=2025, item__name="Sennep").donor, hjelp)
+        # case-insensitive match onto the contact sheet's spelling
+        self.assertEqual(PlanLine.objects.get(year=2025, item__name="Brus").donor.name, "Fjell Mineralvann")
+        self.assertEqual(Donor.objects.filter(name__iexact="Fjell Mineralvann").count(), 1)
+
+    def test_the_main_sheet_gives_lines_for_three_years(self):
+        self._import()
+
+        ribbe = {line.year: line for line in PlanLine.objects.filter(item__name="Ribbe")}
+        self.assertEqual(sorted(ribbe), [2024, 2025, 2026])
+        self.assertEqual((ribbe[2024].quantity_confirmed, ribbe[2024].unit, ribbe[2024].donor), (_dec(510), "kg", None))
+        self.assertEqual((ribbe[2025].quantity_requested, ribbe[2025].quantity_confirmed), (_dec(500), _dec(500)))
+        self.assertEqual((ribbe[2025].status, ribbe[2025].acquisition, ribbe[2025].delivery_mode), ("delivered", "gift", "delivery"))
+        self.assertEqual(ribbe[2025].delivery_date, datetime.date(2025, 12, 22))
+        self.assertEqual((ribbe[2026].quantity_requested, ribbe[2026].status), (_dec(500), "planned"))
+
+    def test_the_next_year_sheet_only_fills_what_the_main_sheet_left_blank(self):
+        self._import()
+
+        # Ribbe: main sheet says 500, the copy sheet says 480 -- main wins.
+        self.assertEqual(PlanLine.objects.get(year=2026, item__name="Ribbe").quantity_requested, _dec(500))
+        # Kake: main has nothing for 2026, the copy sheet supplies it.
+        kake = PlanLine.objects.get(year=2026, item__name="Kake")
+        self.assertEqual((kake.quantity_requested, kake.donor.name), (_dec(200), "Acme Bakeri"))
+
+    def test_price_outcome_and_notes_are_read(self):
+        self._import()
+
+        kake = PlanLine.objects.get(year=2025, item__name="Kake")
+        self.assertEqual((kake.acquisition, kake.unit_price, kake.unit), ("purchase", _dec(394), "stk"))
+        self.assertEqual((kake.outcome, kake.outcome_source), ("ran_out_early", "imported"))
+        self.assertEqual((kake.ran_out_note, kake.next_year_note), ("tomt juleaften", "Kan øke."))
+        leverpostei = PlanLine.objects.get(year=2025, item__name="Leverpostei")
+        self.assertEqual((leverpostei.quantity_confirmed, leverpostei.outcome, leverpostei.leftover_quantity),
+                         (_dec("34.8"), "leftover", _dec(10)))
+
+    def test_dropped_items_are_cancelled_and_not_planned_again(self):
+        self._import()
+
+        notes = PlanLine.objects.get(year=2025, item__name="Nøtter")
+        self.assertEqual(notes.status, "cancelled")
+        self.assertFalse(PlanLine.objects.filter(year=2026, item__name="Nøtter").exists())
+        self.assertEqual(FoodItem.objects.filter(name__icontains="droppet").count(), 0)
+
+    def test_unreadable_quantities_are_reported_not_lost(self):
+        report = self._import()
+
+        self.assertIn("Fått en del fra gruppen", [u["text"] for u in report["unparsed_quantities"]])
+        juice = PlanLine.objects.get(year=2025, item__name="Eplejuice")
+        self.assertIsNone(juice.quantity_confirmed)
+        self.assertEqual(juice.quantity_note, "Fått en del fra gruppen")
+        self.assertEqual(juice.quantity_requested, _dec(80))
+
+    def test_a_supplier_only_named_on_the_next_year_sheet_fills_the_same_lines(self):
+        """Hummus has no supplier on the main sheet (it's inside the quantity
+        text); the next-year sheet's "supplier last year" supplies it. That
+        must complete the existing lines, not add a second one per year."""
+        self._import()
+
+        mills = Donor.objects.get(name="Mills")
+        for year in (2025, 2026):
+            lines = PlanLine.objects.filter(year=year, item__name="Hummus")
+            self.assertEqual(lines.count(), 1, year)
+            self.assertEqual(lines.get().donor, mills)
+        self.assertEqual(PlanLine.objects.get(year=2026, item__name="Hummus").quantity_requested, _dec(6))
+
+    def test_note_rows_below_the_table_are_ignored(self):
+        self._import()
+        self.assertFalse(FoodItem.objects.filter(name__icontains="MOTTATT").exists())
+
+    def test_reimporting_changes_nothing(self):
+        self._import()
+        counts = (Donor.objects.count(), DonorContact.objects.count(), FoodItem.objects.count(), PlanLine.objects.count())
+
+        second = self._import()
+
+        self.assertEqual((Donor.objects.count(), DonorContact.objects.count(), FoodItem.objects.count(), PlanLine.objects.count()), counts)
+        self.assertEqual((second["donors"]["created"], second["lines"]["created"], second["items"]["created"]), (0, 0, 0))
+
+    def test_reimporting_never_overwrites_edits_made_in_the_crm(self):
+        self._import()
+        line = PlanLine.objects.get(year=2025, item__name="Ribbe")
+        line.quantity_confirmed, line.status, line.comment = _dec(450), "confirmed", "Endret av meg"
+        line.save()
+        donor = Donor.objects.get(name="Acme Bakeri")
+        donor.owner_name = "Noen andre"
+        donor.save()
+
+        self._import()
+
+        line.refresh_from_db()
+        donor.refresh_from_db()
+        self.assertEqual((line.quantity_confirmed, line.status, line.comment), (_dec(450), "confirmed", "Endret av meg"))
+        self.assertEqual(donor.owner_name, "Noen andre")
+
+    def test_dry_run_reports_but_saves_nothing(self):
+        report = self._import(dry_run=True)
+
+        self.assertTrue(report["dry_run"])
+        self.assertGreater(report["lines"]["created"], 0)
+        self.assertEqual((Donor.objects.count(), PlanLine.objects.count(), FoodItem.objects.count()), (0, 0, 0))
+
+    def test_every_supplier_decision_is_reported(self):
+        report = self._import()
+
+        decisions = {d["text"]: d for d in report["supplier_resolution"]}
+        self.assertEqual(decisions["Mills via Per"]["via"], "Hjelp AS")
+        self.assertEqual(decisions["Fjell mineralvann"]["donor"], "Fjell Mineralvann")
+
+    def test_a_file_that_is_not_a_workbook_or_has_no_food_sheet_is_rejected(self):
+        from io import BytesIO
+
+        from .crm_import import ImportError_, import_workbook
+
+        with self.assertRaises(ImportError_):
+            import_workbook(BytesIO(b"definitely not a spreadsheet"))
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        wb.active.append(["noe", "helt", "annet"])
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        with self.assertRaises(ImportError_):
+            import_workbook(buffer)
+
+    def test_the_imported_history_feeds_the_forecast(self):
+        from .crm import forecast
+
+        self._import()
+        rows = {r["item_name"]: r for r in forecast(2026)}
+
+        self.assertEqual(rows["Kake"]["suggested_quantity"], _dec(230))  # ran out early: 180 * 1.3 = 234 -> 230
+        self.assertEqual(rows["Kake"]["planned_quantity"], _dec(200))  # what the sheet's author wrote
+        self.assertEqual(rows["Sennep"]["action"], "drop")
+        self.assertEqual(rows["Ribbe"]["action"], "keep")
+
+
+class CrmApiTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.leader = User.objects.create_user(username="leader", password="pw")
+        event = make_event(title="Alternativ Jul", created_by=self.admin)
+        shift = Shift.objects.create(
+            event=event, title="Kjøkken", date=datetime.date.today(),
+            start_time=datetime.time(18, 0), end_time=datetime.time(22, 0), created_by=self.admin,
+        )
+        shift.leaders.add(self.leader)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+    # -- who may use it ------------------------------------------------------
+
+    def test_only_admins_can_use_the_crm_and_everyone_else_is_refused(self):
+        donor = Donor.objects.create(name="Acme")
+        urls = [
+            ("get", "/api/donors/"), ("get", f"/api/donors/{donor.id}/"), ("get", "/api/donor-contacts/"),
+            ("get", "/api/food-items/"), ("get", "/api/plan-lines/"), ("get", "/api/guest-counts/"),
+            ("get", "/api/crm/forecast/?year=2026"), ("get", "/api/crm/summary/"),
+            ("post", "/api/crm/plan-year/"), ("post", "/api/crm/import/"),
+        ]
+        for who in (self.volunteer, self.leader):
+            self.client.force_authenticate(user=who)
+            for method, url in urls:
+                self.assertEqual(getattr(self.client, method)(url).status_code, 403, (who.username, url))
+            self.assertEqual(self.client.post("/api/donors/", {"name": "X"}, format="json").status_code, 403)
+            self.assertEqual(self.client.delete(f"/api/donors/{donor.id}/").status_code, 403)
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/donors/").status_code, 401)
+        self.assertEqual(Donor.objects.count(), 1)
+
+    # -- donors and contacts -------------------------------------------------
+
+    def test_create_donor_and_contacts(self):
+        created = self.client.post(
+            "/api/donors/", {"name": "Acme Bakeri", "relationship": "supplier", "owner_name": "Anna"}, format="json"
+        )
+        self.assertEqual(created.status_code, 201)
+        donor_id = created.data["id"]
+
+        contact = self.client.post(
+            "/api/donor-contacts/", {"donor": donor_id, "name": "Lise", "email": "lise@acme.example", "is_primary": True}, format="json"
+        )
+        self.assertEqual(contact.status_code, 201)
+
+        detail = self.client.get(f"/api/donors/{donor_id}/")
+        self.assertEqual([c["email"] for c in detail.data["contacts"]], ["lise@acme.example"])
+
+    def test_donor_names_are_unique_ignoring_case(self):
+        self.client.post("/api/donors/", {"name": "Bama"}, format="json")
+        self.assertEqual(self.client.post("/api/donors/", {"name": "BAMA"}, format="json").status_code, 400)
+
+    def test_a_contact_needs_a_name_or_an_email(self):
+        donor = Donor.objects.create(name="Acme")
+        self.assertEqual(self.client.post("/api/donor-contacts/", {"donor": donor.id}, format="json").status_code, 400)
+        self.assertEqual(self.client.post("/api/donor-contacts/", {"donor": donor.id, "email": "not-an-email"}, format="json").status_code, 400)
+
+    def test_search_finds_donors_by_contact(self):
+        acme = Donor.objects.create(name="Acme")
+        Donor.objects.create(name="Other")
+        DonorContact.objects.create(donor=acme, name="Lise", email="lise@acme.example")
+
+        by_name = self.client.get("/api/donors/?search=acm")
+        by_email = self.client.get("/api/donors/?search=lise@")
+        self.assertEqual([d["name"] for d in by_name.data], ["Acme"])
+        self.assertEqual([d["name"] for d in by_email.data], ["Acme"])
+
+    def test_donor_years_show_whether_it_delivered_what_it_promised(self):
+        donor = Donor.objects.create(name="Acme")
+        make_line(2024, "A", donor=donor, quantity_confirmed=1, unit="kg", status="delivered")
+        make_line(2024, "B", donor=donor, quantity_confirmed=1, unit="kg", status="confirmed")
+        make_line(2024, "C", donor=donor, quantity_confirmed=1, unit="kg", status="cancelled")
+
+        (row,) = self.client.get(f"/api/donors/{donor.id}/").data["years"]
+
+        self.assertEqual((row["year"], row["lines"], row["confirmed"], row["delivered"]), (2024, 2, 2, 1))
+        self.assertEqual(row["missing"], ["B"])
+
+    def test_needs_attention_flags_a_due_contact_date_and_unconfirmed_lines(self):
+        today = datetime.date.today()
+        donor = Donor.objects.create(name="Acme", next_contact_on=today - datetime.timedelta(days=1))
+        make_line(today.year, "A", donor=donor, quantity_requested=1, unit="kg", status="asked")
+
+        reasons = self.client.get(f"/api/donors/{donor.id}/").data["needs_attention"]
+
+        self.assertEqual(len(reasons), 2)
+
+    def test_merging_donors_moves_contacts_and_lines_and_resolves_clashes(self):
+        keep, dupe = Donor.objects.create(name="Bama Dagligvare", owner_name=""), Donor.objects.create(name="BAMA", owner_name="Henning", relationship="sponsor")
+        DonorContact.objects.create(donor=keep, name="Erik", email="erik@bama.example")
+        DonorContact.objects.create(donor=dupe, name="Erik", email="ERIK@bama.example")  # same person
+        DonorContact.objects.create(donor=dupe, name="Ny", email="ny@bama.example")
+        item = FoodItem.objects.create(name="Agurk", category="Koltbord")
+        make_line(2025, item=item, donor=keep, quantity_confirmed=128, unit="stk")
+        make_line(2025, item=item, donor=dupe, quantity_confirmed=999, unit="stk", comment="fra duplikatet")
+        make_line(2025, "Ananas", donor=dupe, quantity_confirmed=20, unit="stk")
+
+        response = self.client.post(f"/api/donors/{dupe.id}/merge/", {"into": keep.id}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Donor.objects.filter(pk=dupe.pk).exists())
+        keep.refresh_from_db()
+        self.assertEqual((keep.owner_name, keep.relationship), ("Henning", "sponsor"))
+        self.assertEqual(sorted(keep.contacts.values_list("email", flat=True)), ["erik@bama.example", "ny@bama.example"])
+        agurk = PlanLine.objects.get(year=2025, item=item)
+        self.assertEqual((agurk.donor, agurk.quantity_confirmed, agurk.comment), (keep, _dec(128), "fra duplikatet"))
+        self.assertEqual(PlanLine.objects.filter(donor=keep).count(), 2)
+
+    def test_cannot_merge_a_donor_into_itself_or_nothing(self):
+        donor = Donor.objects.create(name="Acme")
+        self.assertEqual(self.client.post(f"/api/donors/{donor.id}/merge/", {"into": donor.id}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(f"/api/donors/{donor.id}/merge/", {"into": 9999}, format="json").status_code, 400)
+        self.assertTrue(Donor.objects.filter(pk=donor.pk).exists())
+
+    # -- plan lines ----------------------------------------------------------
+
+    def test_create_a_line_for_an_existing_or_a_brand_new_item(self):
+        donor = Donor.objects.create(name="Acme")
+        item = FoodItem.objects.create(name="Ribbe", category="Varmmat")
+
+        existing = self.client.post(
+            "/api/plan-lines/", {"year": 2026, "item": item.id, "donor": donor.id, "unit": "kg", "quantity_requested": "500"}, format="json"
+        )
+        new = self.client.post(
+            "/api/plan-lines/",
+            {"year": 2026, "new_item_name": "Pinnekjøtt", "new_item_category": "Varmmat", "unit": "kg"},
+            format="json",
+        )
+
+        self.assertEqual((existing.status_code, new.status_code), (201, 201))
+        self.assertEqual(existing.data["item_name"], "Ribbe")
+        self.assertEqual((new.data["item_name"], new.data["category"]), ("Pinnekjøtt", "Varmmat"))
+        self.assertTrue(FoodItem.objects.filter(name="Pinnekjøtt").exists())
+
+    def test_a_line_needs_an_item(self):
+        self.assertEqual(self.client.post("/api/plan-lines/", {"year": 2026}, format="json").status_code, 400)
+
+    def test_one_line_per_item_donor_and_year(self):
+        donor = Donor.objects.create(name="Acme")
+        item = FoodItem.objects.create(name="Ribbe")
+        body = {"year": 2026, "item": item.id, "donor": donor.id}
+        self.assertEqual(self.client.post("/api/plan-lines/", body, format="json").status_code, 201)
+        self.assertEqual(self.client.post("/api/plan-lines/", body, format="json").status_code, 400)
+        # ...but the same item from a different donor is fine (gift + purchase).
+        other = Donor.objects.create(name="Other")
+        self.assertEqual(self.client.post("/api/plan-lines/", {**body, "donor": other.id}, format="json").status_code, 201)
+
+    def test_an_outcome_entered_by_hand_is_marked_manual(self):
+        line = make_line(2025, quantity_confirmed=100, unit="kg", outcome="ran_out", outcome_source="imported")
+
+        self.client.patch(f"/api/plan-lines/{line.id}/", {"outcome": "right"}, format="json")
+        line.refresh_from_db()
+        self.assertEqual((line.outcome, line.outcome_source), ("right", "manual"))
+
+        self.client.patch(f"/api/plan-lines/{line.id}/", {"outcome": ""}, format="json")
+        line.refresh_from_db()
+        self.assertEqual((line.outcome, line.outcome_source), ("", ""))
+
+    def test_editing_something_else_keeps_an_imported_outcome_marked_as_a_guess(self):
+        line = make_line(2025, quantity_confirmed=100, unit="kg", outcome="ran_out", outcome_source="imported")
+        self.client.patch(f"/api/plan-lines/{line.id}/", {"comment": "ny kommentar"}, format="json")
+        line.refresh_from_db()
+        self.assertEqual(line.outcome_source, "imported")
+
+    def test_estimated_cost_only_for_purchases_with_a_price(self):
+        paid = make_line(2025, "A", quantity_confirmed=10, unit="kg", acquisition="purchase", unit_price=100)
+        gift = make_line(2025, "B", quantity_confirmed=10, unit="kg", acquisition="gift", unit_price=100)
+        unpriced = make_line(2025, "C", quantity_confirmed=10, unit="kg", acquisition="purchase")
+
+        by_id = {l["id"]: l for l in self.client.get("/api/plan-lines/?year=2025").json()}
+        self.assertEqual(by_id[paid.id]["estimated_cost"], 1000.0)
+        self.assertIsNone(by_id[gift.id]["estimated_cost"])
+        self.assertIsNone(by_id[unpriced.id]["estimated_cost"])
+
+    def test_filter_lines(self):
+        donor = Donor.objects.create(name="Acme")
+        make_line(2025, "A", donor=donor, quantity_confirmed=1, unit="kg")
+        make_line(2026, "B", quantity_requested=1, unit="kg", status="asked")
+
+        self.assertEqual(len(self.client.get("/api/plan-lines/?year=2026").data), 1)
+        self.assertEqual(len(self.client.get(f"/api/plan-lines/?donor={donor.id}").data), 1)
+        self.assertEqual(len(self.client.get("/api/plan-lines/?status=asked").data), 1)
+        self.assertEqual(len(self.client.get("/api/plan-lines/?search=B").data), 1)
+
+    def test_an_item_with_lines_cannot_be_deleted(self):
+        line = make_line(2025, quantity_confirmed=1, unit="kg")
+        self.assertEqual(self.client.delete(f"/api/food-items/{line.item_id}/").status_code, 400)
+        self.assertTrue(PlanLine.objects.filter(pk=line.pk).exists())
+        empty = FoodItem.objects.create(name="Ingenting")
+        self.assertEqual(self.client.delete(f"/api/food-items/{empty.id}/").status_code, 204)
+
+    def test_deleting_a_donor_keeps_its_lines(self):
+        donor = Donor.objects.create(name="Acme")
+        line = make_line(2025, donor=donor, quantity_confirmed=1, unit="kg")
+
+        self.assertEqual(self.client.delete(f"/api/donors/{donor.id}/").status_code, 204)
+
+        line.refresh_from_db()
+        self.assertIsNone(line.donor)
+
+    # -- guests, forecast, summary ------------------------------------------
+
+    def test_guest_counts(self):
+        self.assertEqual(self.client.post("/api/guest-counts/", {"date": "2025-12-24", "guests": 800}, format="json").status_code, 201)
+        self.assertEqual(self.client.post("/api/guest-counts/", {"date": "2025-12-24", "guests": 5}, format="json").status_code, 400)
+        self.client.post("/api/guest-counts/", {"date": "2026-12-24", "guests": 900}, format="json")
+        self.assertEqual(len(self.client.get("/api/guest-counts/?year=2025").data), 1)
+        self.assertEqual(self.client.post("/api/guest-counts/", {"date": "2025-12-25", "guests": -1}, format="json").status_code, 400)
+
+    def test_forecast_endpoint_with_expected_guests(self):
+        make_line(2025, quantity_confirmed=100, unit="kg", outcome="right")
+        GuestCount.objects.create(date=datetime.date(2025, 12, 24), guests=1000)
+
+        plain = self.client.get("/api/crm/forecast/?year=2026").json()
+        scaled = self.client.get("/api/crm/forecast/?year=2026&expected_guests=1500").json()
+
+        self.assertEqual(plain["items"][0]["suggested_quantity"], 100.0)
+        self.assertEqual(scaled["items"][0]["suggested_quantity"], 150.0)
+        self.assertEqual(plain["guest_totals"], {"2025": 1000})
+
+    def test_forecast_validates_its_parameters(self):
+        self.assertEqual(self.client.get("/api/crm/forecast/").status_code, 400)
+        self.assertEqual(self.client.get("/api/crm/forecast/?year=abc").status_code, 400)
+        self.assertEqual(self.client.get("/api/crm/forecast/?year=2026&expected_guests=0").status_code, 400)
+
+    def test_plan_year_endpoint(self):
+        make_line(2025, quantity_confirmed=100, unit="kg", outcome="ran_out")
+
+        first = self.client.post("/api/crm/plan-year/", {"year": 2026}, format="json")
+        second = self.client.post("/api/crm/plan-year/", {"year": 2026}, format="json")
+
+        self.assertEqual((first.status_code, first.data["created"]), (201, 1))
+        self.assertEqual((second.status_code, second.data["created"], second.data["existing"]), (200, 0, 1))
+
+    def test_summary(self):
+        make_line(2026, "A", quantity_requested=10, unit="kg", status="confirmed", acquisition="purchase", unit_price=50)
+        make_line(2026, "B", quantity_requested=10, unit="kg", status="planned", acquisition="gift")
+        make_line(2026, "C", quantity_requested=10, unit="kg", status="cancelled")
+        make_line(2026, "D", quantity_requested=10, unit="kg", acquisition="purchase")  # no price
+        make_line(2025, "E", quantity_confirmed=1, unit="kg", outcome="ran_out")
+        GuestCount.objects.create(date=datetime.date(2026, 12, 24), guests=700)
+
+        data = self.client.get("/api/crm/summary/?year=2026").json()
+
+        self.assertEqual(data["years"], [2026, 2025])
+        self.assertEqual(data["lines"], 3)  # the cancelled one doesn't count
+        self.assertEqual(data["by_status"], {"confirmed": 1, "planned": 2})
+        self.assertEqual(data["estimated_cost"], 500.0)
+        self.assertEqual(data["unpriced_purchase_lines"], 1)
+        self.assertEqual(data["guests"], 700)
+        self.assertEqual(self.client.get("/api/crm/summary/").data["year"], 2026)  # defaults to the latest
+
+    def test_summary_on_an_empty_crm(self):
+        data = self.client.get("/api/crm/summary/").data
+        self.assertEqual((data["years"], data["lines"]), ([], 0))
+
+    # -- import endpoint -----------------------------------------------------
+
+    def _upload(self, buffer=None, name="Mat 2025.xlsx", **extra):
+        upload = SimpleUploadedFile(name, (buffer or make_food_workbook()).read(), content_type="application/octet-stream")
+        return self.client.post("/api/crm/import/", {"file": upload, **extra}, format="multipart")
+
+    def test_upload_imports_the_workbook(self):
+        response = self._upload()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["dry_run"])
+        self.assertGreater(response.data["lines"]["created"], 0)
+        self.assertTrue(Donor.objects.filter(name="Acme Bakeri").exists())
+
+    def test_dry_run_upload_saves_nothing(self):
+        response = self._upload(dry_run="true")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["dry_run"])
+        self.assertFalse(Donor.objects.exists())
+
+    def test_upload_rejects_missing_wrong_or_broken_files(self):
+        self.assertEqual(self.client.post("/api/crm/import/", {}, format="multipart").status_code, 400)
+        self.assertEqual(self._upload(name="mat.csv").status_code, 400)
+        from io import BytesIO
+
+        self.assertEqual(self._upload(BytesIO(b"not a workbook")).status_code, 400)
+        self.assertFalse(Donor.objects.exists())
+
+    def test_upload_over_the_size_limit_is_refused(self):
+        from io import BytesIO
+
+        with mock.patch("api.crm_views.MAX_IMPORT_BYTES", 10):
+            self.assertEqual(self._upload(BytesIO(b"x" * 100)).status_code, 400)
+
+    def test_the_import_report_does_not_echo_contact_details(self):
+        report = self._upload().data
+        text = str(report)
+        for private in ("lise@acme.example", "kari@nordic.example", "per@hjelp.example"):
+            self.assertNotIn(private, text)

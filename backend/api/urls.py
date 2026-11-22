@@ -2,6 +2,10 @@ from django.urls import include, path
 from rest_framework import routers
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from .crm_views import (
+    DonorContactViewSet, DonorViewSet, FoodItemViewSet, GuestCountViewSet, PlanLineViewSet,
+    crm_forecast, crm_import, crm_plan_year, crm_summary,
+)
 from .social_views import social_identities, social_identity_detail, social_login, social_providers
 from .views import (CommendationViewSet, RatingViewSet, StandingViewSet, EmailTokenObtainPairView, EventViewSet, InventoryCategoryViewSet,
                     InventoryItemViewSet, OppgaveSlotViewSet,
@@ -24,6 +28,11 @@ router.register(r'inventory-items', InventoryItemViewSet)
 router.register(r'commendations', CommendationViewSet, basename='commendation')
 router.register(r'ratings', RatingViewSet, basename='rating')
 router.register(r'standings', StandingViewSet, basename='standing')
+router.register(r'donors', DonorViewSet, basename='donor')
+router.register(r'donor-contacts', DonorContactViewSet, basename='donor-contact')
+router.register(r'food-items', FoodItemViewSet, basename='food-item')
+router.register(r'plan-lines', PlanLineViewSet, basename='plan-line')
+router.register(r'guest-counts', GuestCountViewSet, basename='guest-count')
 router.register(r'qrcodes', QRCodeViewSet)
 
 urlpatterns = [
@@ -48,6 +57,11 @@ urlpatterns = [
 
     # JWT token endpoints (login by email)
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    # Donor / food CRM (admin-only) -- see api/crm_views.py.
+    path('crm/forecast/', crm_forecast, name='crm-forecast'),
+    path('crm/plan-year/', crm_plan_year, name='crm-plan-year'),
+    path('crm/summary/', crm_summary, name='crm-summary'),
+    path('crm/import/', crm_import, name='crm-import'),
     # "Sign in with Google / Microsoft" -- see api/social_views.py.
     path('auth/social/providers/', social_providers, name='social-providers'),
     path('auth/social/', social_login, name='social-login'),
