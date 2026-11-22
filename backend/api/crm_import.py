@@ -17,10 +17,12 @@ written to disk or logged.
 
 import difflib
 import re
+from collections import defaultdict
 from datetime import date, datetime
 
 import openpyxl
 from django.db import transaction
+from django.utils import timezone
 
 from .crm import guess_outcome, parse_acquisition, parse_quantity
 from .models import Donor, DonorContact, FoodItem, PlanLine
@@ -275,52 +277,86 @@ def _cell(row, cols, key, year=None):
     return row[idx] if idx is not None and idx < len(row) else None
 
 
+_BLANK = (None, "", PlanLine.ACQ_UNKNOWN, PlanLine.MODE_UNKNOWN)
+
+
 def _fill(obj, **values):
-    """Set only fields that are currently empty. Returns True if any changed."""
+    """Set only fields that are currently empty, and only to a real value
+    ("unknown" is the placeholder for nothing, not something to copy over).
+    Returns True if any changed."""
     changed = False
     for field, value in values.items():
-        current = getattr(obj, field)
-        if value not in (None, "") and current in (None, "", PlanLine.ACQ_UNKNOWN, PlanLine.MODE_UNKNOWN):
+        if value not in _BLANK and getattr(obj, field) in _BLANK:
             setattr(obj, field, value)
             changed = True
     return changed
 
 
-def _find_line(year, item, donor):
-    """The line this row is about. A line with no donor is a wildcard: the
-    main sheet often leaves the supplier blank because it is written inside the
-    quantity ("6kg fra X via Y"), while the next-year sheet's "supplier last
-    year" column names it -- both must end up as the *same* line."""
-    exact = PlanLine.objects.filter(year=year, item=item, donor=donor).first()
-    if exact:
-        return exact
-    others = list(PlanLine.objects.filter(year=year, item=item))
-    if donor is None:
-        return others[0] if len(others) == 1 else None
-    return next((line for line in others if line.donor_id is None), None)
+class LineStore:
+    """Every plan line held in memory for the length of one import.
 
+    The import used to look each row up and save it on its own -- around 1,500
+    queries for one workbook. Against a database on another machine that is a
+    minute or more, longer than the web server waits, so the request was cut
+    off. Reading everything once and writing the changes in two bulk
+    statements keeps it to a handful of round trips.
 
-def _upsert_line(report, year, item, donor, via, create=True, **values):
-    line = _find_line(year, item, donor)
-    if line is None:
-        if not create:
-            return None
-        line = PlanLine(year=year, item=item, donor=donor, via_donor=via)
-        for field, value in values.items():
-            if value not in (None, ""):  # keep the model's defaults for blanks
-                setattr(line, field, value)
-        line.save()
-        report["lines"]["created"] += 1
+    A line with no donor is a wildcard: the main sheet often leaves the
+    supplier blank because it is written inside the quantity ("6kg fra X via
+    Y"), while the next-year sheet's "supplier last year" column names it --
+    both must end up as the *same* line."""
+
+    # Everything an import can change; id/created_at never are.
+    UPDATE_FIELDS = [f.name for f in PlanLine._meta.concrete_fields if f.name not in ("id", "created_at")]
+
+    def __init__(self, report):
+        self.report = report
+        self.new = []
+        self.dirty = {}
+        self._by_item_year = defaultdict(list)
+        for line in PlanLine.objects.all():
+            self._by_item_year[(line.year, line.item_id)].append(line)
+
+    def find(self, year, item, donor):
+        lines = self._by_item_year.get((year, item.pk), [])
+        donor_id = donor.pk if donor else None
+        exact = next((line for line in lines if line.donor_id == donor_id), None)
+        if exact:
+            return exact
+        if donor_id is None:
+            return lines[0] if len(lines) == 1 else None
+        return next((line for line in lines if line.donor_id is None), None)
+
+    def upsert(self, year, item, donor, via, create=True, **values):
+        line = self.find(year, item, donor)
+        if line is None:
+            if not create:
+                return None
+            line = PlanLine(year=year, item=item, donor=donor, via_donor=via)
+            for field, value in values.items():
+                if value not in (None, ""):  # keep the model's defaults for blanks
+                    setattr(line, field, value)
+            self.new.append(line)
+            self._by_item_year[(year, item.pk)].append(line)
+            self.report["lines"]["created"] += 1
+            return line
+        changed = False
+        if line.donor_id is None and donor is not None:
+            line.donor, changed = donor, True
+        if _fill(line, **({"via_donor": via} if via else {}), **values):
+            changed = True
+        if changed:
+            if line.pk:
+                self.dirty[line.pk] = line
+            self.report["lines"]["updated"] += 1
         return line
-    changed = False
-    if line.donor_id is None and donor is not None:
-        line.donor, changed = donor, True
-    if _fill(line, **({"via_donor": via} if via else {}), **values):
-        changed = True
-    if changed:
-        line.save()
-        report["lines"]["updated"] += 1
-    return line
+
+    def flush(self):
+        PlanLine.objects.bulk_create(self.new)
+        now = timezone.now()
+        for line in self.dirty.values():
+            line.updated_at = now  # bulk_update doesn't run auto_now
+        PlanLine.objects.bulk_update(list(self.dirty.values()), self.UPDATE_FIELDS)
 
 
 def _quantities(report, raw, item_name, field):
@@ -330,7 +366,14 @@ def _quantities(report, raw, item_name, field):
     return quantity, unit, note
 
 
-def _import_food(ws, report, resolver, main):
+def _item_name(raw):
+    """(clean name, dropped?) for an item cell -- \"Nøtter - DROPPET\" is a dropped item."""
+    name = _text(raw)
+    dropped = bool(re.search(r"\bdroppet\b", name, re.IGNORECASE))
+    return re.sub(r"\s*-\s*droppet\s*$", "", name, flags=re.IGNORECASE).strip(), dropped
+
+
+def _import_food(ws, report, resolver, main, items, store):
     cols = _column_map(ws)
     if "item" not in cols or "category" not in cols:
         return
@@ -349,12 +392,8 @@ def _import_food(ws, report, resolver, main):
         name = _text(_cell(row, cols, "item"))
         if not (category and name):
             continue
-        dropped = bool(re.search(r"\bdroppet\b", name, re.IGNORECASE))
-        name = re.sub(r"\s*-\s*droppet\s*$", "", name, flags=re.IGNORECASE).strip()
-        item = FoodItem.objects.filter(name__iexact=name).first()
-        if item is None:
-            item = FoodItem.objects.create(name=name[:150], category=category[:60])
-            report["items"]["created"] += 1
+        name, dropped = _item_name(name)
+        item = items[name.lower()]
 
         donor, via = resolver.resolve(_cell(row, cols, "supplier"))
 
@@ -362,8 +401,8 @@ def _import_food(ws, report, resolver, main):
         if main and previous in cols["actual"]:
             q, unit, note = _quantities(report, _cell(row, cols, "actual", previous), name, "actual")
             if q is not None:
-                _upsert_line(
-                    report, previous, item, None, None,
+                store.upsert(
+                    previous, item, None, None,
                     quantity_confirmed=q, unit=unit, quantity_note=note, status=PlanLine.STATUS_DELIVERED,
                 )
 
@@ -385,8 +424,8 @@ def _import_food(ws, report, resolver, main):
             next_note = _text(_cell(row, cols, "next_note", nxt))
             outcome, leftover = guess_outcome(ran_out, next_note, unit)
             mode_word = _text(_cell(row, cols, "mode")).lower()
-            _upsert_line(
-                report, current, item, donor, via,
+            store.upsert(
+                current, item, donor, via,
                 status=status, unit=unit, quantity_requested=rq, quantity_confirmed=cq,
                 quantity_note=cnote or rnote, acquisition=acquisition, unit_price=price, price_note=price_note,
                 delivery_date=_as_date(_cell(row, cols, "date")),
@@ -399,7 +438,7 @@ def _import_food(ws, report, resolver, main):
         # The next-year copy names last year's supplier: use it to fill in a
         # current-year line the main sheet left without one.
         if not main and donor is not None:
-            _upsert_line(report, current, item, donor, via, create=False)
+            store.upsert(current, item, donor, via, create=False)
 
         # What is wanted next year: this sheet's own column, in the main sheet
         # (partly filled) or the dedicated next-year copy (nearly complete).
@@ -408,11 +447,34 @@ def _import_food(ws, report, resolver, main):
             q, unit, note = _quantities(report, wanted, name, "requested_next")
             acquisition, price, price_note = parse_acquisition(_cell(row, cols, "acquisition"), unit)
             if q is not None or note:
-                _upsert_line(
-                    report, nxt, item, donor, via,
+                store.upsert(
+                    nxt, item, donor, via,
                     quantity_requested=q, unit=unit, quantity_note=note,
                     acquisition=acquisition, unit_price=price, price_note=price_note,
                 )
+
+
+def _ensure_items(food_sheets, report):
+    """Every item named in the food sheets, creating the missing ones in one
+    batch. Returns {lower-case name: FoodItem}."""
+    items = {item.name.lower(): item for item in FoodItem.objects.all()}
+    missing = {}
+    for ws in food_sheets:
+        cols = _column_map(ws)
+        if "item" not in cols or "category" not in cols:
+            continue
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            category, (name, _) = _text(_cell(row, cols, "category")), _item_name(_cell(row, cols, "item"))
+            if category and name and name.lower() not in items and name.lower() not in missing:
+                missing[name.lower()] = FoodItem(name=name[:150], category=category[:60])
+    if missing:
+        FoodItem.objects.bulk_create(list(missing.values()))
+        if any(item.pk is None for item in missing.values()):  # database didn't hand back ids
+            items.update({item.name.lower(): item for item in FoodItem.objects.filter(name__in=[i.name for i in missing.values()])})
+        else:
+            items.update(missing)
+        report["items"]["created"] += len(missing)
+    return items
 
 
 def import_workbook(file, dry_run=False):
@@ -443,12 +505,15 @@ def import_workbook(file, dry_run=False):
         for ws in contacts:
             _import_contacts(ws, report)
         resolver = DonorResolver(report)
+        items = _ensure_items(food, report)
+        store = LineStore(report)
         # The sheet with last year's actual amounts goes first; copies for
         # the coming year only top up what the main sheet leaves blank.
         food.sort(key=lambda ws: 0 if any(re.fullmatch(r"mengde \d{4}", h.lower()) for h in _headers(ws).values()) else 1)
         for ws in food:
             is_main = any(re.fullmatch(r"mengde \d{4}", h.lower()) for h in _headers(ws).values())
-            _import_food(ws, report, resolver, is_main)
+            _import_food(ws, report, resolver, is_main, items, store)
+        store.flush()
         _set_relationships_from_lines()
         if dry_run:
             transaction.set_rollback(True)
@@ -460,13 +525,16 @@ def import_workbook(file, dry_run=False):
 def _set_relationships_from_lines():
     """A donor with no stated relationship takes it from how its lines were
     acquired (all gifts -> sponsor, all purchases -> supplier, mixed -> both)."""
-    for donor in Donor.objects.filter(relationship=Donor.REL_UNKNOWN):
-        kinds = set(donor.lines.exclude(acquisition=PlanLine.ACQ_UNKNOWN).values_list("acquisition", flat=True))
-        if not kinds:
-            continue
-        if kinds == {PlanLine.ACQ_GIFT}:
+    kinds = defaultdict(set)
+    for donor_id, acquisition in (
+        PlanLine.objects.exclude(acquisition=PlanLine.ACQ_UNKNOWN).exclude(donor=None).values_list("donor_id", "acquisition").distinct()
+    ):
+        kinds[donor_id].add(acquisition)
+    for donor in Donor.objects.filter(relationship=Donor.REL_UNKNOWN, pk__in=list(kinds)):
+        acquired = kinds[donor.pk]
+        if acquired == {PlanLine.ACQ_GIFT}:
             donor.relationship = Donor.REL_SPONSOR
-        elif kinds == {PlanLine.ACQ_PURCHASE}:
+        elif acquired == {PlanLine.ACQ_PURCHASE}:
             donor.relationship = Donor.REL_SUPPLIER
         else:
             donor.relationship = Donor.REL_BOTH
