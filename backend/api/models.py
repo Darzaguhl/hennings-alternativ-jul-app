@@ -860,3 +860,211 @@ class SocialIdentity(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user} @ {self.provider}"
+
+
+# ---------------------------------------------------------------------------
+# CRM: donors/suppliers, the yearly food plan, and what happened with it.
+#
+# Organisation-wide, not per event: the relationships and the plan span
+# years (and events), and only admins (of any event) can see any of it --
+# contact details of business contacts, prices and gift values included.
+# ---------------------------------------------------------------------------
+
+
+class Donor(models.Model):
+    """A company or person we get food/drink from, as a sponsor (gift), a
+    supplier (we pay) or both. The relationship outlives any one Christmas:
+    year-specific facts live on PlanLine, who to talk to on DonorContact."""
+
+    KIND_COMPANY = "company"
+    KIND_INDIVIDUAL = "individual"
+    KIND_OTHER = "other"
+    KIND_CHOICES = ((KIND_COMPANY, "Company"), (KIND_INDIVIDUAL, "Individual"), (KIND_OTHER, "Other"))
+
+    REL_SPONSOR = "sponsor"
+    REL_SUPPLIER = "supplier"
+    REL_BOTH = "both"
+    REL_UNKNOWN = "unknown"
+    RELATIONSHIP_CHOICES = (
+        (REL_SPONSOR, "Sponsor -- gives for free"),
+        (REL_SUPPLIER, "Supplier -- we buy"),
+        (REL_BOTH, "Sponsor and supplier"),
+        (REL_UNKNOWN, "Unknown"),
+    )
+
+    name = models.CharField(max_length=150)
+    kind = models.CharField(max_length=12, choices=KIND_CHOICES, default=KIND_COMPANY)
+    relationship = models.CharField(max_length=10, choices=RELATIONSHIP_CHOICES, default=REL_UNKNOWN)
+    owner_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Who on our side handles this relationship. Free text: they don't all have accounts.",
+    )
+    notes = models.TextField(blank=True)
+    last_contacted_on = models.DateField(null=True, blank=True)
+    next_contact_on = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            # Case-insensitive, so "BAMA" and "Bama" can't become two donors.
+            models.UniqueConstraint(models.functions.Lower("name"), name="unique_donor_name_ci"),
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class DonorContact(models.Model):
+    """A person at a donor. Business contact details are personal data, so
+    they're admin-only and deleted with the donor."""
+
+    donor = models.ForeignKey(Donor, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=150, blank=True)
+    role = models.CharField(max_length=100, blank=True)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=40, blank=True)
+    is_primary = models.BooleanField(default=False)
+    notes = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        ordering = ["-is_primary", "name", "email"]
+
+    def __str__(self) -> str:
+        return f"{self.name or self.email} @ {self.donor}"
+
+
+class FoodItem(models.Model):
+    """What we plan for, independent of year and supplier ("Bacon",
+    "Kransekake") -- the thing forecasts follow across years."""
+
+    name = models.CharField(max_length=150)
+    category = models.CharField(max_length=60, blank=True)
+
+    class Meta:
+        ordering = ["category", "name"]
+        constraints = [models.UniqueConstraint(models.functions.Lower("name"), name="unique_food_item_name_ci")]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class PlanLine(models.Model):
+    """One item for one Christmas, from one donor: what we wanted, what was
+    confirmed, what actually arrived, and how it went.
+
+    Quantities are a number plus a unit; the sheets also say things like
+    "7 kasser av hver" or "100kg Costa finmalt", so anything the number+unit
+    doesn't capture is kept in quantity_note rather than lost. A forecast only
+    compares quantities in the same unit.
+
+    The outcome is what makes next year's suggestion possible: without a
+    record of "ran out early" or "200 kg left over" there is nothing to learn
+    from. It is entered by hand; imported lines carry a *guess* from the old
+    comments (outcome_source) that someone should confirm.
+    """
+
+    STATUS_PLANNED = "planned"
+    STATUS_ASKED = "asked"
+    STATUS_CONFIRMED = "confirmed"
+    STATUS_DELIVERED = "delivered"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = (
+        (STATUS_PLANNED, "Planned"),
+        (STATUS_ASKED, "Asked"),
+        (STATUS_CONFIRMED, "Confirmed"),
+        (STATUS_DELIVERED, "Delivered"),
+        (STATUS_CANCELLED, "Cancelled"),
+    )
+
+    ACQ_GIFT = "gift"
+    ACQ_PURCHASE = "purchase"
+    ACQ_MIXED = "mixed"
+    ACQ_UNKNOWN = "unknown"
+    ACQUISITION_CHOICES = (
+        (ACQ_GIFT, "Gift"),
+        (ACQ_PURCHASE, "Purchase"),
+        (ACQ_MIXED, "Gift and purchase"),
+        (ACQ_UNKNOWN, "Unknown"),
+    )
+
+    MODE_PICKUP = "pickup"
+    MODE_DELIVERY = "delivery"
+    MODE_UNKNOWN = "unknown"
+    MODE_CHOICES = ((MODE_PICKUP, "We pick up"), (MODE_DELIVERY, "They deliver"), (MODE_UNKNOWN, "Unknown"))
+
+    OUTCOME_RAN_OUT_EARLY = "ran_out_early"
+    OUTCOME_RAN_OUT = "ran_out"
+    OUTCOME_RIGHT = "right"
+    OUTCOME_LEFTOVER = "leftover"
+    OUTCOME_CHOICES = (
+        (OUTCOME_RAN_OUT_EARLY, "Ran out early"),
+        (OUTCOME_RAN_OUT, "Ran out"),
+        (OUTCOME_RIGHT, "About right"),
+        (OUTCOME_LEFTOVER, "Leftover"),
+    )
+    SOURCE_MANUAL = "manual"
+    SOURCE_IMPORTED = "imported"
+
+    year = models.PositiveSmallIntegerField(db_index=True, help_text="The Christmas this is for, e.g. 2025.")
+    item = models.ForeignKey(FoodItem, on_delete=models.CASCADE, related_name="lines")
+    donor = models.ForeignKey(Donor, on_delete=models.SET_NULL, null=True, blank=True, related_name="lines")
+    via_donor = models.ForeignKey(
+        Donor,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="lines_arranged",
+        help_text="Someone who arranged it for us (e.g. 'Mills via Roy'): the donor is Mills, this is Roy's company.",
+    )
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_PLANNED)
+
+    unit = models.CharField(max_length=20, blank=True)
+    quantity_requested = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    quantity_confirmed = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    quantity_received = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    quantity_note = models.CharField(max_length=200, blank=True)
+
+    acquisition = models.CharField(max_length=10, choices=ACQUISITION_CHOICES, default=ACQ_UNKNOWN)
+    unit_price = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, help_text="NOK per `unit`, when we pay."
+    )
+    price_note = models.CharField(max_length=200, blank=True)
+
+    delivery_date = models.DateField(null=True, blank=True)
+    delivery_mode = models.CharField(max_length=10, choices=MODE_CHOICES, default=MODE_UNKNOWN)
+
+    outcome = models.CharField(max_length=14, choices=OUTCOME_CHOICES, blank=True)
+    outcome_source = models.CharField(max_length=10, blank=True)
+    leftover_quantity = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    ran_out_note = models.CharField(max_length=200, blank=True, help_text="When it ran out, in words.")
+    comment = models.TextField(blank=True)
+    next_year_note = models.TextField(blank=True, help_text="What to do differently next year.")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["year", "item__category", "item__name"]
+        constraints = [models.UniqueConstraint(fields=["year", "item", "donor"], name="unique_plan_line_per_donor")]
+
+    def __str__(self) -> str:
+        return f"{self.year} {self.item}"
+
+
+class GuestCount(models.Model):
+    """How many guests were served on a day -- the number food quantities
+    really scale with. Organisation-wide (not tied to an event) so earlier
+    years can be entered too, even ones from before this system."""
+
+    date = models.DateField(unique=True)
+    guests = models.PositiveIntegerField()
+    note = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        ordering = ["date"]
+
+    def __str__(self) -> str:
+        return f"{self.date}: {self.guests}"
