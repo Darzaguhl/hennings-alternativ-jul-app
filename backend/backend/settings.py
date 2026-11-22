@@ -258,3 +258,18 @@ ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "http://localhost:51
 # emails (see email.send_password_setup_email). Differs between
 # preprod/prod, same reasoning as ADMIN_DASHBOARD_URL.
 WEBSITE_URL = os.environ.get("WEBSITE_URL", "http://localhost:4173")
+
+# --- "Sign in with Google / Microsoft" (see api/social.py) -----------------
+# Public client IDs, set per environment on Render. Leave unset to switch a
+# provider off: the endpoints then answer "not set up" and the clients hide
+# their buttons. Google: the web client ID is what the website and admin
+# dashboard use (and is handed to them via /api/auth/social/providers/);
+# the iOS/Android client IDs of the mobile app go in the comma-separated
+# EXTRA list -- all of them are accepted as the token's audience.
+GOOGLE_OAUTH_WEB_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_WEB_CLIENT_ID", "").strip()
+GOOGLE_OAUTH_EXTRA_CLIENT_IDS = [
+    c.strip() for c in os.environ.get("GOOGLE_OAUTH_EXTRA_CLIENT_IDS", "").split(",") if c.strip()
+]
+# Microsoft: one app registration (multi-tenant + personal accounts) with a
+# redirect URI per client (SPA for web/dashboard, mobile for the app).
+MICROSOFT_OAUTH_CLIENT_ID = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip()
