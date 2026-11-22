@@ -4389,3 +4389,94 @@ class SocialLinkingTests(TestCase):
         self.assertEqual(self.client.get("/api/auth/social/identities/").status_code, 401)
         self.assertEqual(self.client.post("/api/auth/social/identities/", {}, format="json").status_code, 401)
         self.assertEqual(self.client.delete("/api/auth/social/identities/google/").status_code, 401)
+
+
+@override_settings(GOOGLE_OAUTH_WEB_CLIENT_ID=GOOGLE_WEB, MICROSOFT_OAUTH_CLIENT_ID=MS_CLIENT)
+class LegacyEmailAccountsStillWorkTests(TestCase):
+    """Social sign-in is purely additive: with Google/Microsoft switched on,
+    accounts that only ever used an e-mail address -- with a password, or
+    the passwordless website registration -- keep working exactly as before,
+    and an account never needs a provider linked."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def test_email_and_password_account_logs_in_without_any_provider_linked(self):
+        User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+
+        response = self.client.post("/api/token/", {"email": "old@example.com", "password": "s3cret-pass!"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertFalse(SocialIdentity.objects.exists())
+
+    def test_passwordless_website_registration_still_works_and_gives_a_session(self):
+        make_event(title="Jul", created_by=User.objects.create_user(username="org", password="pw"))
+
+        # The website form sends no password (valid_registration_payload includes
+        # one by default, so blank it to match what the site really submits).
+        response = self.client.post("/api/register/", valid_registration_payload(password=""), format="json")
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="new.volunteer@example.com")
+        self.assertFalse(user.has_usable_password())
+        self.assertFalse(user.social_identities.exists())
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.data['access']}")
+        self.assertEqual(self.client.get("/api/users/me/").status_code, 200)
+
+    def test_passwordless_account_can_still_get_a_password_by_e_mail_link(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com")
+        user.set_unusable_password()
+        user.save()
+
+        self.client.post("/api/password-setup/request/", {"email": "old@example.com"}, format="json")
+        token = PasswordSetupToken.objects.get(user=user)
+        confirm = self.client.post(
+            "/api/password-setup/confirm/", {"token": str(token.token), "password": "Brand-new-pass-1"}, format="json"
+        )
+        self.assertEqual(confirm.status_code, 200)
+
+        login = self.client.post("/api/token/", {"email": "old@example.com", "password": "Brand-new-pass-1"}, format="json")
+        self.assertEqual(login.status_code, 200)
+
+    def test_account_created_by_social_sign_in_can_add_an_e_mail_password_later(self):
+        from .social import SocialClaims
+
+        claims = SocialClaims("google", "g-1", "kari@example.com", True, "Kari", "Nordmann")
+        with mock.patch("api.social_views.verify_id_token", return_value=claims):
+            self.assertEqual(
+                self.client.post("/api/auth/social/", {"provider": "google", "id_token": "t"}, format="json").status_code,
+                201,
+            )
+        user = User.objects.get(email="kari@example.com")
+        self.assertFalse(user.has_usable_password())
+
+        self.client.post("/api/password-setup/request/", {"email": "kari@example.com"}, format="json")
+        token = PasswordSetupToken.objects.get(user=user)
+        self.client.post(
+            "/api/password-setup/confirm/", {"token": str(token.token), "password": "Brand-new-pass-1"}, format="json"
+        )
+
+        login = self.client.post("/api/token/", {"email": "kari@example.com", "password": "Brand-new-pass-1"}, format="json")
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(user.social_identities.count(), 1)  # both ways in now work
+
+    def test_a_signed_in_password_user_who_never_links_anything_is_unaffected(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+        self.client.force_authenticate(user=user)
+
+        self.assertEqual(self.client.get("/api/users/me/").status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/social/identities/").data, [])
+
+    def test_social_sign_in_never_removes_or_changes_an_existing_password(self):
+        user = User.objects.create_user(username="old@example.com", email="old@example.com", password="s3cret-pass!")
+        from .social import SocialClaims
+
+        claims = SocialClaims("google", "g-1", "old@example.com", True, "", "")
+        with mock.patch("api.social_views.verify_id_token", return_value=claims):
+            refused = self.client.post("/api/auth/social/", {"provider": "google", "id_token": "t"}, format="json")
+
+        self.assertEqual(refused.status_code, 409)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("s3cret-pass!"))
