@@ -769,3 +769,64 @@ class Rating(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user}: {self.level} @ {self.shift}"
+
+
+class StandingOverride(models.Model):
+    """An admin's manual decision about someone's standing, which wins over
+    the automatic one (see api/standing.py) -- e.g. clearing a single bad
+    night's "Bekymring", or flagging a concern the ratings never captured.
+    Internal only, like everything about standing: the volunteer never
+    sees it. A required note says why, so the next admin can tell.
+
+    Per user, not per event, because standing spans years; the data it
+    overrides is always read through the requesting admin's own events
+    (see StandingViewSet), so it never exposes another event's records.
+    """
+
+    LEVEL_GOOD = "good"
+    LEVEL_CONCERN = "concern"
+    LEVEL_CHOICES = (
+        (LEVEL_GOOD, "Good"),
+        (LEVEL_CONCERN, "Concern"),
+    )
+
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="standing_override")
+    level = models.CharField(max_length=10, choices=LEVEL_CHOICES)
+    note = models.CharField(max_length=300)
+    set_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="standing_overrides_set"
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"{self.user}: {self.level}"
+
+
+class AbsenceExcuse(models.Model):
+    """An admin's decision that one specific absence shouldn't count against
+    someone -- a late sick call, a family emergency -- recorded per person
+    per day. Avmelding in time already removes the signup, so this is for
+    the cases that came too late (or never made it into the system).
+
+    An excused absence is neither a no-show nor attendance: it simply drops
+    out of the volunteer's no-show rate. Internal only, like all standing
+    data. Only meaningful for a day the person actually signed up for and
+    missed; attendance_excuse refuses to excuse anything else.
+    """
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="absence_excuses")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="absence_excuses")
+    date = models.DateField()
+    note = models.CharField(max_length=300, blank=True)
+    excused_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="absence_excuses_given"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["event", "user", "date"], name="unique_absence_excuse_per_day"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user} excused @ {self.event} ({self.date})"
