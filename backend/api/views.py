@@ -272,6 +272,21 @@ def request_password_setup(request):
     return Response({"detail": "If an account exists for that email, a link has been sent."})
 
 
+def _has_room(slot):
+    return slot.capacity is None or slot.assigned_count < slot.capacity
+
+
+def _neediest_first(slots):
+    """Oppgave slots ordered by how empty they are (share of places filled);
+    ones with no stated capacity come after those that still need people."""
+
+    def sort_key(slot):
+        filled = slot.assigned_count / slot.capacity if slot.capacity else 1.0
+        return (filled, slot.assigned_count, slot.skill.name)
+
+    return sorted(slots, key=sort_key)
+
+
 def _rank_candidates(signups):
     """Order a user's candidate ShiftSignups for a day, best suggestion first.
 
@@ -391,7 +406,9 @@ def _resolve_checkin(event, user, performed_by):
     # different oppgaver on the same vakt is just as ambiguous as two
     # different vakter now that a vakt alone no longer says which oppgave
     # they'd be doing -- both go to the pool for admin review.
-    if len(candidates) == 1 and not candidates[0].shift.is_critical:
+    # "Hva som helst" is never auto-assigned: the point is that someone picks
+    # what they should do.
+    if len(candidates) == 1 and not candidates[0].shift.is_critical and not candidates[0].oppgave_slot.skill.is_flexible:
         oppgave_slot = candidates[0].oppgave_slot
         Assignment.objects.create(oppgave_slot=oppgave_slot, user=user, confirmed_by=performed_by)
         return {"status": "assigned", "shift": oppgave_slot.shift}
@@ -821,15 +838,25 @@ class EventViewSet(viewsets.ModelViewSet):
                 )
             )
             ranked = _rank_candidates(candidates)
+            # Someone who ticked "hva som helst" can be given any oppgave on
+            # those vakter, not only the ones they signed up for.
+            flexible_shift_ids = {c.shift_id for c in candidates if c.oppgave_slot.skill.is_flexible}
+            open_slots = _neediest_first(
+                OppgaveSlot.objects.filter(shift_id__in=flexible_shift_ids, skill__is_flexible=False).select_related(
+                    "shift", "skill"
+                )
+            )
+            suggestion = ranked[0].oppgave_slot if ranked else None
+            if suggestion is not None and suggestion.skill.is_flexible:
+                suggestion = next((slot for slot in open_slots if _has_room(slot)), suggestion)
             entries.append(
                 {
                     "user": UserSerializer(arrival.user, context={"request": request}).data,
                     "checked_in_at": arrival.checked_in_at,
                     "candidates": ShiftSignupSerializer(ranked, many=True, context={"request": request}).data,
+                    "open_slots": OppgaveSlotSerializer(open_slots, many=True, context={"request": request}).data,
                     "suggested_oppgave_slot": (
-                        OppgaveSlotSerializer(ranked[0].oppgave_slot, context={"request": request}).data
-                        if ranked
-                        else None
+                        OppgaveSlotSerializer(suggestion, context={"request": request}).data if suggestion else None
                     ),
                 }
             )
@@ -1079,14 +1106,16 @@ def _conflicting_signup(user, shift):
     return signup.shift if signup else None
 
 
-def _would_complete_three_consecutive(user, shift):
-    """True if signing up for `shift` would give the user 3 (or more)
-    numbered-consecutive vakter in the event's chronological order --
-    the real site's burnout rule ("ikke mulig å melde seg på tre
-    sammenhengende vakter"). "Consecutive" means adjacent positions in the
-    event's full vakt sequence (date, start_time order), not merely
-    touching in time."""
+def _exceeds_consecutive_limit(user, shift):
+    """True if signing up for `shift` would give the user more vakter in a row
+    than the event allows (Event.max_consecutive_shifts; 2 by default -- the
+    burnout rule "ikke mulig å melde seg på tre sammenhengende vakter").
+    "In a row" means adjacent positions in the event's full vakt sequence
+    (date, start_time order), not merely touching in time."""
 
+    limit = shift.event.max_consecutive_shifts
+    if not limit:
+        return False
     ordered_ids = list(Shift.objects.filter(event=shift.event).order_by("date", "start_time").values_list("id", flat=True))
     if shift.id not in ordered_ids:
         return False
@@ -1097,13 +1126,41 @@ def _would_complete_three_consecutive(user, shift):
     )
     signed_up_ids.add(shift.id)
 
-    for window_start in (index - 2, index - 1, index):
-        window = range(window_start, window_start + 3)
-        if window_start < 0 or window.stop > len(ordered_ids):
+    run = limit + 1  # the shortest run that breaks the rule
+    for window_start in range(index - limit, index + 1):
+        if window_start < 0 or window_start + run > len(ordered_ids):
             continue
-        if all(ordered_ids[i] in signed_up_ids for i in window):
+        if all(ordered_ids[i] in signed_up_ids for i in range(window_start, window_start + run)):
             return True
     return False
+
+
+_NUMBER_WORDS = {1: "én", 2: "to", 3: "tre", 4: "fire", 5: "fem", 6: "seks", 7: "sju", 8: "åtte", 9: "ni", 10: "ti"}
+
+
+def _number_word(n):
+    return _NUMBER_WORDS.get(n, str(n))
+
+
+def _oppgave_choice_refusal(user, slot):
+    """Why this user may not add this oppgave on this vakt, or None. Two rules,
+    both per vakt: the choice is either specific oppgaver or "hva som helst",
+    never both; and at most Event.max_oppgaver_per_vakt specific oppgaver.
+    Nothing already signed up is removed to make room -- the volunteer is told
+    why instead."""
+
+    shift = slot.shift
+    chosen = list(ShiftSignup.objects.filter(user=user, oppgave_slot__shift=shift).select_related("oppgave_slot__skill"))
+    if slot.skill.is_flexible:
+        if any(not s.oppgave_slot.skill.is_flexible for s in chosen):
+            return "«Hva som helst» kan ikke kombineres med bestemte oppgaver, og du er allerede påmeldt en på denne vakten."
+        return None
+    if any(s.oppgave_slot.skill.is_flexible for s in chosen):
+        return "Du har meldt deg til «hva som helst» på denne vakten, og kan ikke velge bestemte oppgaver i tillegg."
+    limit = shift.event.max_oppgaver_per_vakt
+    if limit and len(chosen) >= limit:
+        return f"Du kan velge høyst {limit} {'oppgave' if limit == 1 else 'oppgaver'} per vakt."
+    return None
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
@@ -1221,11 +1278,18 @@ class OppgaveSlotViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if _would_complete_three_consecutive(user, shift):
-            return Response(
-                {"detail": "Det er ikke mulig å melde seg på tre sammenhengende vakter."},
-                status=status.HTTP_400_BAD_REQUEST,
+        if _exceeds_consecutive_limit(user, shift):
+            limit = shift.event.max_consecutive_shifts
+            detail = (
+                "Det er ikke mulig å melde seg på tre sammenhengende vakter."
+                if limit == 2
+                else f"Det er ikke mulig å melde seg på mer enn {_number_word(limit)} vakter på rad."
             )
+            return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+        refusal = _oppgave_choice_refusal(user, oppgave_slot)
+        if refusal:
+            return Response({"detail": refusal}, status=status.HTTP_400_BAD_REQUEST)
 
         has_experience = request.data.get("has_relevant_experience")
         if isinstance(has_experience, str):
@@ -1332,13 +1396,16 @@ class X1SignupViewSet(viewsets.ModelViewSet):
         shift_ids = set(
             ShiftSignup.objects.filter(event=event, user=user).values_list("shift_id", flat=True)
         )
-        if len(shift_ids) < 3:
-            raise ValidationError("Krever påmelding på minst tre andre vakter.")
+        if len(shift_ids) < event.x1_min_shifts:
+            raise ValidationError(f"Krever påmelding på minst {_number_word(event.x1_min_shifts)} andre vakter.")
         main_block_count = Shift.objects.filter(
-            id__in=shift_ids, vakt_number__gte=5, vakt_number__lte=10
+            id__in=shift_ids, vakt_number__gte=event.x1_core_first, vakt_number__lte=event.x1_core_last
         ).count()
-        if main_block_count < 2:
-            raise ValidationError("Krever minst to av vaktene fra vakt 5–10.")
+        if main_block_count < event.x1_min_core_shifts:
+            raise ValidationError(
+                f"Krever minst {_number_word(event.x1_min_core_shifts)} av vaktene "
+                f"fra vakt {event.x1_core_first}–{event.x1_core_last}."
+            )
         serializer.save(user=user)
 
     def perform_destroy(self, instance):

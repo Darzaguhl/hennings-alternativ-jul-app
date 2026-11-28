@@ -720,7 +720,7 @@ class OppgaveSlotSignupValidationTests(TestCase):
     admin-declared vakt conflict pairs and no three numbered-consecutive
     vakter -- both still enforced at the vakt level regardless of which
     oppgave is picked. See _conflicting_signup /
-    _would_complete_three_consecutive in views.py.
+    _exceeds_consecutive_limit in views.py.
 
     _conflicting_signup used to be a computed time-overlap check instead
     of ShiftConflict -- test_overlapping_but_undeclared_shifts_are_allowed
@@ -5405,4 +5405,298 @@ class OsloCalendarDayTests(TestCase):
 
         self.assertLess(response.status_code, 300, response.data)
         self.assertEqual(EventCheckIn.objects.get(user=volunteer).date, datetime.date(2026, 12, 25))
+
+
+class SignupRuleBase(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin", password="pw")
+        self.volunteer = User.objects.create_user(username="volunteer", password="pw")
+        self.event = make_event(title="Alternativ Jul", created_by=self.admin)
+        self.today = datetime.date.today()
+        # Ten vakter, one per day, so "in a row" is easy to reason about.
+        self.shifts = [
+            Shift.objects.create(
+                event=self.event, title=f"Vakt {n}", vakt_number=n, date=self.today + datetime.timedelta(days=n - 1),
+                start_time=datetime.time(10, 0), end_time=datetime.time(14, 0), created_by=self.admin,
+            )
+            for n in range(1, 11)
+        ]
+        self.client = APIClient()
+
+    def slot(self, vakt, name, **kwargs):
+        shift = self.shifts[vakt - 1]
+        existing = OppgaveSlot.objects.filter(shift=shift, skill__name=name).first()
+        return existing or make_slot(shift, skill_name=name, **kwargs)
+
+    def flex(self, vakt):
+        Skill.objects.update_or_create(name="Hva som helst", defaults={"is_flexible": True})
+        return self.slot(vakt, "Hva som helst")
+
+    def sign_up(self, slot, user=None):
+        self.client.force_authenticate(user=user or self.volunteer)
+        return self.client.post(f"/api/oppgave-slots/{slot.id}/signup/", {}, format="json")
+
+    def set_rules(self, **values):
+        for key, value in values.items():
+            setattr(self.event, key, value)
+        self.event.save()
+
+
+class OppgaveLimitRuleTests(SignupRuleBase):
+    def test_two_oppgaver_per_vakt_by_default(self):
+        self.assertEqual(self.sign_up(self.slot(1, "Buffet")).status_code, 201)
+        self.assertEqual(self.sign_up(self.slot(1, "Kjøkken")).status_code, 201)
+
+        third = self.sign_up(self.slot(1, "Toaletter"))
+
+        self.assertEqual(third.status_code, 400)
+        self.assertIn("høyst 2 oppgaver per vakt", third.data["detail"])
+        self.assertEqual(ShiftSignup.objects.count(), 2)
+
+    def test_each_vakt_has_its_own_limit(self):
+        for vakt, names in ((1, ("A", "B")), (3, ("C", "D")), (5, ("E", "F"))):
+            for name in names:
+                self.assertEqual(self.sign_up(self.slot(vakt, name)).status_code, 201)
+
+    def test_limit_is_the_events_setting(self):
+        self.set_rules(max_oppgaver_per_vakt=1)
+        self.sign_up(self.slot(1, "Buffet"))
+
+        second = self.sign_up(self.slot(1, "Kjøkken"))
+
+        self.assertEqual(second.status_code, 400)
+        self.assertIn("høyst 1 oppgave per vakt", second.data["detail"])
+
+    def test_blank_limit_means_no_limit(self):
+        self.set_rules(max_oppgaver_per_vakt=None)
+        for name in ("A", "B", "C", "D"):
+            self.assertEqual(self.sign_up(self.slot(1, name)).status_code, 201)
+
+    def test_limit_is_per_person(self):
+        self.sign_up(self.slot(1, "Buffet"))
+        self.sign_up(self.slot(1, "Kjøkken"))
+        other = User.objects.create_user(username="other", password="pw")
+        self.assertEqual(self.sign_up(self.slot(1, "Toaletter"), user=other).status_code, 201)
+
+
+class HvaSomHelstRuleTests(SignupRuleBase):
+    def test_can_be_chosen_on_several_vakter(self):
+        self.assertEqual(self.sign_up(self.flex(1)).status_code, 201)
+        self.assertEqual(self.sign_up(self.flex(3)).status_code, 201)
+
+    def test_cannot_be_added_to_specific_oppgaver_on_the_same_vakt(self):
+        self.sign_up(self.slot(1, "Buffet"))
+
+        response = self.sign_up(self.flex(1))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("kan ikke kombineres", response.data["detail"])
+        self.assertEqual(ShiftSignup.objects.count(), 1)  # nothing removed to make room
+
+    def test_specific_oppgaver_cannot_be_added_to_it_on_the_same_vakt(self):
+        self.sign_up(self.flex(1))
+
+        response = self.sign_up(self.slot(1, "Buffet"))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("hva som helst", response.data["detail"])
+        self.assertEqual(ShiftSignup.objects.count(), 1)
+
+    def test_it_can_be_mixed_with_specific_oppgaver_on_other_vakter(self):
+        self.assertEqual(self.sign_up(self.slot(1, "Buffet")).status_code, 201)
+        self.assertEqual(self.sign_up(self.flex(3)).status_code, 201)
+        self.assertEqual(self.sign_up(self.slot(5, "Buffet")).status_code, 201)
+
+    def test_it_still_obeys_the_vakt_rules_and_capacity(self):
+        self.sign_up(self.flex(1))
+        self.sign_up(self.flex(2))
+        self.assertEqual(self.sign_up(self.flex(3)).status_code, 400)  # three in a row
+
+        full = self.flex(5)
+        full.capacity = 0
+        full.save()
+        self.assertEqual(self.sign_up(full).status_code, 400)
+
+    def test_checking_in_puts_them_in_the_pool_instead_of_assigning(self):
+        slot = self.flex(1)
+        ShiftSignup.objects.create(oppgave_slot=slot, user=self.volunteer)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(f"/api/events/{self.event.id}/checkin/", {"user_id": self.volunteer.id}, format="json")
+
+        self.assertEqual(response.status_code, 202, response.data)
+        self.assertFalse(Assignment.objects.exists())
+
+    def test_a_single_specific_signup_is_still_assigned_automatically(self):
+        ShiftSignup.objects.create(oppgave_slot=self.slot(1, "Buffet"), user=self.volunteer)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(f"/api/events/{self.event.id}/checkin/", {"user_id": self.volunteer.id}, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Assignment.objects.exists())
+
+    def _pool(self):
+        EventCheckIn.objects.get_or_create(event=self.event, user=self.volunteer, date=self.shifts[0].date)
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(f"/api/events/{self.event.id}/pool/?date={self.shifts[0].date.isoformat()}")
+        self.assertEqual(response.status_code, 200)
+        (entry,) = response.data
+        return entry
+
+    def test_the_pool_offers_every_oppgave_on_that_vakt_and_suggests_the_emptiest(self):
+        busy = self.slot(1, "Buffet", capacity=4)
+        empty = self.slot(1, "Kjøkken", capacity=4)
+        self.slot(2, "Annen vakt", capacity=4)  # not a vakt they chose
+        for i in range(2):
+            other = User.objects.create_user(username=f"o{i}", password="pw")
+            Assignment.objects.create(oppgave_slot=busy, user=other, confirmed_by=self.admin)
+        ShiftSignup.objects.create(oppgave_slot=self.flex(1), user=self.volunteer)
+
+        entry = self._pool()
+
+        self.assertEqual({s["skill_name"] for s in entry["open_slots"]}, {"Buffet", "Kjøkken"})
+        self.assertEqual(entry["suggested_oppgave_slot"]["id"], empty.id)
+        self.assertTrue(entry["candidates"][0]["oppgave_slot"]["is_flexible"])
+
+    def test_pool_falls_back_to_the_flexible_slot_when_everything_else_is_full(self):
+        full = self.slot(1, "Buffet", capacity=0)
+        flexible = self.flex(1)
+        ShiftSignup.objects.create(oppgave_slot=flexible, user=self.volunteer)
+
+        entry = self._pool()
+        self.assertEqual(entry["suggested_oppgave_slot"]["id"], flexible.id)
+        self.assertNotEqual(entry["suggested_oppgave_slot"]["id"], full.id)
+
+    def test_a_specific_signup_gets_no_open_slots(self):
+        ShiftSignup.objects.create(oppgave_slot=self.slot(1, "Buffet"), user=self.volunteer)
+        self.assertEqual(self._pool()["open_slots"], [])
+
+    def test_they_can_be_assigned_to_an_oppgave_they_did_not_sign_up_for(self):
+        kitchen = self.slot(1, "Kjøkken")
+        ShiftSignup.objects.create(oppgave_slot=self.flex(1), user=self.volunteer)
+        EventCheckIn.objects.create(event=self.event, user=self.volunteer, date=self.shifts[0].date)
+        self.client.force_authenticate(user=self.admin)
+
+        response = self.client.post(
+            f"/api/events/{self.event.id}/assign/", {"user_id": self.volunteer.id, "oppgave_slot_id": kitchen.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_the_migration_switches_it_on_for_the_existing_catch_all(self):
+        import importlib
+
+        from django.apps import apps
+
+        existing = Skill.objects.create(name="Fleksibel — hjelper der det trengs")
+        other = Skill.objects.create(name="Buffet")
+        named = Skill.objects.create(name="Hva som helst")
+        Skill.objects.filter(pk=named.pk).update(is_flexible=False)
+
+        migration = importlib.import_module("api.migrations.0034_signup_rules")
+        migration.mark_existing_flexible_oppgaver(apps, None)
+
+        for skill in (existing, other, named):
+            skill.refresh_from_db()
+        self.assertEqual((existing.is_flexible, other.is_flexible, named.is_flexible), (True, False, True))
+
+
+class ConfigurableVaktRuleTests(SignupRuleBase):
+    def _run(self, *vakter, name="Buffet"):
+        return [self.sign_up(self.slot(v, name)) for v in vakter]
+
+    def test_two_in_a_row_is_the_default_and_the_message_is_unchanged(self):
+        responses = self._run(1, 2, 3)
+        self.assertEqual([r.status_code for r in responses], [201, 201, 400])
+        self.assertEqual(responses[-1].data["detail"], "Det er ikke mulig å melde seg på tre sammenhengende vakter.")
+
+    def test_the_middle_vakt_is_refused_too(self):
+        self.assertEqual([r.status_code for r in self._run(1, 3, 2)], [201, 201, 400])
+
+    def test_one_in_a_row(self):
+        self.set_rules(max_consecutive_shifts=1)
+        responses = self._run(1, 2)
+        self.assertEqual([r.status_code for r in responses], [201, 400])
+        self.assertIn("mer enn én vakter på rad", responses[-1].data["detail"])
+
+    def test_three_in_a_row_allowed_but_not_four(self):
+        self.set_rules(max_consecutive_shifts=3)
+        self.assertEqual([r.status_code for r in self._run(1, 2, 3, 4)], [201, 201, 201, 400])
+
+    def test_blank_removes_the_limit(self):
+        self.set_rules(max_consecutive_shifts=None)
+        self.assertEqual({r.status_code for r in self._run(1, 2, 3, 4, 5)}, {201})
+
+    def _x1(self):
+        self.client.force_authenticate(user=self.volunteer)
+        return self.client.post("/api/x1-signups/", {"event": self.event.id}, format="json")
+
+    def test_x1_thresholds_come_from_the_event(self):
+        self.set_rules(x1_min_shifts=2, x1_min_core_shifts=1, x1_core_first=1, x1_core_last=2)
+        self._run(1)
+        too_few = self._x1()
+        self.assertEqual(too_few.status_code, 400)
+        self.assertIn("minst to andre vakter", str(too_few.data))
+
+        self._run(4)
+        self.assertEqual(self._x1().status_code, 201)
+
+    def test_x1_core_range_message_uses_the_settings(self):
+        self.set_rules(x1_core_first=8, x1_core_last=9)
+        self._run(1, 3, 5)
+        response = self._x1()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("minst to av vaktene fra vakt 8–9", str(response.data))
+
+    def test_x1_without_a_core_demand(self):
+        self.set_rules(x1_min_core_shifts=0, x1_core_first=9, x1_core_last=10)
+        self._run(1, 3, 5)
+        self.assertEqual(self._x1().status_code, 201)
+
+    def test_admin_can_edit_the_rules_and_others_cannot(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.patch(
+            f"/api/events/{self.event.id}/", {"max_oppgaver_per_vakt": 3, "max_consecutive_shifts": None}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual((response.data["max_oppgaver_per_vakt"], response.data["max_consecutive_shifts"]), (3, None))
+
+        self.client.force_authenticate(user=self.volunteer)
+        refused = self.client.patch(f"/api/events/{self.event.id}/", {"max_oppgaver_per_vakt": 9}, format="json")
+        self.assertIn(refused.status_code, (403, 404))
+
+    def test_impossible_rule_values_are_rejected(self):
+        self.client.force_authenticate(user=self.admin)
+        url = f"/api/events/{self.event.id}/"
+        for body in (
+            {"max_oppgaver_per_vakt": 0},
+            {"max_consecutive_shifts": 0},
+            {"x1_min_shifts": 0},
+            {"x1_core_first": 11},  # after the current last (10)
+            {"x1_core_first": 6, "x1_core_last": 5},
+        ):
+            self.assertEqual(self.client.patch(url, body, format="json").status_code, 400, body)
+
+    def test_the_public_signup_page_gets_the_rules_and_flags(self):
+        self.flex(1)
+        self.client.force_authenticate(user=None)
+
+        data = self.client.get("/api/public/event/").data
+
+        self.assertEqual(
+            (data["max_oppgaver_per_vakt"], data["max_consecutive_shifts"], data["x1_min_shifts"],
+             data["x1_min_core_shifts"], data["x1_core_first"], data["x1_core_last"]),
+            (2, 2, 3, 2, 5, 10),
+        )
+        self.assertEqual([slot["is_flexible"] for slot in data["oppgave_slots"]], [True])
+
+    def test_only_an_admin_can_mark_an_oppgave_as_hva_som_helst(self):
+        skill = Skill.objects.create(name="Alt")
+        self.client.force_authenticate(user=self.volunteer)
+        self.assertEqual(self.client.patch(f"/api/skills/{skill.id}/", {"is_flexible": True}, format="json").status_code, 403)
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(self.client.patch(f"/api/skills/{skill.id}/", {"is_flexible": True}, format="json").status_code, 200)
+        skill.refresh_from_db()
+        self.assertTrue(skill.is_flexible)
 

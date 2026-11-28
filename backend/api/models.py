@@ -14,6 +14,11 @@ class Skill(models.Model):
     has created for that (shift, skill) pair."""
 
     name = models.CharField(max_length=100, unique=True)
+    is_flexible = models.BooleanField(
+        default=False,
+        help_text="\"Hva som helst\": the volunteer will help with anything. They wait in the pool at "
+        "check-in and can be given any oppgave on that vakt. Can't be combined with specific oppgaver.",
+    )
 
     class Meta:
         ordering = ["name"]
@@ -137,6 +142,28 @@ class Event(models.Model):
         default=RATING_VISIBILITY_OWN,
         help_text="Who besides admins can read post-event ratings. See Rating.",
     )
+    # Signup rules (see views.OppgaveSlotViewSet.signup and X1SignupViewSet),
+    # editable per event on the dashboard's Vakter page. The public signup
+    # page mirrors them to grey options out; these are what is enforced.
+    max_oppgaver_per_vakt = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        default=2,
+        help_text="Most oppgaver one volunteer may sign up for on one vakt. Blank = no limit. "
+        "\"Hva som helst\" is chosen instead of oppgaver, never on top of them.",
+    )
+    max_consecutive_shifts = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        default=2,
+        help_text="Most vakter in a row one volunteer may sign up for. Blank = no limit.",
+    )
+    x1_min_shifts = models.PositiveSmallIntegerField(default=3, help_text="Vaktleder (X1): vakter needed in total.")
+    x1_min_core_shifts = models.PositiveSmallIntegerField(
+        default=2, help_text="Vaktleder (X1): how many of those must be in the core range (0 = no such demand)."
+    )
+    x1_core_first = models.PositiveSmallIntegerField(default=5, help_text="First vakt number of the core range.")
+    x1_core_last = models.PositiveSmallIntegerField(default=10, help_text="Last vakt number of the core range.")
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
