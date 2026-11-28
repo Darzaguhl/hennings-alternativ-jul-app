@@ -30,7 +30,7 @@ User = get_user_model()
 class SkillSerializer(serializers.ModelSerializer):
     class Meta:
         model = Skill
-        fields = ["id", "name"]
+        fields = ["id", "name", "is_flexible"]
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -275,6 +275,12 @@ class EventSerializer(serializers.ModelSerializer):
             "signups_open",
             "checkin_mode",
             "rating_visibility",
+            "max_oppgaver_per_vakt",
+            "max_consecutive_shifts",
+            "x1_min_shifts",
+            "x1_min_core_shifts",
+            "x1_core_first",
+            "x1_core_last",
             "created_by",
             "viewer_role",
         ]
@@ -282,6 +288,19 @@ class EventSerializer(serializers.ModelSerializer):
         # event active at a time), so it only changes via the dedicated
         # activate/deactivate actions, which handle deactivating the rest.
         read_only_fields = ["created_by", "is_active"]
+        extra_kwargs = {
+            "max_oppgaver_per_vakt": {"min_value": 1},
+            "max_consecutive_shifts": {"min_value": 1},
+            "x1_min_shifts": {"min_value": 1},
+        }
+
+    def validate(self, attrs):
+        # A partial update sends only some fields: check the range as it will be.
+        first = attrs.get("x1_core_first", getattr(self.instance, "x1_core_first", 5))
+        last = attrs.get("x1_core_last", getattr(self.instance, "x1_core_last", 10))
+        if first > last:
+            raise serializers.ValidationError({"x1_core_last": "The core range must end at or after it starts."})
+        return attrs
 
     def get_viewer_role(self, obj):
         request = self.context.get("request")
@@ -343,12 +362,13 @@ class PublicOppgaveSlotSerializer(serializers.ModelSerializer):
     render "for Vakt 5, here are the oppgaver you can pick"."""
 
     skill_name = serializers.CharField(source="skill.name", read_only=True)
+    is_flexible = serializers.BooleanField(source="skill.is_flexible", read_only=True)
     signup_count = serializers.IntegerField(read_only=True)
     is_full = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = OppgaveSlot
-        fields = ["id", "shift", "skill", "skill_name", "capacity", "signup_count", "is_full"]
+        fields = ["id", "shift", "skill", "skill_name", "is_flexible", "capacity", "signup_count", "is_full"]
         read_only_fields = fields
 
 
@@ -377,6 +397,13 @@ class PublicEventSerializer(serializers.ModelSerializer):
             "signup_opens_at",
             "signup_closes_at",
             "signups_open",
+            # The signup rules, so the form can mirror them.
+            "max_oppgaver_per_vakt",
+            "max_consecutive_shifts",
+            "x1_min_shifts",
+            "x1_min_core_shifts",
+            "x1_core_first",
+            "x1_core_last",
         ]
         read_only_fields = fields
 
@@ -506,6 +533,7 @@ class OppgaveSlotSerializer(serializers.ModelSerializer):
     shift_b_title -- avoids a second lookup in the admin dashboard."""
 
     skill_name = serializers.CharField(source="skill.name", read_only=True)
+    is_flexible = serializers.BooleanField(source="skill.is_flexible", read_only=True)
     shift_title = serializers.CharField(source="shift.title", read_only=True)
     signup_count = serializers.IntegerField(read_only=True)
     assigned_count = serializers.IntegerField(read_only=True)
@@ -520,6 +548,7 @@ class OppgaveSlotSerializer(serializers.ModelSerializer):
             "shift_title",
             "skill",
             "skill_name",
+            "is_flexible",
             "capacity",
             "signup_count",
             "assigned_count",
