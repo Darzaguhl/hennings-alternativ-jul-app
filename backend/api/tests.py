@@ -5380,3 +5380,29 @@ class CrmApiTests(TestCase):
         text = str(report)
         for private in ("lise@acme.example", "kari@nordic.example", "per@hjelp.example"):
             self.assertNotIn(private, text)
+
+
+class OsloCalendarDayTests(TestCase):
+    """"Today" is the calendar day in Oslo, where the event is: just after
+    midnight there is already the next day, although it's still the previous
+    one in UTC."""
+
+    JUST_AFTER_MIDNIGHT_IN_OSLO = datetime.datetime(2026, 12, 24, 23, 30, tzinfo=datetime.timezone.utc)
+
+    def test_localdate_is_the_oslo_date(self):
+        with mock.patch("django.utils.timezone.now", return_value=self.JUST_AFTER_MIDNIGHT_IN_OSLO):
+            self.assertEqual(timezone.localdate(), datetime.date(2026, 12, 25))
+
+    def test_a_check_in_just_after_midnight_belongs_to_the_new_day(self):
+        admin = User.objects.create_user(username="admin", password="pw")
+        volunteer = User.objects.create_user(username="volunteer", password="pw")
+        event = make_event(title="Alternativ Jul", created_by=admin)
+        client = APIClient()
+        client.force_authenticate(user=admin)
+
+        with mock.patch("django.utils.timezone.now", return_value=self.JUST_AFTER_MIDNIGHT_IN_OSLO):
+            response = client.post(f"/api/events/{event.id}/checkin/", {"user_id": volunteer.id}, format="json")
+
+        self.assertLess(response.status_code, 300, response.data)
+        self.assertEqual(EventCheckIn.objects.get(user=volunteer).date, datetime.date(2026, 12, 25))
+
