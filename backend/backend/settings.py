@@ -173,7 +173,11 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# The event happens in Oslo, and "today" decides which day a check-in, the
+# pool and attendance belong to (timezone.localdate()). In UTC, anything
+# between midnight and 01:00 Oslo time was filed under the previous day.
+# Timestamps are still stored in UTC (USE_TZ).
+TIME_ZONE = 'Europe/Oslo'
 
 USE_I18N = True
 
