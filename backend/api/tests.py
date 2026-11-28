@@ -5233,6 +5233,15 @@ class CrmApiTests(TestCase):
         line.refresh_from_db()
         self.assertEqual((line.outcome, line.outcome_source), ("", ""))
 
+    def test_sending_the_same_outcome_confirms_a_guess(self):
+        line = make_line(2025, quantity_confirmed=100, unit="kg", outcome="ran_out", outcome_source="imported")
+
+        response = self.client.patch(f"/api/plan-lines/{line.id}/", {"outcome": "ran_out"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertEqual((line.outcome, line.outcome_source), ("ran_out", "manual"))
+
     def test_editing_something_else_keeps_an_imported_outcome_marked_as_a_guess(self):
         line = make_line(2025, quantity_confirmed=100, unit="kg", outcome="ran_out", outcome_source="imported")
         self.client.patch(f"/api/plan-lines/{line.id}/", {"comment": "ny kommentar"}, format="json")

@@ -105,10 +105,11 @@ class PlanLineSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("There is already a line for this item and donor that year.")
         return attrs
 
-    def _note_outcome_source(self, validated, instance=None):
-        # An outcome someone types in is a fact; one carried in from old
-        # comments stays marked as a guess until it's touched.
-        if "outcome" in validated and (instance is None or validated["outcome"] != instance.outcome):
+    def _note_outcome_source(self, validated):
+        # An outcome someone sends is a fact -- including sending the one that
+        # is already there, which is how a guess from old comments gets
+        # confirmed. A guess stays a guess until the outcome itself is sent.
+        if "outcome" in validated:
             validated["outcome_source"] = PlanLine.SOURCE_MANUAL if validated["outcome"] else ""
         return validated
 
@@ -116,7 +117,7 @@ class PlanLineSerializer(serializers.ModelSerializer):
         return super().create(self._note_outcome_source(validated_data))
 
     def update(self, instance, validated_data):
-        return super().update(instance, self._note_outcome_source(validated_data, instance))
+        return super().update(instance, self._note_outcome_source(validated_data))
 
 
 class GuestCountSerializer(serializers.ModelSerializer):
